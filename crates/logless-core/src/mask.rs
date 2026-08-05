@@ -30,6 +30,8 @@ pub enum Mask {
     Var,
     /// A leading `[component]` prefix — a logger or service name, not a value.
     Component,
+    /// A parenthesised aside carrying a value: `(1.57 KB)`, `(took 3ms)`.
+    Paren,
 }
 
 impl Mask {
@@ -45,6 +47,7 @@ impl Mask {
             Mask::Quoted => "<STR>",
             Mask::Var => "<VAR>",
             Mask::Component => "<COMP>",
+            Mask::Paren => "<PAREN>",
         }
     }
 
@@ -148,10 +151,63 @@ fn is_component_prefix(token: &str, position: usize) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'))
 }
 
+/// Longest parenthesised group treated as one aside. Beyond this it is prose
+/// with a bracket in it, not a value.
+const MAX_PAREN_TOKENS: usize = 4;
+
+/// Unit words that trail a value and may or may not be present.
+fn is_optional_unit(token: &str) -> bool {
+    matches!(
+        token.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()),
+        "sec" | "secs" | "ms" | "msec" | "s" | "m" | "h"
+            | "KB" | "MB" | "GB" | "TB" | "kb" | "mb" | "gb" | "bytes"
+    )
+}
+
 pub fn mask_line(line: &str, tokens: &mut Vec<String>, raw: &mut Vec<String>) {
     tokens.clear();
     raw.clear();
-    for (position, raw_token) in line.split_whitespace().enumerate() {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let mut position = 0;
+    while position < words.len() {
+        let raw_token = words[position];
+
+        // A parenthesised aside carrying a value is optional decoration, and
+        // it is *deleted* rather than replaced by a placeholder.
+        //
+        // Drain buckets templates by token count first, so `1608 bytes
+        // (1.57 KB) sent` and `0 bytes sent` are structurally incapable of
+        // merging while the group occupies any positions at all — one
+        // placeholder token is still one token more than the shorter line has.
+        // Masking has to normalise *length*, not just content, for a
+        // length-bucketed miner. Measured on Proxifier: one shape became seven
+        // as separate tokens, three as a placeholder, and one when deleted.
+        //
+        // The digit requirement keeps prose like `(pam_unix)` intact, where
+        // the parentheses really are part of the message.
+        if raw_token.starts_with('(') && !raw_token.starts_with("()") {
+            if let Some(end) = (position..words.len().min(position + MAX_PAREN_TOKENS))
+                .find(|i| words[*i].ends_with(')'))
+            {
+                let group = words[position..=end].join(" ");
+                if group.chars().any(|c| c.is_ascii_digit()) {
+                    position = end + 1;
+                    continue;
+                }
+            }
+        }
+
+        // Trailing unit words after a value are optional in the same way:
+        // `lifetime 00:01` and `lifetime 00:01 sec` are one shape. Only
+        // dropped when the previous token was variable, so the word `sec` in
+        // ordinary prose survives.
+        if is_optional_unit(raw_token) && tokens.last().is_some_and(|t| is_placeholder(t)) {
+            position += 1;
+            continue;
+        }
+        let position_of_token = position;
+        position += 1;
+        let position = position_of_token;
         if is_component_prefix(raw_token, position) {
             raw.push(raw_token.to_string());
             tokens.push(Mask::Component.placeholder().to_string());

@@ -26,7 +26,7 @@ fn nanos_to_secs_f64(nanos: u64) -> f64 {
 ///
 /// Two deliberate choices:
 ///
-/// * `fingerprint = ["logless:<template_id>"]` — Sentry groups on this, so our
+/// * `fingerprint = ["logless:<template fingerprint>"]` — Sentry groups on this, so our
 ///   template becomes its issue. Grouping stops being heuristic and starts
 ///   being deterministic, which is a selling point in its own right.
 /// * context lines become **breadcrumbs**, which is exactly the widget Sentry
@@ -43,10 +43,14 @@ pub fn sentry_envelope(window: &ContextWindow) -> String {
 }
 
 fn sentry_event(window: &ContextWindow, event_id: &str) -> String {
-    let fingerprint = window
-        .error_template_id
-        .map(|t| format!("\"logless:{t}\""))
-        .unwrap_or_else(|| format!("\"logless:flow:{:016x}\"", window.flow_hash));
+    // Grouping key. Content-derived, never the per-agent template counter:
+    // that number is assigned in arrival order, so two nodes give the same
+    // shape different numbers and Sentry would split one issue across a fleet
+    // while merging unrelated errors that share an index.
+    let fingerprint = match window.error_template_fingerprint {
+        Some(f) => format!("\"logless:t:{f:016x}\""),
+        None => format!("\"logless:flow:{:016x}\"", window.flow_hash),
+    };
 
     let breadcrumbs: Vec<String> = window
         .context
@@ -199,6 +203,7 @@ mod tests {
             key_tier: KeyTier::Trace,
             flow_hash: 0xdead_beef,
             error_template_id: Some(7),
+            error_template_fingerprint: Some(0x1234_5678_9abc_def0),
             service: Some("api".into()),
             suppressed: 3,
         }
@@ -225,7 +230,10 @@ mod tests {
     #[test]
     fn sentry_fingerprint_is_the_template_so_grouping_is_deterministic() {
         let event = parse(sentry_envelope(&window(1)).split('\n').nth(2).unwrap());
-        assert_eq!(event["fingerprint"][0], "logless:7");
+        assert_eq!(
+            event["fingerprint"][0], "logless:t:123456789abcdef0",
+            "the grouping key must be content-derived, not the per-agent counter"
+        );
         assert_eq!(event["level"], "error");
         assert_eq!(event["tags"]["service"], "api");
         assert_eq!(event["tags"]["logless.template_id"], "7");
@@ -245,10 +253,28 @@ mod tests {
 
     #[test]
     fn an_untemplated_error_still_gets_a_stable_fingerprint() {
+        // Both fields are cleared: a line that did not template has neither a
+        // local id nor a content fingerprint, and the flow hash is the fallback
+        // grouping key.
         let mut w = window(1);
         w.error_template_id = None;
+        w.error_template_fingerprint = None;
         let event = parse(sentry_envelope(&w).split('\n').nth(2).unwrap());
         assert_eq!(event["fingerprint"][0], "logless:flow:00000000deadbeef");
+    }
+
+    #[test]
+    fn the_local_template_id_never_reaches_the_grouping_key() {
+        // The id is a per-agent counter assigned in arrival order. If it ever
+        // leaked into the fingerprint, one shape would land in a different
+        // Sentry issue on every node in the fleet.
+        let mut w = window(1);
+        w.error_template_id = Some(999_999);
+        w.error_template_fingerprint = Some(0xabcd);
+        let event = parse(sentry_envelope(&w).split('\n').nth(2).unwrap());
+        let fingerprint = event["fingerprint"][0].as_str().unwrap().to_string();
+        assert!(!fingerprint.contains("999999"), "{fingerprint}");
+        assert_eq!(fingerprint, "logless:t:000000000000abcd");
     }
 
     #[test]

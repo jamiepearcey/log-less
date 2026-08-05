@@ -40,6 +40,13 @@ jobs:
       - name: Storm harness
         run: ./scripts/storm.sh 10000 10 512
 
+      # ENOSPC arrives one write at a time, so the agent keeps running with
+      # some subsystems failing and others fine — the case where a component
+      # swallows an error and reports success. Skips itself if it cannot get a
+      # size-limited filesystem.
+      - name: Disk-full harness
+        run: ./scripts/diskfull.sh 24
+
   licences:
     runs-on: ubuntu-latest
     steps:

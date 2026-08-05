@@ -658,6 +658,7 @@ mod tests {
             key_tier: KeyTier::Trace,
             flow_hash: 0xdead_beef,
             error_template_id: Some(7),
+            error_template_fingerprint: Some(7),
             service: Some("api".into()),
             suppressed: 3,
         }

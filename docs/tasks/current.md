@@ -127,6 +127,12 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - **Aggregate events showed an example instead of a shape**: the rollup's `template` field received the raw body. An aggregate exists to show the shape, so it now carries the masked template text alongside one concrete example.
 - **Long ids classified as `<NUM>`**: a 32-character all-digit trace id matched the numeric check before the hex one. Tokens of 16+ characters are identifiers, not quantities.
 
+### A grouping bug the consult surfaced
+
+The Sentry fingerprint was `logless:<template_id>`, where the id is a **per-agent counter minted in arrival order**. Within one agent that is stable and correct — it survives restart through the catalog. Across a fleet it is meaningless: node A's template 7 and node B's template 7 are different shapes, so one issue splits across nodes while unrelated errors merge on a shared index. For a feature whose selling point is *deterministic* grouping, and a deployment model of hundreds of nodes, that was wrong on every node from the start.
+
+Fingerprints are now derived from the masked template text (FNV-1a, not `DefaultHasher`, which is explicitly not stable across processes). Every agent watching the same service agrees without coordinating. The cost is that widening a template changes its fingerprint and starts a new Sentry issue at that point; that is rare, and the alternative was wrong always rather than occasionally.
+
 ### The compression step that was not there
 
 `compression-experiment` writes 22,000 real LogHub lines both ways, with identical writer settings:
@@ -144,10 +150,33 @@ The reason is that the work is already being done: zstd plus dictionary encoding
 
 So this is closed as **rejected on measurement**: a few percent is not worth making `body` derivable, breaking the Parquet contract, and forcing every external reader to join a dictionary to see their own log text. Compaction (72%) and the sort order were where the real wins were.
 
+- [x] **Disk-full and io-pressure harness** (`scripts/diskfull.sh`, in CI): a size-limited filesystem, filled by ballast while the agent writes, with concurrent fsync churn. ENOSPC arrives one write at a time, so the agent keeps running with some subsystems failing — the case where a component swallows an error and reports success. Verified: 96,000 records ingested against a full disk, ENOSPC surfaced, all committed after recovery, `verify` clean.
+- [x] **Over-splitting fixed, and the benchmark was wrong.** See below.
+
+### The benchmark was measuring the wrong thing
+
+Two corrections to what was recorded last time, both of which reversed conclusions:
+
+**1. Wrong input.** LogHub's ground-truth templates describe the parsed `Content` field — the header (timestamp, level, component) is split off by a per-dataset log format *before* templating. We were feeding raw lines. So the benchmark was largely measuring our masking of *their header format*. Corrected, Apache went from 2.00× to **exactly 6/6**, and Thunderbird from 0.72× to 1.01×. The over-splitting recorded as a real defect was mostly an artefact of the harness.
+
+This also means the previously recorded "0.4 was 0.59×, 4 of 11 within 2×" was wrong: measured properly, 0.4 gives 0.91× with 11/11 within 2×. The threshold change was a modest improvement, not the dramatic one claimed.
+
+**2. Wrong metric.** Template-count agreement is weak — a parser can produce exactly the right number of templates while assigning the wrong lines to each, and score 1.00. Now reporting LogHub's **Parsing Accuracy** (fraction of lines whose predicted group exactly matches the ground-truth group) alongside a **dispersion** figure (mean absolute log-ratio), which unlike a geometric mean cannot be flattered by over-splits and under-merges cancelling out.
+
+| | at the time of the last commit | now |
+|---|---|---|
+| geometric-mean ratio | 1.00× | 0.97× |
+| dispersion (lower is better) | 0.098 | **0.076** |
+| mean parsing accuracy | (not measured) | **0.844** |
+| Proxifier ratio / accuracy | 1.50× / 0.049 | **0.88× / 0.522** |
+
+The Proxifier fix came from a consult: mask by *deleting* optional groups rather than substituting a placeholder. For a miner that buckets by token count, one placeholder is still one token more than the shorter line has, so `1608 bytes (1.57 KB) sent` could never merge with `0 bytes sent`. Deleting the group — and trailing unit words like `sec` after a variable — normalises length. One shape went from seven templates as separate tokens, to three as a placeholder, to one deleted.
+
 ## Still open
 
-- **Chaos harness covers SIGKILL only.** Disk-full and io-throttle injection are not automated.
-- **Two LogHub datasets still over-split** (Proxifier 3.25×, Apache 2.00×): both are dominated by lines whose only variable part is a path or a duration, which the masker splits more finely than the ground truth does.
+- **Parsing accuracy is 0.844, and two datasets are poor**: Linux 0.349 and HealthApp 0.717. Both have shapes whose variable parts are unquoted free text, which no masking heuristic separates from the static parts. This is the honest ceiling of masking-plus-fixed-length-bucketing.
+- **Cross-node template convergence is unproven.** Fingerprints are now content-derived (below), so two agents on the same log source *should* agree, but nothing measures whether they converge on the same widened templates from different arrival orders. The right test is replaying a shuffled stream and comparing fingerprint assignments.
+- **The benchmark uses the 2,000-line samples.** LogHub 2.0 has full annotated datasets in the millions; the tail and the memory bound are barely exercised at 2k.
 
 ## Deferred (do not pull in)
 Novelty/rate anomaly layer (EWMA + SpaceSaving + HLL) · k8s DaemonSet · S3 tiering · DuckLake aggregation tier · Flight SQL · syslog · ES `_bulk` · Datadog/OTLP out.

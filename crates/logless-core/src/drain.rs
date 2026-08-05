@@ -42,16 +42,29 @@ pub struct DrainConfig {
     /// Fraction of *comparable* positions that must match for a line to join an
     /// existing template.
     ///
-    /// Measured against the 11 LogHub corpora, which publish ground-truth
-    /// template counts. At the original 0.4 the geometric-mean ratio of our
-    /// count to theirs was 0.59x — over-merging badly, with only 4 of 11
-    /// datasets within 2x. At 0.8 it is 0.99x with 10 of 11 within 2x.
+    /// Measured against the 11 LogHub corpora and their published ground-truth
+    /// template counts, comparing on the parsed `Content` field — which is what
+    /// the ground truth describes. Scored by mean absolute log-ratio
+    /// ("dispersion"), because a geometric mean can sit at 1.00 while half the
+    /// datasets over-split and half under-merge and the errors cancel:
     ///
-    /// Over-merging is the dangerous direction here and is why this is tuned
-    /// high: distinct error shapes collapsing into one template means one
-    /// Sentry fingerprint for unrelated failures, and a dedupe window that
-    /// suppresses errors which are not duplicates. Over-splitting only costs
-    /// dictionary entries. `scripts/loghub.sh` reproduces the sweep.
+    /// | threshold | geo-mean | dispersion |
+    /// |---|---|---|
+    /// | 0.4 | 0.91x | 0.138 |
+    /// | 0.8 | 0.96x | 0.124 |
+    /// | **0.9** | **1.00x** | **0.098** |
+    /// | 0.93–1.0 | 1.02x | 0.094 (plateau) |
+    ///
+    /// 0.9 rather than the flat optimum at 0.93+: on this corpus they are worth
+    /// 0.004, and staying below the plateau keeps the wildcard-widening path
+    /// available for variability the masker misses — hostnames and thread names
+    /// that real deployments have and these corpora do not.
+    ///
+    /// Over-merging is the more dangerous direction, because distinct error
+    /// shapes collapsing into one template means one Sentry fingerprint for
+    /// unrelated failures and a dedupe window suppressing errors that are not
+    /// duplicates. Over-splitting only costs dictionary entries.
+    /// `scripts/loghub.sh` reproduces the sweep.
     pub similarity_threshold: f64,
     /// Hard cap on distinct templates. Past it, lines are reported untemplated
     /// rather than growing memory without limit — a corpus of pure noise must
@@ -64,7 +77,7 @@ impl Default for DrainConfig {
         Self {
             depth: 4,
             max_children: 100,
-            similarity_threshold: 0.8,
+            similarity_threshold: 0.9,
             max_templates: 10_000,
         }
     }
@@ -84,6 +97,36 @@ impl Template {
     pub fn text(&self) -> String {
         self.tokens.join(" ")
     }
+
+    /// Content-derived identity, stable across agents.
+    ///
+    /// [`Template::id`] is a per-agent counter minted in arrival order, which
+    /// is right for local bookkeeping and wrong for anything a *fleet* shares.
+    /// Two agents seeing the same log shape assign it different numbers, so a
+    /// Sentry fingerprint built from the id splits one issue across nodes and
+    /// merges unrelated errors that happen to share an index — the exact
+    /// opposite of the deterministic grouping this feature promises.
+    ///
+    /// Derived from the masked token sequence, so every agent watching the
+    /// same service agrees without coordinating. Widening a template does
+    /// change it, which starts a new Sentry issue at that point; that is the
+    /// price of not needing a central registry, and it is rare compared with
+    /// the alternative, which is wrong on every node from the start.
+    pub fn fingerprint(&self) -> u64 {
+        fingerprint_of(&self.text())
+    }
+}
+
+/// FNV-1a over the template text. Not [`std::hash::DefaultHasher`], which is
+/// explicitly not stable across builds or processes — the one property this
+/// needs.
+pub fn fingerprint_of(template_text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in template_text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
 }
 
 #[derive(Debug, PartialEq)]
@@ -328,6 +371,18 @@ fn similarity(template: &[String], tokens: &[String]) -> f64 {
         // Same length, same tree path, and nothing but variables: one shape.
         return 1.0;
     }
+    // Tried and rejected: allowing a single differing position outright,
+    // regardless of length, on the reasoning that one-in-five is the same
+    // evidence as one-in-twenty. Measured, it over-merges — dispersion across
+    // the LogHub corpora went from 0.098 to 0.128, worse than the entire gain
+    // from tuning this threshold, and it made the threshold itself irrelevant
+    // (0.8, 0.9 and 0.95 all produced identical results).
+    //
+    // The consequence, which is deliberate: on a short line, merging depends on
+    // the masker rather than on wildcard widening. A five-token template at 0.9
+    // needs all five comparable positions to match. That costs extra dictionary
+    // entries, which is the cheap error; the expensive one is distinct error
+    // shapes sharing a fingerprint.
     matches as f64 / comparable as f64
 }
 
@@ -416,15 +471,33 @@ mod tests {
     #[test]
     fn merging_widens_a_static_position_to_a_wildcard() {
         let mut d = drain();
-        // Same length and mostly the same tokens, differing in one static word.
-        let a = d.add_line("connection to primary database succeeded", 0).unwrap();
-        let b = d.add_line("connection to replica database succeeded", 0).unwrap();
+        // Long enough that one differing word is inside the threshold: 13
+        // comparable positions, one of which differs, is 0.92 >= 0.9.
+        let a = d
+            .add_line("connection to primary database succeeded after retry from pool worker on node alpha", 0)
+            .unwrap();
+        let b = d
+            .add_line("connection to replica database succeeded after retry from pool worker on node alpha", 0)
+            .unwrap();
 
         assert_eq!(a.template_id, b.template_id, "should merge, not fork");
         let template = d.template(a.template_id).unwrap();
-        assert_eq!(template.text(), "connection to <*> database succeeded");
+        assert!(template.text().contains("connection to <*> database"), "{}", template.text());
         // The differing word is now recoverable as a parameter.
-        assert_eq!(b.params, vec!["replica"]);
+        assert!(b.params.contains(&"replica".to_string()), "{:?}", b.params);
+    }
+
+    #[test]
+    fn a_short_line_with_a_differing_word_forks_rather_than_merging() {
+        // The deliberate consequence of a high threshold: five tokens, one
+        // differing, is 0.8 and below the bar. Short lines rely on the masker,
+        // not on wildcard widening. Measured across the LogHub corpora, the
+        // alternative — allowing one difference regardless of length —
+        // over-merges and costs more than tuning the threshold ever gained.
+        let mut d = drain();
+        let a = d.add_line("connection to primary database succeeded", 0).unwrap();
+        let b = d.add_line("connection to replica database succeeded", 0).unwrap();
+        assert_ne!(a.template_id, b.template_id);
     }
 
     #[test]

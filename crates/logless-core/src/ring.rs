@@ -174,6 +174,11 @@ pub struct ContextWindow {
     /// Hash of the ordered template sequence; identical flows collapse on it.
     pub flow_hash: u64,
     pub error_template_id: Option<u64>,
+    /// Content-derived identity of the error's template, stable across agents.
+    /// The numeric id above is a per-agent counter and must never leave the
+    /// node as a grouping key. `None` when the line did not template.
+    #[serde(default)]
+    pub error_template_fingerprint: Option<u64>,
     pub service: Option<String>,
     /// Occurrences collapsed into this window since it was first emitted.
     pub suppressed: u64,
@@ -465,6 +470,8 @@ impl Ring {
             key_tier: key.tier,
             flow_hash,
             error_template_id: error.template_id,
+            // Filled in by the caller, which holds the template dictionary.
+            error_template_fingerprint: None,
             service: error.service.clone(),
             suppressed: suppressed_since,
         }))

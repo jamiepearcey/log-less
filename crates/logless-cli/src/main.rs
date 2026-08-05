@@ -1021,7 +1021,12 @@ fn run(
                 // Every error is forwarded. Only the context is economised on.
                 *errors_forwarded += 1;
                 let (json, outbound) = match ring.capture(&record) {
-                    Capture::Window(w) => {
+                    Capture::Window(mut w) => {
+                        // The ring assigns the local template id; the grouping
+                        // key has to be content-derived, and only here is the
+                        // template *text* known.
+                        w.error_template_fingerprint = (!template_text.is_empty())
+                            .then(|| logless_core::drain::fingerprint_of(&template_text));
                         *windows += 1;
                         let json = window_json(&w);
                         (
@@ -1813,6 +1818,12 @@ fn bare_window(record: &LogRecord, flow_hash: Option<u64>) -> ContextWindow {
         key_tier: KeyTier::Service,
         flow_hash: flow_hash.unwrap_or(0),
         error_template_id: record.template_id,
+        // Falls back to the body when no template text is to hand. Two agents
+        // seeing the same *line* still agree, which is the property that
+        // matters; only the widened-template case needs the dictionary.
+        error_template_fingerprint: record
+            .template_id
+            .map(|_| logless_core::drain::fingerprint_of(&record.body)),
         service: record.service.clone(),
         suppressed: 0,
     }
