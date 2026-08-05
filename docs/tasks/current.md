@@ -45,7 +45,7 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] **Benched: 775,617 lines/s/core release (target ≥500k, met); 15 templates from 2M lines; 0% untemplated.** Debug build is ~39k/s — never bench unoptimised.
 - [x] Fallback path intact: nothing depends on templating: a `None` match writes the record untemplated.
 - [x] **Benchmarked against the 11 real LogHub corpora** with their published ground-truth template counts (`scripts/loghub.sh`). 568k lines/s/core on real logs. **This changed a default**: see below.
-- [ ] **Store template id + parameter columns instead of the body text.** Measured: templating alone left compression unchanged at 2.4×, exactly as the design predicted — the ratio gain needs this step.
+- [x] **Store template id + parameter columns instead of body text — measured, and rejected.** See "The compression step that was not there" below. The assumption was 4–8×; it is 4.7%.
 - [x] **Bracketed component prefixes are masked** (`<COMP>`): 5 shapes across 3 components now yield 5 templates, not 15. A bracketed *level* is excluded — merging `[ERROR]` with `[INFO]` would put an error's fingerprint on an info line.
 
 ### Bugs found by end-to-end testing (fixed, weeks 2–3)
@@ -62,7 +62,8 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] Demo: 100k lines / 221 errors → every error forwarded, 6 context windows, **132× less data upstream**.
 - [x] Bounds tested: 100k lines through a 1 MB ring stays under budget; one chatty key cannot evict a quiet neighbour.
 - [x] **Storm harness** (`scripts/storm.sh`, in CI): 10k errors/s sustained, **peak RSS 75 MiB** against a 512 MiB budget, sampled from `ps` rather than from our own accounting — which is exactly what would be wrong if the ring leaked.
-- [ ] Measure dedupe window and windows-per-minute against a real corpus — the 60s/3 defaults are guesses.
+- [x] **Dedupe window measured against a contiguous real corpus** (`dedupe-stats`, Thunderbird, 871s): repeat gaps p50=1s, p90=14s, p99=22s. A 30s window collapses 99.3% of repeats and 60s collapses 99.5%, so the 60s default stands — now measured rather than guessed.
+- [x] **Global context-window ceiling added** (`max_windows_per_minute`, default 30). The measurement found the real gap: the busiest minute produced **80 distinct new templates**, and the existing budget is per-shape, so 80 shapes could each spend their own — a burst arriving at the vendor exactly when everything else is going wrong.
 
 ### Bugs found by end-to-end testing (fixed, weeks 4–5)
 - **Templates over-merged**: masked positions counted as *matches* in the similarity score, so a shared `service=… trace_id=…` prefix alone could clear the threshold. Four distinct debug messages collapsed into one template id, which would have broken novelty detection and flow hashing. Variable positions no longer count toward similarity.
@@ -91,7 +92,7 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] **Sentry ingest proxy**: `/api/<project>/envelope/` and the legacy `/store/`, gzip, byte-exact forwarding, `relay` vs `resign` upstream identity, per-project routing, deterministic transaction sampling, attachments held locally, unknown item types passed through, upstream rate limits honoured and reflected back to SDKs.
 - [x] **Verified against the real `sentry-sdk`** (2.66.1) with a stand-in upstream: 20 errors + 1 message + 12 transactions → 23 items forwarded, 10 transactions sampled out at `transaction_sample_rate = 0.25`, all 33 stored locally with full payloads. Relay sent `/api/1234/envelope/` with `sentry_key=appkey123`; resign sent `/api/77/envelope/` with `sentry_key=ourteamkey`. Stacktraces, `release`, `environment`, `server_name` and trace context all intact upstream.
 - [x] **Sentry upstream queue is spooled to disk**, fsynced before the SDK is answered `200`. Tested across a restart with an unreachable upstream: envelopes are delivered later, and a delivered envelope is not re-sent.
-- [ ] Sentry proxy: replay held-back transactions and attachments upstream on demand — the "undo button" for the Sentry path, matching what the log path already promises.
+- [x] **Sentry replay upstream** (`logless replay --to-sentry`). Verified: 6 transactions held back live at `transaction_sample_rate = 0`, then replayed to `/api/4242/envelope/` with the client's own key under relay mode, carrying the SDK's original payload bytes.
 - [x] **Delivery cursor persisted** for the log forwarder too: undelivered events are replayed on start.
 - [x] **Tail glob patterns** with periodic rediscovery (`*`, `?`, `[a-z]`, `[!…]`). Re-expanded every 5s, because the window in which a new service's log file appears is exactly the window an incident lives in. `**` is deliberately unsupported and matches nothing rather than half-working.
 - [x] **Replay scanner** (`scan.rs`) and `logless replay`: prunes by partition directory, then row-group statistics, then rows. `--explain` shows which files a query would open. Sends matched history to the configured destinations with `--forward` — the undo button.
@@ -126,12 +127,27 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - **Aggregate events showed an example instead of a shape**: the rollup's `template` field received the raw body. An aggregate exists to show the shape, so it now carries the masked template text alongside one concrete example.
 - **Long ids classified as `<NUM>`**: a 32-character all-digit trace id matched the numeric check before the hex one. Tokens of 16+ characters are identifiers, not quantities.
 
+### The compression step that was not there
+
+`compression-experiment` writes 22,000 real LogHub lines both ways, with identical writer settings:
+
+| | bytes | vs raw |
+|---|---|---|
+| raw text | 3,178,575 | — |
+| Parquet, body stored | 706,940 | 4.50× |
+| Parquet, template id + params, no body | 673,794 | 4.72× |
+| template dictionary (shared, written once) | 64,444 | — |
+
+**4.7% smaller with the dictionary amortised across files; 4.4% *larger* if it is not.** The design assumed this step was worth 4–8×.
+
+The reason is that the work is already being done: zstd plus dictionary encoding over the sorted `body` column removes exactly the redundancy templating would remove. The template text is the repetitive part and compresses to nearly nothing; the parameters are the high-entropy part and are incompressible either way. Templating was never the missing compression step — it earns its place through *structure* (stable ids for fingerprints, dedupe and novelty), which is what §3 of the architecture already claimed and what the earlier "2.4×, unchanged" measurement was actually telling us.
+
+So this is closed as **rejected on measurement**: a few percent is not worth making `body` derivable, breaking the Parquet contract, and forcing every external reader to join a dictionary to see their own log text. Compaction (72%) and the sort order were where the real wins were.
+
 ## Still open
 
-- **Store template id + parameter columns instead of body text.** The remaining compression work, and the one that needs a schema change: `body` would become derivable rather than stored, so external readers would have to join a template dictionary. Compaction has since delivered 72% on fragmentation, which was the other half of the same problem.
-- **Sentry replay upstream.** History is already stored with the full envelope payload, so replaying held-back transactions and attachments is now a scan plus a re-send — but it is not written.
-- **Dedupe window and windows-per-minute are still guesses** (60s / 3). The LogHub corpora are now downloaded by `scripts/loghub.sh` and carry timestamps, so this is measurable rather than merely stated.
 - **Chaos harness covers SIGKILL only.** Disk-full and io-throttle injection are not automated.
+- **Two LogHub datasets still over-split** (Proxifier 3.25×, Apache 2.00×): both are dominated by lines whose only variable part is a path or a duration, which the masker splits more finely than the ground truth does.
 
 ## Deferred (do not pull in)
 Novelty/rate anomaly layer (EWMA + SpaceSaving + HLL) · k8s DaemonSet · S3 tiering · DuckLake aggregation tier · Flight SQL · syslog · ES `_bulk` · Datadog/OTLP out.

@@ -111,6 +111,8 @@ At-least-once with idempotency keys (UUIDv7 per event, assigned at ingest). Exac
 
 Note the debug build manages only ~39k lines/s — the target holds only when optimised, so never benchmark this in a debug profile.
 
+**Measured, and it settles the question**: storing template id + parameter columns *instead of* the body is 4.7% smaller with the dictionary amortised, and 4.4% larger without — not the 4–8× assumed. zstd plus dictionary encoding over the sorted body column is already removing the redundancy templating would remove. See `docs/tasks/current.md`.
+
 The compression row is the important one and it confirms the reasoning above rather than contradicting it: `template_id` is assigned but `body` is still stored in full, so nothing shrinks yet. Ratio gains need the follow-up step (store template id + parameter columns *instead of* the body text). Templating earns its place today through **structure** — stable ids for novelty detection, rate baselines and Sentry fingerprints.
 
 - **Hard rule**: the architecture must not *depend* on templating. If throughput or stability misses target, fall back to sorted + zstd and lose only the anomaly features.
@@ -291,6 +293,8 @@ The bet is that the OTLP logs message tree is frozen — protobuf's compatibilit
 | Dropping unrecognised envelope item types | Breaks every SDK feature newer than this build | Unknown types pass through untouched, under their real name |
 | Swallowing upstream `429`s | The SDKs behind the proxy never see the signal and keep sending into a wall | Limits recorded, applied before send, and reflected back verbatim |
 | Random transaction sampling | Splits one trace across the boundary; Sentry shows half a transaction tree | Deterministic FNV-1a on the envelope id |
+| Storing template id + parameters instead of body text | Measured on 22k real lines: 4.7% smaller at best, 4.4% larger per-file. zstd over the sorted body column already removes the same redundancy | Keep the body; templating earns its place through structure, not size |
+| A global cap on context windows being unnecessary | The per-shape budget does nothing about many shapes at once, and the busiest real minute had 80 distinct new templates | `max_windows_per_minute`, default 30 |
 | A similarity threshold tuned on synthetic lines | 0.4 over-merged every real corpus (0.59× ground truth, 4/11 within 2×); distinct error shapes shared one fingerprint | 0.8, measured against 11 LogHub corpora (0.99×, 10/11) |
 | Scoring template similarity over *all* tokens | The score then depends on how much of the line is masked, so improving the masker splits templates that used to merge (observed: one template became a hundred) | Score over comparable (non-variable) positions only |
 | An accounting tolerance derived from the fsync byte budget | Worked out at 65,000 records and reported OK while 30,000 were missing | Zero tolerance by default; slack is opt-in for auditing after a known kill |

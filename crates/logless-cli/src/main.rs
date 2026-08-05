@@ -220,6 +220,11 @@ enum Command {
         /// this, `replay` only prints what it would send.
         #[arg(long)]
         forward: bool,
+        /// Send matched Sentry-proxied items to upstream Sentry instead. This
+        /// is the undo button for the proxy path: transactions and attachments
+        /// held back at the time can be sent now, from the copy on disk.
+        #[arg(long)]
+        to_sentry: bool,
         /// Show which files the query would open, and stop.
         #[arg(long)]
         explain: bool,
@@ -325,6 +330,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             contains,
             limit,
             forward,
+            to_sentry,
             explain,
         } => {
             let config = load(&config)?;
@@ -340,7 +346,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 contains,
                 limit,
             };
-            replay(&config, &query, forward, explain)?;
+            replay(&config, &query, forward, to_sentry, explain)?;
         }
 
         Command::Recover { config, repair } => {
@@ -1503,6 +1509,7 @@ fn replay(
     config: &Config,
     query: &logless_core::scan::Query,
     forward: bool,
+    to_sentry: bool,
     explain: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store_dir = config.store_dir();
@@ -1529,6 +1536,10 @@ fn replay(
         result.stats.row_groups_pruned,
         if result.truncated { " — TRUNCATED at the limit" } else { "" }
     )?;
+
+    if to_sentry {
+        return replay_to_sentry(config, &result.records, &mut out);
+    }
 
     if !forward {
         for record in result.records.iter().take(20) {
@@ -1583,6 +1594,66 @@ fn replay(
             stats.failures
         )?;
     }
+    Ok(())
+}
+
+/// Re-sends stored Sentry items upstream.
+fn replay_to_sentry(
+    config: &Config,
+    records: &[LogRecord],
+    out: &mut impl Write,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(dsn) = config.sentry.upstream_dsn.as_deref().and_then(sentry::Dsn::parse) else {
+        writeln!(out, "sentry.upstream_dsn is not set; nothing to replay to")?;
+        return Ok(());
+    };
+    let upstream = sentry::Upstream::new(Box::new(HttpTransport::default()));
+    let now = now_unix_secs();
+    let (mut sent, mut skipped) = (0u64, 0u64);
+
+    for record in records {
+        let Some((project, envelope)) = sentry::envelope_from_record(record) else {
+            // Not a proxied Sentry item — an ordinary log line matched the
+            // same query. Skipped rather than converted: inventing an event
+            // Sentry never saw is not a replay.
+            skipped += 1;
+            continue;
+        };
+        // Replay honours the same relay/resign choice as live traffic, so an
+        // event lands in the project it would have landed in at the time.
+        let target = match config.sentry.upstream_auth {
+            sentry::UpstreamAuth::Relay => logless_core::sentry::dsn::UpstreamTarget {
+                url: format!("{}/api/{}/envelope/", dsn.origin(), project),
+                key: record
+                    .attributes
+                    .iter()
+                    .find(|a| a.key == "sentry.key")
+                    .and_then(|a| match &a.value {
+                        logless_core::AttrValue::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| dsn.key.clone()),
+                project,
+            },
+            sentry::UpstreamAuth::Resign => logless_core::sentry::dsn::UpstreamTarget {
+                url: dsn.envelope_url(),
+                key: dsn.key.clone(),
+                project: dsn.project.clone(),
+            },
+        };
+        match upstream.send(&target, &envelope, now) {
+            sentry::Delivery::Sent { status } if status < 400 => sent += 1,
+            other => {
+                writeln!(out, "  upstream refused one envelope: {other:?}")?;
+            }
+        }
+    }
+    let stats = upstream.stats.snapshot();
+    writeln!(
+        out,
+        "replayed {sent} envelopes to Sentry ({skipped} matched records were not proxied items); bytes_sent={} failures={}",
+        stats.bytes_sent, stats.failures
+    )?;
     Ok(())
 }
 

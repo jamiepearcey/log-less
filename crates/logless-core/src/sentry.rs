@@ -735,6 +735,46 @@ fn drain_once(upstream: &Upstream, spool: Option<&std::sync::Mutex<Spool>>) -> b
     false
 }
 
+/// Rebuilds an envelope from a record the store kept, for replay.
+///
+/// The proxy stores every item's raw payload (`sentry.payload`), including the
+/// ones policy held back — that is what makes the forwarding decision
+/// reversible rather than merely delayed. Replay is therefore a scan plus a
+/// re-send, not a reconstruction: the bytes going upstream now are the bytes
+/// the SDK produced then.
+pub fn envelope_from_record(record: &LogRecord) -> Option<(String, Envelope)> {
+    let attr = |key: &str| {
+        record.attributes.iter().find(|a| a.key == key).and_then(|a| match &a.value {
+            AttrValue::Str(s) => Some(s.clone()),
+            _ => None,
+        })
+    };
+    let payload = attr("sentry.payload")?;
+    let item_type = attr("sentry.item_type").unwrap_or_else(|| "event".to_string());
+    let project = attr("sentry.project")?;
+    let event_id = attr("sentry.event_id").unwrap_or_else(new_event_id);
+
+    let mut header = serde_json::Map::new();
+    header.insert("event_id".into(), serde_json::Value::String(event_id));
+    Some((
+        project,
+        Envelope {
+            header,
+            items: vec![Item {
+                header_raw: format!(
+                    "{{\"type\":\"{item_type}\",\"length\":{}}}",
+                    payload.len()
+                )
+                .into_bytes(),
+                item_type: ItemType::parse(&item_type),
+                type_name: item_type,
+                payload: payload.into_bytes(),
+                had_length: true,
+            }],
+        },
+    ))
+}
+
 /// Sentry event ids are 32 lowercase hex characters with no dashes.
 fn new_event_id() -> String {
     uuid::Uuid::now_v7().simple().to_string()

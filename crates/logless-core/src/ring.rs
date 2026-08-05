@@ -129,6 +129,15 @@ pub struct RingConfig {
     /// Full context windows allowed per `(service, template)` per minute.
     /// Beyond it, errors are still reported but without their context.
     pub windows_per_minute: u32,
+    /// Ceiling on context windows per minute across *all* shapes.
+    ///
+    /// The per-template budget bounds a storm of one shape. It does nothing
+    /// about many shapes at once, which is what the start of an incident looks
+    /// like: measured on a contiguous real corpus, the busiest minute produced
+    /// **80 distinct new templates**, and 80 × `windows_per_minute` is a burst
+    /// of full context windows arriving at the vendor exactly when everything
+    /// else is also going wrong. This is the backstop for that.
+    pub max_windows_per_minute: u32,
     /// Identical windows within this period collapse into one.
     pub dedupe_window: Duration,
 }
@@ -142,6 +151,7 @@ impl Default for RingConfig {
             context_age: Duration::from_secs(30),
             max_context_lines: 200,
             windows_per_minute: 3,
+            max_windows_per_minute: 30,
             dedupe_window: Duration::from_secs(60),
         }
     }
@@ -238,6 +248,8 @@ pub struct Ring {
     shards: Vec<Shard>,
     /// `(service, template)` → (window start nanos, windows emitted).
     budgets: HashMap<(String, u64), (u64, u32)>,
+    /// (minute start, windows emitted in it) across every shape.
+    global_budget: (u64, u32),
     /// flow hash → (last emitted nanos, suppressed count).
     recent_flows: HashMap<u64, (u64, u64)>,
     pub stats: RingStats,
@@ -251,6 +263,7 @@ impl RingConfig {
             max_context_lines: p.max_context_lines,
             context_age: p.context_age,
             windows_per_minute: p.windows_per_minute,
+            max_windows_per_minute: p.max_windows_per_minute,
             dedupe_window: p.dedupe_window,
             ..Default::default()
         }
@@ -270,6 +283,7 @@ impl Ring {
             config,
             shards,
             budgets: HashMap::new(),
+            global_budget: (0, 0),
             recent_flows: HashMap::new(),
             stats: RingStats::default(),
         }
@@ -407,13 +421,26 @@ impl Ring {
             self.recent_flows.insert(flow_hash, (now, 0));
         }
 
+        // Global ceiling first: the per-shape budget below bounds one storm,
+        // but not many shapes starting at once.
+        let minute_ns = Duration::from_secs(60).as_nanos() as u64;
+        if now.saturating_sub(self.global_budget.0) >= minute_ns {
+            self.global_budget = (now, 0);
+        }
+        if self.global_budget.1 >= self.config.max_windows_per_minute {
+            self.stats.windows_rate_limited += 1;
+            return Capture::ContextSuppressed {
+                reason: Suppressed::RateLimited,
+                flow_hash: Some(flow_hash),
+            };
+        }
+
         // Rate limit per (service, error template): bounds egress by the number
         // of distinct error shapes, not the number of errors.
         let service = error.service.clone().unwrap_or_default();
         let template = error.template_id.unwrap_or(0);
-        let minute = Duration::from_secs(60).as_nanos() as u64;
         let budget = self.budgets.entry((service.clone(), template)).or_insert((now, 0));
-        if now.saturating_sub(budget.0) >= minute {
+        if now.saturating_sub(budget.0) >= minute_ns {
             *budget = (now, 0);
         }
         if budget.1 >= self.config.windows_per_minute {
@@ -424,6 +451,7 @@ impl Ring {
             };
         }
         budget.1 += 1;
+        self.global_budget.1 += 1;
 
         self.stats.windows_emitted += 1;
         Capture::Window(Box::new(ContextWindow {
@@ -504,6 +532,59 @@ mod tests {
     fn with_trace(mut r: LogRecord, trace: u8) -> LogRecord {
         r.trace_id = Some([trace; 16]);
         r
+    }
+
+    #[test]
+    fn a_global_ceiling_bounds_many_shapes_starting_at_once() {
+        // The per-shape budget bounds one storm and does nothing about many
+        // shapes at once, which is what the start of an incident looks like:
+        // measured on a contiguous real corpus, the busiest minute produced 80
+        // distinct new templates. Without this, that is 80 separate budgets
+        // all spending at the vendor simultaneously.
+        let mut ring = Ring::new(RingConfig {
+            windows_per_minute: 100,
+            max_windows_per_minute: 5,
+            ..RingConfig::default()
+        });
+        let mut captured = 0;
+        for shape in 0..50u64 {
+            // Each shape gets its own trace and a preceding line, so every one
+            // of them genuinely has context to attach and reaches the limiter.
+            let trace = shape as u8;
+            ring.observe(&with_trace(line(999, Severity::DEBUG, "before", 900), trace));
+            let error = with_trace(line(1_000, Severity::ERROR, "boom", shape), trace);
+            ring.observe(&error);
+            if matches!(ring.capture(&error), Capture::Window(_)) {
+                captured += 1;
+            }
+        }
+        assert_eq!(captured, 5, "distinct shapes share one global budget");
+        assert!(ring.stats.windows_rate_limited >= 45);
+    }
+
+    #[test]
+    fn the_global_ceiling_refills_each_minute() {
+        let mut ring = Ring::new(RingConfig {
+            windows_per_minute: 100,
+            max_windows_per_minute: 2,
+            ..RingConfig::default()
+        });
+        let mut captured = 0;
+        for shape in 0..10u64 {
+            let trace = shape as u8;
+            ring.observe(&with_trace(line(999, Severity::DEBUG, "before", 900), trace));
+            let error = with_trace(line(1_000, Severity::ERROR, "boom", shape), trace);
+            ring.observe(&error);
+            if matches!(ring.capture(&error), Capture::Window(_)) {
+                captured += 1;
+            }
+        }
+        assert_eq!(captured, 2);
+        // A minute later the budget is back: suppression must not be permanent.
+        ring.observe(&with_trace(line(1_099, Severity::DEBUG, "before", 900), 99));
+        let later = with_trace(line(1_100, Severity::ERROR, "boom", 99), 99);
+        ring.observe(&later);
+        assert!(matches!(ring.capture(&later), Capture::Window(_)));
     }
 
     #[test]
@@ -627,6 +708,7 @@ mod tests {
         let mut ring = Ring::new(RingConfig {
             dedupe_window: Duration::from_secs(10),
             windows_per_minute: 100,
+            max_windows_per_minute: u32::MAX,
             ..Default::default()
         });
         // First window, then four collapsed into it.
@@ -651,6 +733,7 @@ mod tests {
         // escalation an operator needs to see; the rate limiter bounds them.
         let mut ring = Ring::new(RingConfig {
             windows_per_minute: 100,
+            max_windows_per_minute: u32::MAX,
             ..Default::default()
         });
         for round in 0..5u64 {

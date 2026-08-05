@@ -27,6 +27,12 @@ scripts/loghub.sh        # template mining against 11 real corpora with publishe
 scripts/licences.sh      # every dependency is permissively licensed
 ```
 
+Two of those changed the design rather than confirming it: the LogHub benchmark
+showed the template similarity threshold was over-merging every real dataset,
+and a compression experiment showed the long-planned "store templates instead of
+bodies" step was worth 4.7%, not the 4–8× assumed. Both are written up in
+[`docs/tasks/current.md`](docs/tasks/current.md).
+
 ## Why
 
 Vendors price on ingest volume, so teams raise log levels to save money and then

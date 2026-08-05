@@ -65,6 +65,10 @@ pub struct PushdownConfig {
     /// egress by distinct error shapes rather than error count.
     #[serde(default = "default_windows_per_minute")]
     pub windows_per_minute: u32,
+    /// Ceiling on context windows per minute across all shapes. The per-shape
+    /// budget bounds one storm; this bounds an incident starting.
+    #[serde(default = "default_max_windows_per_minute")]
+    pub max_windows_per_minute: u32,
     #[serde(default = "default_dedupe_window", with = "humantime_serde")]
     pub dedupe_window: Duration,
 }
@@ -87,6 +91,9 @@ fn default_context_age() -> Duration {
 fn default_windows_per_minute() -> u32 {
     3
 }
+fn default_max_windows_per_minute() -> u32 {
+    30
+}
 fn default_dedupe_window() -> Duration {
     Duration::from_secs(60)
 }
@@ -100,6 +107,7 @@ impl Default for PushdownConfig {
             max_context_lines: default_context_lines(),
             context_age: default_context_age(),
             windows_per_minute: default_windows_per_minute(),
+            max_windows_per_minute: default_max_windows_per_minute(),
             dedupe_window: default_dedupe_window(),
         }
     }
