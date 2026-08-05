@@ -1,0 +1,70 @@
+# --- Rust -------------------------------------------------------------------
+/target
+**/*.rs.bk
+# Only a library publishes without a lockfile; this workspace ships a binary,
+# so Cargo.lock is committed deliberately and is NOT ignored here.
+
+# Coverage and profiling output
+*.profraw
+*.profdata
+/coverage/
+tarpaulin-report.*
+perf.data*
+flamegraph.svg
+*.heaptrack*
+
+# Benchmark and fuzzing artefacts
+/criterion/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+
+# --- This project's own on-disk state ---------------------------------------
+# What `logless run` creates. If anyone points a config at the checkout, these
+# appear — and committing a WAL or a partitioned store would publish whatever
+# logs were being tested with, which for a log agent is the worst thing to leak.
+/wal/
+/store/
+**/catalog.db
+**/catalog.db-shm
+**/catalog.db-wal
+*.parquet
+tail.ckpt
+*.wal
+# Pushdown/demo output, and the throwaway data dirs the walkthroughs create.
+*.jsonl
+/scratch/
+/demo/
+/*demo/
+/logless.toml
+
+# Generated configs may carry a real DSN, HEC token or Sentry key. The example
+# in the README is the only config that belongs in the repo.
+*.local.toml
+config.local.toml
+.env
+.env.*
+!.env.example
+
+# --- Tooling ----------------------------------------------------------------
+# `.claude/settings.json` is shared; `settings.local.json` is per-developer and
+# records paths and permissions specific to one machine.
+.claude/settings.local.json
+# ...and the temp files the tool writes beside it while saving.
+.claude/settings.local.json.tmp.*
+
+# Python used only by the verification harnesses, never by the agent itself.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+otelenv/
+
+# --- Editors and OS ---------------------------------------------------------
+.DS_Store
+.AppleDouble
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
