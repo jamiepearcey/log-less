@@ -39,6 +39,19 @@ pub struct DrainConfig {
     /// wildcard branch rather than growing the tree without bound.
     pub max_children: usize,
     /// Fraction of matching positions required to join an existing template.
+    /// Fraction of *comparable* positions that must match for a line to join an
+    /// existing template.
+    ///
+    /// Measured against the 11 LogHub corpora, which publish ground-truth
+    /// template counts. At the original 0.4 the geometric-mean ratio of our
+    /// count to theirs was 0.59x — over-merging badly, with only 4 of 11
+    /// datasets within 2x. At 0.8 it is 0.99x with 10 of 11 within 2x.
+    ///
+    /// Over-merging is the dangerous direction here and is why this is tuned
+    /// high: distinct error shapes collapsing into one template means one
+    /// Sentry fingerprint for unrelated failures, and a dedupe window that
+    /// suppresses errors which are not duplicates. Over-splitting only costs
+    /// dictionary entries. `scripts/loghub.sh` reproduces the sweep.
     pub similarity_threshold: f64,
     /// Hard cap on distinct templates. Past it, lines are reported untemplated
     /// rather than growing memory without limit — a corpus of pure noise must
@@ -51,7 +64,7 @@ impl Default for DrainConfig {
         Self {
             depth: 4,
             max_children: 100,
-            similarity_threshold: 0.4,
+            similarity_threshold: 0.8,
             max_templates: 10_000,
         }
     }
@@ -292,14 +305,30 @@ fn similarity(template: &[String], tokens: &[String]) -> f64 {
     if template.is_empty() {
         return 1.0;
     }
-    let matches = template
-        .iter()
-        .zip(tokens)
-        .filter(|(t, l)| {
-            t == l && *t != WILDCARD && !mask::is_placeholder(t) && !mask::is_placeholder(l)
-        })
-        .count();
-    matches as f64 / template.len() as f64
+    // Score over *comparable* positions only, not over every token.
+    //
+    // Variable positions carry no evidence either way: two lines that both say
+    // `id=<NUM>` there are neither more nor less alike for it. Dividing by the
+    // total instead makes the score depend on how much of the line happens to
+    // be masked, so improving the masking heuristics silently pushes shapes
+    // below the threshold and splits templates that used to merge. (Observed:
+    // masking a leading `[component]` turned one template into a hundred.)
+    let mut comparable = 0usize;
+    let mut matches = 0usize;
+    for (t, l) in template.iter().zip(tokens) {
+        if *t == WILDCARD || mask::is_placeholder(t) || mask::is_placeholder(l) {
+            continue;
+        }
+        comparable += 1;
+        if t == l {
+            matches += 1;
+        }
+    }
+    if comparable == 0 {
+        // Same length, same tree path, and nothing but variables: one shape.
+        return 1.0;
+    }
+    matches as f64 / comparable as f64
 }
 
 /// Widen a template to cover a new line: differing positions become wildcards.
@@ -370,7 +399,9 @@ mod tests {
         let m = d
             .add_line("[api] handled request id=4711 user=u99 latency_ms=812", 0)
             .unwrap();
-        assert_eq!(m.params, vec!["4711", "u99", "812"]);
+        // The component is a variable position, so it is a parameter too —
+        // which is what lets an aggregate report which components hit a shape.
+        assert_eq!(m.params, vec!["[api]", "4711", "u99", "812"]);
         assert!(m.is_new);
     }
 

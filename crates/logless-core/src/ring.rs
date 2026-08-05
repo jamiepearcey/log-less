@@ -27,7 +27,7 @@ use crate::model::LogRecord;
 
 /// Which signal identified the context. Reported upstream so users can see when
 /// correlation fell back to something weak and fix their instrumentation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum KeyTier {
     /// `trace_id` — the good case.
     Trace,
@@ -147,7 +147,7 @@ impl Default for RingConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContextLine {
     pub timestamp_unix_nano: u64,
     pub severity: u8,
@@ -156,7 +156,7 @@ pub struct ContextLine {
 }
 
 /// An error plus the lines that led to it — the payload forwarded upstream.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ContextWindow {
     pub error: ContextLine,
     pub context: Vec<ContextLine>,
@@ -170,7 +170,7 @@ pub struct ContextWindow {
 }
 
 /// Why a context window was not attached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Suppressed {
     /// An identical flow was forwarded recently; `flow_hash` points at it.
     DuplicateFlow,

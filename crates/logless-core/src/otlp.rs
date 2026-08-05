@@ -5,14 +5,17 @@
 //! destination change rather than a migration. `model.rs` is already the OTel
 //! logs data model, so this is a decode, not a translation.
 //!
-//! Two transports, one decoder: OTLP/HTTP (`http`) and OTLP/gRPC (`grpc`) both
-//! hand their protobuf to [`logs::decode_request`]. OTLP/JSON is a second
-//! *encoding* and is not implemented; the HTTP receiver answers `415` naming
-//! what is supported rather than failing as a malformed payload.
+//! Two transports and two encodings, one data model: OTLP/HTTP (`http`) and
+//! OTLP/gRPC (`grpc`) carry protobuf to [`logs::decode_request`], and
+//! OTLP/JSON goes through [`json::decode_request`]. All three produce the same
+//! `LogRecord`, so nothing downstream can tell which wire a record arrived on —
+//! which is what lets one error dedupe against the same error from a different
+//! transport.
 
 pub mod grpc;
 pub mod h2;
 pub mod http;
+pub mod json;
 pub mod logs;
 pub mod proto;
 

@@ -23,6 +23,7 @@ use logless_core::ring::{Capture, ContextLine, ContextWindow, KeyTier, Ring, Rin
 use logless_core::hec::{self, Admitted};
 use logless_core::sentry;
 use logless_core::otlp::{self, Accepted};
+use logless_core::spool::{Spool, SpoolConfig};
 use logless_core::tail::Tailer;
 use logless_core::{merge, now_unix_nanos, now_unix_secs, partition, queue, retention, store, wal};
 
@@ -31,6 +32,10 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 /// How often rolled-up aggregate events are flushed upstream. A long-running
 /// agent must not hold a storm's counter until shutdown.
 const AGGREGATE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+/// How long the WAL writer waits for more records before sealing a frame.
+/// Bounded by, and much smaller than, the fsync interval that already defines
+/// the crash window, so it adds no exposure that was not already there.
+const WAL_BATCH_LINGER: Duration = Duration::from_millis(5);
 /// How often tailed files are checked for new data.
 const TAIL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Decoded OTLP batches buffered between the receiver threads and the record
@@ -135,6 +140,29 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Check the whole-path accounting invariant.
+    ///
+    /// `received == committed + still-in-WAL + deliberately dropped`. The
+    /// in-process invariant stops at the WAL, and both merge data-loss bugs
+    /// lived past that point.
+    Verify {
+        #[arg(long)]
+        config: PathBuf,
+        /// Records allowed to be missing, for auditing after a known SIGKILL.
+        ///
+        /// Zero by default, and that is the point: after a clean shutdown the
+        /// counters are written *after* the final WAL sync, so there is no
+        /// window and no slack to give. A tolerance derived from the fsync
+        /// byte budget worked out at 65,000 records, and made this check report
+        /// OK while 30,000 records were missing.
+        #[arg(long, default_value_t = 0)]
+        tolerance: u64,
+    },
+    /// Combine small per-segment files into larger ones.
+    Compact {
+        #[arg(long)]
+        config: PathBuf,
+    },
     /// Expire partitions past their level bucket's retention.
     Retention {
         #[arg(long)]
@@ -166,6 +194,35 @@ enum Command {
         config: PathBuf,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// Query committed history, and optionally push it upstream.
+    ///
+    /// This is the "undo button": verbosity you chose not to forward at the
+    /// time can be sent to the vendor now, after the incident has told you
+    /// which window matters.
+    Replay {
+        #[arg(long)]
+        config: PathBuf,
+        /// How far back to look, e.g. `15m`, `2h`.
+        #[arg(long, default_value = "1h")]
+        since: String,
+        #[arg(long)]
+        service: Option<String>,
+        /// Minimum OTel severity number (17 = ERROR).
+        #[arg(long)]
+        min_severity: Option<u8>,
+        /// Only records whose body contains this substring.
+        #[arg(long)]
+        contains: Option<String>,
+        #[arg(long, default_value_t = 1000)]
+        limit: usize,
+        /// Send the matched records to the configured destinations. Without
+        /// this, `replay` only prints what it would send.
+        #[arg(long)]
+        forward: bool,
+        /// Show which files the query would open, and stop.
+        #[arg(long)]
+        explain: bool,
     },
     /// Measure template-mining throughput on synthetic lines.
     Bench {
@@ -260,6 +317,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?
         }
 
+        Command::Replay {
+            config,
+            since,
+            service,
+            min_severity,
+            contains,
+            limit,
+            forward,
+            explain,
+        } => {
+            let config = load(&config)?;
+            let window = humantime::parse_duration(&since)?;
+            let now = now_unix_nanos();
+            let query = logless_core::scan::Query {
+                from_unix_nano: Some(
+                    now.saturating_sub(window.as_secs().saturating_mul(1_000_000_000)),
+                ),
+                until_unix_nano: None,
+                service,
+                min_severity: min_severity.map(Severity),
+                contains,
+                limit,
+            };
+            replay(&config, &query, forward, explain)?;
+        }
+
         Command::Recover { config, repair } => {
             let config = load(&config)?;
             let report = wal::recover(&config.wal_dir(), repair, |_| {})?;
@@ -302,6 +385,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.untemplated,
                 report.new_templates,
                 drain.template_count()
+            );
+        }
+
+        Command::Verify { config, tolerance } => {
+            let config = load(&config)?;
+            let counters = logless_core::counters::Counters::load(&config.storage.data_dir);
+            let catalog = Catalog::open(&catalog_path(&config))?;
+            let (committed, _bytes) = catalog.totals()?;
+
+            // Replay the WAL to count what is accepted but not yet merged.
+            let mut in_wal = 0u64;
+            let report = wal::recover(&config.wal_dir(), false, |batch| {
+                in_wal += batch.len() as u64;
+            })?;
+
+            let audit = logless_core::counters::Audit {
+                received: counters.received,
+                committed,
+                in_wal,
+                dropped: counters.dropped,
+            };
+            println!(
+                "received={} committed={} in_wal={} dropped={} unaccounted={}",
+                audit.received, audit.committed, audit.in_wal, audit.dropped, audit.unaccounted()
+            );
+            println!("wal segments replayed: {}", report.segments_read);
+            if audit.unaccounted() < 0 {
+                // More on disk than the counters know about: the previous run
+                // did not exit cleanly, so the counter file predates records
+                // that were nonetheless committed. Stale bookkeeping, not loss.
+                println!(
+                    "counters are stale by {} records — the previous run did not exit cleanly",
+                    -audit.unaccounted()
+                );
+            } else if audit.balances(tolerance) {
+                println!("OK: every accepted record is committed, still in the WAL, or was deliberately dropped");
+            } else {
+                println!(
+                    "ACCOUNTING VIOLATION: {} records unaccounted for (tolerance {tolerance})",
+                    audit.unaccounted()
+                );
+                std::process::exit(2);
+            }
+        }
+
+        Command::Compact { config } => {
+            let config = load(&config)?;
+            let mut catalog = Catalog::open(&catalog_path(&config))?;
+            let report = logless_core::compact::compact(
+                &config.store_dir(),
+                &mut catalog,
+                &logless_core::compact::CompactConfig::default(),
+                None,
+            )?;
+            println!(
+                "compacted {} partitions: {} files -> {} ({} rows), {} -> {} bytes ({:.0}% saved)",
+                report.partitions_compacted,
+                report.files_replaced,
+                report.files_written,
+                report.rows,
+                report.bytes_before,
+                report.bytes_after,
+                report.saved_fraction() * 100.0
             );
         }
 
@@ -511,6 +657,19 @@ fn run(
     } else {
         let destinations = config.destinations.clone();
         let summary = Arc::clone(&dispatch_stats);
+        // Curated events are spooled before they are dispatched, so a restart
+        // resumes where delivery stopped instead of re-sending everything or
+        // dropping what was in flight. The cursor lives in its own file, not
+        // the catalog: it changes far more often than catalog rows, and a
+        // vendor outage should not become SQLite write traffic.
+        let spool_dir = config.storage.data_dir.join("forward-spool");
+        let mut spool = match Spool::open(&spool_dir, SpoolConfig::default()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!(error = %e, "forward spool unavailable; delivery is memory-only");
+                None
+            }
+        };
         Some(
             std::thread::Builder::new()
                 .name("logless-forward".into())
@@ -520,9 +679,30 @@ fn run(
                         .map(|d| Forwarder::new(d, Box::new(HttpTransport::default())))
                         .collect();
                     let mut dispatch = Dispatch::new(forwarders, AGGREGATE_FLUSH_INTERVAL);
+                    // Anything left from a previous run goes first, in order.
+                    if let Some(spool) = spool.as_mut() {
+                        replay_spool(spool, &mut dispatch);
+                    }
                     loop {
                         match outbound_rx.recv_timeout(Duration::from_millis(200)) {
-                            Ok(item) => dispatch.handle(&item),
+                            Ok(item) => {
+                                if let Some(spool) = spool.as_mut() {
+                                    if let Ok(bytes) = postcard::to_stdvec(&item) {
+                                        let _ = spool.push(&bytes);
+                                    }
+                                }
+                                dispatch.handle(&item);
+                                // Committed after dispatch: a crash in between
+                                // re-sends, and re-sending is recoverable in a
+                                // way that silently dropping is not.
+                                if let Some(spool) = spool.as_mut() {
+                                    if let Ok(batch) = spool.peek(256) {
+                                        if let Some((cursor, _)) = batch.last() {
+                                            let _ = spool.commit(*cursor);
+                                        }
+                                    }
+                                }
+                            }
                             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         }
@@ -596,7 +776,11 @@ fn run(
                     wal::WalWriter::open(&wal_dir, segment_bytes, fsync_interval, fsync_bytes)?;
                 active.store(w.current_segment_id(), Ordering::Relaxed);
                 loop {
-                    let batch = consumer.next_batch(4096, Duration::from_millis(20));
+                    let batch = consumer.next_batch_lingering(
+                        4096,
+                        Duration::from_millis(20),
+                        WAL_BATCH_LINGER,
+                    );
                     if !batch.is_empty() {
                         w.append(&batch)?;
                         active.store(w.current_segment_id(), Ordering::Relaxed);
@@ -739,12 +923,18 @@ fn run(
                 .upstream_dsn
                 .as_ref()
                 .map(|_| sentry::Upstream::new(Box::new(HttpTransport::default())));
-            Some(sentry::Receiver::start(&config.sentry, upstream, move |records| {
-                match tx.try_send(records) {
-                    Ok(()) => sentry::Admitted::Accepted,
-                    Err(_) => sentry::Admitted::Busy,
-                }
-            })?)
+            let sentry_spool = config.storage.data_dir.join("sentry-spool");
+            Some(sentry::Receiver::start(
+                &config.sentry,
+                upstream,
+                Some(sentry_spool.as_path()),
+                move |records| {
+                    match tx.try_send(records) {
+                        Ok(()) => sentry::Admitted::Accepted,
+                        Err(_) => sentry::Admitted::Busy,
+                    }
+                },
+            )?)
         }
         _ => None,
     };
@@ -1165,6 +1355,17 @@ fn run(
     }
 
     let s = stats.snapshot();
+    // Persisted before anything is printed: the audit is only meaningful if
+    // this survives every exit path that reached here.
+    let lifetime = logless_core::counters::Counters::load(&config.storage.data_dir).add_session(
+        s.received,
+        s.enqueued,
+        s.dropped() + refused_debug,
+    );
+    if let Err(e) = lifetime.save(&config.storage.data_dir) {
+        tracing::warn!(error = %e, "could not persist ingest counters");
+    }
+
     let mut out = std::io::stdout().lock();
     writeln!(
         out,
@@ -1276,6 +1477,115 @@ fn run(
     Ok(())
 }
 
+/// Re-dispatches whatever a previous run spooled but never delivered.
+fn replay_spool(spool: &mut Spool, dispatch: &mut Dispatch) {
+    let Ok(pending) = spool.peek(4096) else { return };
+    if pending.is_empty() {
+        return;
+    }
+    tracing::info!(count = pending.len(), "replaying undelivered events from the spool");
+    let mut last = None;
+    for (cursor, bytes) in pending {
+        match postcard::from_bytes::<Outbound>(&bytes) {
+            Ok(item) => dispatch.handle(&item),
+            // A record this build cannot read must not wedge the queue behind
+            // it forever; skipping is the lesser loss.
+            Err(e) => tracing::warn!(error = %e, "skipping an undecodable spool record"),
+        }
+        last = Some(cursor);
+    }
+    if let Some(cursor) = last {
+        let _ = spool.commit(cursor);
+    }
+}
+
+fn replay(
+    config: &Config,
+    query: &logless_core::scan::Query,
+    forward: bool,
+    explain: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store_dir = config.store_dir();
+    let mut out = std::io::stdout().lock();
+
+    if explain {
+        let files = logless_core::scan::plan(&store_dir, query)?;
+        writeln!(out, "would open {} of {} files:", files.len(),
+            logless_core::store::list_parquet_files(&store_dir).len())?;
+        for file in files {
+            writeln!(out, "  {}", file.display())?;
+        }
+        return Ok(());
+    }
+
+    let result = logless_core::scan::scan(&store_dir, query)?;
+    writeln!(
+        out,
+        "matched {} records (scanned {} rows in {} files; {} files and {} row groups pruned){}",
+        result.stats.rows_matched,
+        result.stats.rows_scanned,
+        result.stats.files_considered - result.stats.files_pruned_by_partition,
+        result.stats.files_pruned_by_partition,
+        result.stats.row_groups_pruned,
+        if result.truncated { " — TRUNCATED at the limit" } else { "" }
+    )?;
+
+    if !forward {
+        for record in result.records.iter().take(20) {
+            writeln!(
+                out,
+                "  {} {:<5} {} {}",
+                record.observed_unix_nano,
+                record.severity.0,
+                record.service.as_deref().unwrap_or("-"),
+                record.body
+            )?;
+        }
+        if result.records.len() > 20 {
+            writeln!(out, "  … {} more (use --forward to send them)", result.records.len() - 20)?;
+        }
+        return Ok(());
+    }
+
+    if config.destinations.is_empty() {
+        writeln!(out, "no destinations configured; nothing to forward to")?;
+        return Ok(());
+    }
+
+    // Replayed records go through the same shaping as live ones, so an event
+    // sent now is indistinguishable upstream from one sent at the time — that
+    // is the whole promise of the undo button.
+    let forwarders = config
+        .destinations
+        .iter()
+        .cloned()
+        .map(|d| Forwarder::new(d, Box::new(HttpTransport::default())))
+        .collect();
+    let mut dispatch = Dispatch::new(forwarders, AGGREGATE_FLUSH_INTERVAL);
+    for record in &result.records {
+        dispatch.handle(&Outbound {
+            window: bare_window(record, None),
+            had_context: false,
+            reason: None,
+            template_text: record.body.clone(),
+        });
+    }
+    dispatch.flush_if_due(true);
+    for forwarder in dispatch.forwarders() {
+        let stats = forwarder.stats;
+        writeln!(
+            out,
+            "replayed to {}: events={} aggregates={} bytes={} failures={}",
+            forwarder.destination().name(),
+            stats.events_sent,
+            stats.aggregates_sent,
+            stats.bytes_sent,
+            stats.failures
+        )?;
+    }
+    Ok(())
+}
+
 fn maintenance_pass(
     config: &Config,
     catalog: &mut Catalog,
@@ -1309,6 +1619,26 @@ fn maintenance_pass(
             now_unix_secs(),
         )
     };
+    // Compaction runs after the merge, so the files it just wrote are
+    // candidates, and never for the hour still being written to.
+    let active_hour = (!writer_done).then(|| now_unix_nanos() / (3_600 * 1_000_000_000));
+    match logless_core::compact::compact(
+        &config.store_dir(),
+        catalog,
+        &logless_core::compact::CompactConfig::default(),
+        active_hour,
+    ) {
+        Ok(r) if r.partitions_compacted > 0 => tracing::info!(
+            partitions = r.partitions_compacted,
+            files_replaced = r.files_replaced,
+            rows = r.rows,
+            saved_pct = format!("{:.0}", r.saved_fraction() * 100.0),
+            "compacted small files"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "compaction failed"),
+    }
+
     match merged {
         Ok(r) if r.segments_merged > 0 || r.segments_skipped > 0 => {
             tracing::info!(

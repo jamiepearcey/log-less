@@ -43,6 +43,22 @@ pub struct Catalog {
     conn: Connection,
 }
 
+/// Reads `hour=…/level=…` back out of a path. The catalog is derived state, so
+/// the path is the authority here, not the other way round.
+fn partition_from_path(path: &Path) -> (u64, String) {
+    let mut hour = 0;
+    let mut bucket = String::new();
+    for component in path.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if let Some(value) = text.strip_prefix("hour=") {
+            hour = super::partition::parse_hour(value).unwrap_or(0);
+        } else if let Some(value) = text.strip_prefix("level=") {
+            bucket = value.to_string();
+        }
+    }
+    (hour, bucket)
+}
+
 impl Catalog {
     pub fn open(path: &Path) -> Result<Self, CatalogError> {
         if let Some(parent) = path.parent() {
@@ -137,6 +153,42 @@ impl Catalog {
                 now_unix_secs as i64
             ],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records a compacted file and forgets the files it replaced.
+    ///
+    /// One transaction, because the intermediate state — the replacement
+    /// recorded while its inputs are still listed — would double-count every
+    /// row in that partition for anything reading the catalog's totals.
+    pub fn record_compaction(
+        &mut self,
+        path: &Path,
+        stats: &FileStats,
+        replaced: &[PathBuf],
+    ) -> Result<(), CatalogError> {
+        let (epoch_hour, bucket) = partition_from_path(path);
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO files (path, epoch_hour, bucket, rows, bytes, min_observed, max_observed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(path) DO UPDATE SET
+                rows = excluded.rows, bytes = excluded.bytes,
+                min_observed = excluded.min_observed, max_observed = excluded.max_observed",
+            params![
+                path.to_string_lossy(),
+                epoch_hour as i64,
+                bucket,
+                stats.rows as i64,
+                stats.bytes as i64,
+                stats.min_observed_nanos,
+                stats.max_observed_nanos,
+            ],
+        )?;
+        for old in replaced {
+            tx.execute("DELETE FROM files WHERE path = ?1", params![old.to_string_lossy()])?;
+        }
         tx.commit()?;
         Ok(())
     }

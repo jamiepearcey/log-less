@@ -167,26 +167,24 @@ impl Handler for OtlpHandler {
 
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
 
-        // JSON is a valid OTLP encoding we do not implement yet. Say so
-        // precisely — a generic 400 sends someone hunting for a bad payload.
-        if request.content_type().contains("json") {
-            self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
-            return status_reply(
-                415,
-                rpc::UNIMPLEMENTED,
-                "OTLP/JSON is not implemented; send application/x-protobuf",
-            );
-        }
-
-        let decoded: Decoded = match decode_request(&request.body, crate::now_unix_nanos()) {
-            Ok(d) => d,
-            Err(e) => {
-                self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
-                return status_reply(
-                    400,
-                    rpc::INVALID_ARGUMENT,
-                    &format!("malformed OTLP: {e}"),
-                );
+        // Both encodings of the same message. Chosen by content type, because
+        // that is what the spec says and what every emitter sets.
+        let json = request.content_type().contains("json");
+        let decoded: Decoded = if json {
+            match super::json::decode_request(&request.body, crate::now_unix_nanos()) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
+                    return json_status_reply(400, &format!("malformed OTLP/JSON: {e}"));
+                }
+            }
+        } else {
+            match decode_request(&request.body, crate::now_unix_nanos()) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
+                    return status_reply(400, rpc::INVALID_ARGUMENT, &format!("malformed OTLP: {e}"));
+                }
             }
         };
 
@@ -197,13 +195,22 @@ impl Handler for OtlpHandler {
             Accepted::All => {
                 self.stats.accepted.fetch_add(1, Ordering::Relaxed);
                 self.stats.records.fetch_add(count, Ordering::Relaxed);
-                // Empty ExportLogsServiceResponse: success, no partial_success.
-                Reply::new(200, CONTENT_TYPE, Vec::new())
+                // Empty ExportLogsServiceResponse. A client that sent JSON gets
+                // JSON back: it is parsing the response with a JSON decoder.
+                if json {
+                    Reply::json(200, "{}")
+                } else {
+                    Reply::new(200, CONTENT_TYPE, Vec::new())
+                }
             }
             Accepted::Rejected => {
                 self.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                status_reply(503, rpc::UNAVAILABLE, "pipeline full, retry")
-                    .with_header("Retry-After", &RETRY_AFTER_SECS.to_string())
+                let reply = if json {
+                    json_status_reply(503, "pipeline full, retry")
+                } else {
+                    status_reply(503, rpc::UNAVAILABLE, "pipeline full, retry")
+                };
+                reply.with_header("Retry-After", &RETRY_AFTER_SECS.to_string())
             }
         }
     }
@@ -291,6 +298,14 @@ fn status_proto(code: u32, message: &str) -> Vec<u8> {
     varint(&mut out, message.len() as u64);
     out.extend_from_slice(message.as_bytes());
     out
+}
+
+/// The JSON form of `google.rpc.Status`, for clients that sent JSON.
+fn json_status_reply(http_status: u16, message: &str) -> Reply {
+    Reply::json(
+        http_status,
+        format!(r#"{{"code":{},"message":"{}"}}"#, http_status, message.replace('"', "'")),
+    )
 }
 
 fn status_reply(http_status: u16, rpc_code: u32, message: &str) -> Reply {
@@ -429,17 +444,39 @@ mod tests {
     }
 
     #[test]
-    fn json_is_refused_with_a_specific_status() {
+    fn json_requests_are_decoded_and_answered_in_json() {
         let h = Harness::start(true);
-        let code = match ureq::post(h.url())
+        let body = br#"{"resourceLogs":[{"resource":{"attributes":[
+            {"key":"service.name","value":{"stringValue":"checkout"}}]},
+          "scopeLogs":[{"logRecords":[
+            {"severityNumber":17,"body":{"stringValue":"declined"}}]}]}]}"#;
+        let mut response = ureq::post(h.url())
             .header("Content-Type", "application/json")
-            .send(&b"{}"[..])
-        {
-            Ok(r) => r.status().as_u16(),
-            Err(ureq::Error::StatusCode(c)) => c,
-            Err(e) => panic!("{e}"),
-        };
-        assert_eq!(code, 415, "415 tells the operator the encoding is wrong, not the payload");
+            .send(&body[..])
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.body_mut().read_to_string().unwrap(), "{}");
+        let seen = h.seen.lock().unwrap();
+        assert_eq!(seen[0].body, "declined");
+        assert_eq!(seen[0].severity, crate::Severity::ERROR);
+        assert_eq!(seen[0].service.as_deref(), Some("checkout"));
+    }
+
+    #[test]
+    fn malformed_json_is_answered_in_json_not_protobuf() {
+        // A client that sent JSON is parsing the reply with a JSON decoder;
+        // handing it a protobuf Status makes the real error unreadable.
+        let h = Harness::start(true);
+        let agent: ureq::Agent =
+            ureq::Agent::config_builder().http_status_as_error(false).build().into();
+        let mut response = agent
+            .post(h.url())
+            .header("Content-Type", "application/json")
+            .send(&b"{not json"[..])
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        let body = response.body_mut().read_to_string().unwrap();
+        assert!(body.starts_with('{') && body.contains("message"), "{body}");
     }
 
     #[test]

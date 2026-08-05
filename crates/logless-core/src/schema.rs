@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, RecordBatch, StringBuilder, TimestampNanosecondArray,
-    UInt64Builder, UInt8Array,
+    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, RecordBatch, StringArray,
+    StringBuilder, TimestampNanosecondArray, UInt64Array, UInt64Builder, UInt8Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
@@ -71,6 +71,70 @@ pub fn sort_records(records: &mut [LogRecord]) {
             // contents are reproducible for a given input.
             .then_with(|| a.event_id.cmp(&b.event_id))
     });
+}
+
+/// `RecordBatch` → `LogRecord`, the inverse of [`to_record_batch`].
+///
+/// Used by replay (`crate::scan`). Rows whose required columns are missing or
+/// of the wrong type are skipped rather than defaulted: a replay that invents
+/// a timestamp or a severity would push fabricated data upstream, which is
+/// worse than replaying less.
+pub fn from_record_batch(batch: &RecordBatch) -> Vec<LogRecord> {
+    let column = |name: &str| batch.column_by_name(name);
+    let strings = |name: &str| column(name).and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    let binaries =
+        |name: &str| column(name).and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
+
+    let (Some(timestamp), Some(observed), Some(severity), Some(body)) = (
+        column("timestamp").and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>()),
+        column("observed").and_then(|c| c.as_any().downcast_ref::<TimestampNanosecondArray>()),
+        column("severity").and_then(|c| c.as_any().downcast_ref::<UInt8Array>()),
+        strings("body"),
+    ) else {
+        return Vec::new();
+    };
+    let event_id = binaries("event_id");
+    let trace_id = binaries("trace_id");
+    let span_id = binaries("span_id");
+    let service = strings("service");
+    let severity_text = strings("severity_text");
+    let attributes = strings("attributes");
+    let template_id = column("template_id").and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+
+    (0..batch.num_rows())
+        .map(|row| {
+            let mut record = LogRecord::new(
+                timestamp.value(row).max(0) as u64,
+                crate::model::Severity(severity.value(row)),
+                body.value(row),
+            );
+            record.observed_unix_nano = observed.value(row).max(0) as u64;
+            if let Some(ids) = event_id {
+                if !ids.is_null(row) {
+                    if let Ok(bytes) = <[u8; 16]>::try_from(ids.value(row)) {
+                        record.event_id = uuid::Uuid::from_bytes(bytes);
+                    }
+                }
+            }
+            record.trace_id = trace_id
+                .filter(|a| !a.is_null(row))
+                .and_then(|a| <[u8; 16]>::try_from(a.value(row)).ok());
+            record.span_id = span_id
+                .filter(|a| !a.is_null(row))
+                .and_then(|a| <[u8; 8]>::try_from(a.value(row)).ok());
+            record.service =
+                service.filter(|a| !a.is_null(row)).map(|a| a.value(row).to_string());
+            record.severity_text =
+                severity_text.filter(|a| !a.is_null(row)).map(|a| a.value(row).to_string());
+            record.template_id = template_id.filter(|a| !a.is_null(row)).map(|a| a.value(row));
+            record.attributes = attributes
+                .filter(|a| !a.is_null(row))
+                .map(|a| a.value(row))
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+            record
+        })
+        .collect()
 }
 
 pub fn to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, arrow::error::ArrowError> {

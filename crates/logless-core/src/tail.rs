@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Identity of a file, independent of its name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,6 +81,12 @@ pub struct TailStats {
 /// Tails a fixed set of paths.
 pub struct Tailer {
     paths: Vec<PathBuf>,
+    /// Patterns like `/var/log/*.log`, re-expanded periodically. A fleet's log
+    /// files appear and disappear — a new service deploys, a container starts —
+    /// so expanding once at startup would silently miss everything created
+    /// afterwards, which is exactly the window an incident lives in.
+    patterns: Vec<PathBuf>,
+    last_expansion: Option<Instant>,
     cursors: HashMap<PathBuf, Cursor>,
     checkpoint_path: Option<PathBuf>,
     /// Start at the end of a file seen for the first time, rather than
@@ -88,10 +95,133 @@ pub struct Tailer {
     pub stats: TailStats,
 }
 
+/// How often glob patterns are re-expanded. A directory scan per poll would
+/// be wasteful at a 200 ms cadence; a file created now is picked up within
+/// this, which is well inside the window that matters.
+const REDISCOVER_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Characters that make a path a pattern rather than a name.
+fn is_pattern(path: &Path) -> bool {
+    path.to_string_lossy().contains(['*', '?', '['])
+}
+
+/// Matches one path component against a glob, supporting `*`, `?` and
+/// `[abc]` / `[a-z]` / `[!abc]` classes. Deliberately not a full shell glob:
+/// `**` and brace expansion are not supported, and a pattern using them will
+/// simply match nothing rather than half-work.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // Iterative backtracking: no recursion, so a hostile pattern cannot
+    // exhaust the stack.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut star_n) = (usize::MAX, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            star_n = ni;
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '[' {
+            match class_match(&p[pi..], n[ni]) {
+                Some((matched, len)) if matched => {
+                    pi += len;
+                    ni += 1;
+                }
+                Some(_) | None if star != usize::MAX => {
+                    pi = star + 1;
+                    star_n += 1;
+                    ni = star_n;
+                }
+                _ => return false,
+            }
+        } else if star != usize::MAX {
+            pi = star + 1;
+            star_n += 1;
+            ni = star_n;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
+/// Matches a `[...]` class at the start of `pattern`, returning whether the
+/// character matched and how long the class was.
+fn class_match(pattern: &[char], c: char) -> Option<(bool, usize)> {
+    let close = pattern.iter().position(|ch| *ch == ']')?;
+    if close == 0 {
+        return None;
+    }
+    let mut body = &pattern[1..close];
+    let negated = matches!(body.first(), Some('!' | '^'));
+    if negated {
+        body = &body[1..];
+    }
+    let mut matched = false;
+    let mut i = 0;
+    while i < body.len() {
+        if i + 2 < body.len() && body[i + 1] == '-' {
+            if c >= body[i] && c <= body[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if body[i] == c {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    Some((matched != negated, close + 1))
+}
+
 impl Tailer {
+    /// Expands patterns into concrete paths, adding files that have appeared.
+    ///
+    /// Only ever adds. A file that matched and has since been rotated away is
+    /// left in `paths` so its cursor survives — dropping it would restart the
+    /// file from zero if it came back under the same name.
+    fn expand_patterns(&mut self) {
+        if self.patterns.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        if self.last_expansion.is_some_and(|t| now.duration_since(t) < REDISCOVER_INTERVAL) {
+            return;
+        }
+        self.last_expansion = Some(now);
+
+        for pattern in &self.patterns {
+            let Some(parent) = pattern.parent() else { continue };
+            let Some(name) = pattern.file_name().and_then(|n| n.to_str()) else { continue };
+            let Ok(entries) = std::fs::read_dir(parent) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let Some(found) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                if glob_match(name, found) && !self.paths.contains(&path) {
+                    tracing::info!(path = %path.display(), "tailing a newly matched file");
+                    self.paths.push(path);
+                }
+            }
+        }
+    }
+    /// Splits literal paths from glob patterns. A path containing `*`, `?` or
+    /// `[` is treated as a pattern; anything else is taken literally, so a file
+    /// that genuinely has a bracket in its name still needs no escaping until
+    /// it also needs a wildcard.
     pub fn new(paths: Vec<PathBuf>, start_at_end: bool) -> Self {
+        let (patterns, paths): (Vec<PathBuf>, Vec<PathBuf>) =
+            paths.into_iter().partition(|p| is_pattern(p));
         Self {
             paths,
+            patterns,
+            last_expansion: None,
             cursors: HashMap::new(),
             checkpoint_path: None,
             start_at_end,
@@ -114,6 +244,7 @@ impl Tailer {
     ///
     /// `emit` receives complete lines only.
     pub fn poll(&mut self, mut emit: impl FnMut(&Path, &str)) {
+        self.expand_patterns();
         let paths = self.paths.clone();
         for path in paths {
             self.poll_one(&path, &mut emit);
@@ -309,6 +440,114 @@ fn load_checkpoint(path: &Path) -> HashMap<PathBuf, Cursor> {
         );
     }
     out
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn a_file_created_after_startup_is_picked_up() {
+        // The window a new service's log file appears in is exactly the window
+        // an incident lives in, so expanding once at startup is not enough.
+        let dir = tempfile::tempdir().unwrap();
+        let mut tailer = Tailer::new(vec![dir.path().join("*.log")], false);
+
+        let mut lines = Vec::new();
+        tailer.poll(|_, l| lines.push(l.to_string()));
+        assert!(lines.is_empty(), "nothing matches yet");
+
+        std::fs::write(dir.path().join("app.log"), "first\n").unwrap();
+        // Force the rediscovery interval to have elapsed.
+        tailer.last_expansion = None;
+        tailer.poll(|_, l| lines.push(l.to_string()));
+        assert_eq!(lines, ["first"]);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("app.log"))
+            .unwrap();
+        writeln!(file, "second").unwrap();
+        tailer.poll(|_, l| lines.push(l.to_string()));
+        assert_eq!(lines, ["first", "second"], "and it keeps following it");
+    }
+
+    #[test]
+    fn non_matching_files_and_directories_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.log"), "yes\n").unwrap();
+        std::fs::write(dir.path().join("app.txt"), "no\n").unwrap();
+        std::fs::create_dir(dir.path().join("nested.log")).unwrap();
+
+        let mut tailer = Tailer::new(vec![dir.path().join("*.log")], false);
+        let mut lines = Vec::new();
+        tailer.poll(|_, l| lines.push(l.to_string()));
+        assert_eq!(lines, ["yes"], "a directory named *.log is not a log file");
+    }
+
+    #[test]
+    fn literal_paths_and_patterns_can_be_mixed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("explicit.txt"), "a\n").unwrap();
+        std::fs::write(dir.path().join("globbed.log"), "b\n").unwrap();
+        let mut tailer = Tailer::new(
+            vec![dir.path().join("explicit.txt"), dir.path().join("*.log")],
+            false,
+        );
+        let mut lines = Vec::new();
+        tailer.poll(|_, l| lines.push(l.to_string()));
+        lines.sort();
+        assert_eq!(lines, ["a", "b"]);
+    }
+}
+
+#[cfg(test)]
+mod glob_tests {
+    use super::glob_match;
+
+    #[test]
+    fn stars_and_question_marks() {
+        assert!(glob_match("*.log", "app.log"));
+        assert!(glob_match("*.log", ".log"));
+        assert!(!glob_match("*.log", "app.log.1"), "rotated files are a different name");
+        assert!(glob_match("app-?.log", "app-1.log"));
+        assert!(!glob_match("app-?.log", "app-12.log"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("app*log", "applog"));
+        assert!(glob_match("*app*", "myapp2"));
+    }
+
+    #[test]
+    fn character_classes() {
+        assert!(glob_match("app-[0-9].log", "app-3.log"));
+        assert!(!glob_match("app-[0-9].log", "app-x.log"));
+        assert!(glob_match("app-[abc].log", "app-b.log"));
+        assert!(glob_match("app-[!0-9].log", "app-x.log"));
+        assert!(!glob_match("app-[!0-9].log", "app-7.log"));
+    }
+
+    #[test]
+    fn backtracking_terminates_on_adversarial_patterns() {
+        // The classic catastrophic case for a naive backtracking matcher.
+        assert!(glob_match(&"*".repeat(20), ""), "all-stars matches empty");
+        let pattern = "*a*a*a*a*a*a*a*b";
+        let name = "a".repeat(64);
+        assert!(!glob_match(pattern, &name), "must terminate, not hang");
+    }
+
+    #[test]
+    fn unsupported_syntax_matches_nothing_rather_than_half_working() {
+        // `**` is not implemented; it must not silently behave like `*` across
+        // directory boundaries, which would tail files nobody asked for.
+        assert!(!glob_match("**/*.log", "app.log"));
+    }
+
+    #[test]
+    fn literal_names_still_match_themselves() {
+        assert!(glob_match("syslog", "syslog"));
+        assert!(!glob_match("syslog", "syslog.1"));
+    }
 }
 
 #[cfg(test)]

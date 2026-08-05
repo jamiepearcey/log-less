@@ -17,6 +17,16 @@ OpenTelemetry SDK over both HTTP and gRPC, and a Splunk HEC receiver whose
 acknowledgements are keyed to a real `fdatasync`, and a Sentry ingest proxy
 verified against the real `sentry-sdk`.
 
+## Verify the claims yourself
+
+```sh
+scripts/demo.sh          # the whole story end to end, on synthetic logs
+scripts/chaos.sh         # SIGKILL mid-write, repeatedly; assert nothing is lost or duplicated
+scripts/storm.sh         # 10k errors/s; assert bounded RSS from the OS
+scripts/loghub.sh        # template mining against 11 real corpora with published ground truth
+scripts/licences.sh      # every dependency is permissively licensed
+```
+
 ## Why
 
 Vendors price on ingest volume, so teams raise log levels to save money and then

@@ -28,6 +28,8 @@ pub enum Mask {
     Quoted,
     /// Contains digits but fits no specific shape (`u4567`, `req-42`).
     Var,
+    /// A leading `[component]` prefix — a logger or service name, not a value.
+    Component,
 }
 
 impl Mask {
@@ -42,6 +44,7 @@ impl Mask {
             Mask::Path => "<PATH>",
             Mask::Quoted => "<STR>",
             Mask::Var => "<VAR>",
+            Mask::Component => "<COMP>",
         }
     }
 
@@ -119,10 +122,41 @@ pub fn split_kv(token: &str) -> Option<(&str, &str)> {
 /// The two stay index-aligned because template mining creates *additional*
 /// wildcard positions when it merges two lines, and the parameter at such a
 /// position can only be recovered from this side channel.
+/// Whether a leading `[token]` is a component name rather than something worth
+/// keeping in the template.
+///
+/// `[api] request failed` and `[worker] request failed` are one shape logged by
+/// two components — the service is already its own column and its own pushdown
+/// key, so keeping it in the template forks one logical shape into as many
+/// templates as there are components (measured: 15 instead of 5). A bracketed
+/// *level* is different: `[ERROR]` and `[INFO]` really are different shapes,
+/// and merging them would put an error's template on an info line.
+fn is_component_prefix(token: &str, position: usize) -> bool {
+    if position > 1 {
+        return false;
+    }
+    let Some(inner) = token.strip_prefix('[').and_then(|t| t.strip_suffix(']')) else {
+        return false;
+    };
+    if inner.is_empty() || crate::model::Severity::from_text(inner).is_some() {
+        return false;
+    }
+    // Identifier-ish only: `[api]`, `[order-svc]`, `[com.acme.Worker]`. Anything
+    // with spaces or punctuation beyond this is a message, not a component.
+    inner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'))
+}
+
 pub fn mask_line(line: &str, tokens: &mut Vec<String>, raw: &mut Vec<String>) {
     tokens.clear();
     raw.clear();
-    for raw_token in line.split_whitespace() {
+    for (position, raw_token) in line.split_whitespace().enumerate() {
+        if is_component_prefix(raw_token, position) {
+            raw.push(raw_token.to_string());
+            tokens.push(Mask::Component.placeholder().to_string());
+            continue;
+        }
         // Strip trailing punctuation that would otherwise fuse into the token
         // and defeat classification (`id=42,` / `done.`).
         let (core, trailing) = split_trailing_punctuation(raw_token);
@@ -274,6 +308,50 @@ pub fn variable_params(tokens: &[String], raw: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_leading_component_prefix_is_masked_so_one_shape_stays_one_template() {
+        // Measured before this: `[api]`/`[worker]`/`[auth]` forked five logical
+        // shapes into fifteen templates.
+        let mut tokens = Vec::new();
+        let mut raw = Vec::new();
+        let mut shapes = std::collections::HashSet::new();
+        for component in ["[api]", "[worker]", "[auth]"] {
+            mask_line(&format!("{component} request failed for user 42"), &mut tokens, &mut raw);
+            shapes.insert(tokens.join(" "));
+        }
+        assert_eq!(shapes.len(), 1, "one shape, three components: {shapes:?}");
+        assert!(shapes.iter().next().unwrap().starts_with("<COMP>"));
+    }
+
+    #[test]
+    fn a_bracketed_level_is_not_a_component() {
+        // Merging these would put an error's template on an info line.
+        let mut tokens = Vec::new();
+        let mut raw = Vec::new();
+        mask_line("[ERROR] disk full", &mut tokens, &mut raw);
+        let error_shape = tokens.join(" ");
+        mask_line("[INFO] disk full", &mut tokens, &mut raw);
+        assert_ne!(error_shape, tokens.join(" "));
+        assert!(error_shape.contains("[ERROR]"), "{error_shape}");
+    }
+
+    #[test]
+    fn only_a_leading_bracket_is_treated_as_a_component() {
+        let mut tokens = Vec::new();
+        let mut raw = Vec::new();
+        mask_line("request from [api] failed at stage [three]", &mut tokens, &mut raw);
+        let shape = tokens.join(" ");
+        assert!(!shape.contains("<COMP>"), "a bracket mid-message is content: {shape}");
+    }
+
+    #[test]
+    fn bracketed_prose_is_left_alone() {
+        let mut tokens = Vec::new();
+        let mut raw = Vec::new();
+        mask_line("[not a component] something", &mut tokens, &mut raw);
+        assert!(!tokens.join(" ").contains("<COMP>"));
+    }
+
     fn masked(line: &str) -> (Vec<String>, Vec<String>) {
         let (mut t, mut r) = (Vec::new(), Vec::new());
         mask_line(line, &mut t, &mut r);
@@ -333,7 +411,8 @@ mod tests {
         let (b, pb) = masked("[api] handled request id=99999 user=u17 latency_ms=3");
         assert_eq!(a, b);
         assert_ne!(pa, pb);
-        assert_eq!(pa.len(), 3);
+        // Four variable positions: the component prefix plus the three values.
+        assert_eq!(pa.len(), 4);
     }
 
     #[test]

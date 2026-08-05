@@ -51,6 +51,7 @@ struct Harness {
     receiver: Option<Receiver>,
     stored: Arc<Mutex<Vec<LogRecord>>>,
     fake: Arc<FakeSentry>,
+    _spool: tempfile::TempDir,
 }
 
 impl Harness {
@@ -64,15 +65,17 @@ impl Harness {
         let sink_stored = Arc::clone(&stored);
         let fake = FakeSentry::new();
         let upstream = Upstream::new(Box::new(FakeHandle(Arc::clone(&fake))));
-        let receiver = Receiver::start(&config, Some(upstream), move |records| {
-            if !accept {
-                return Admitted::Busy;
-            }
-            sink_stored.lock().unwrap().extend(records);
-            Admitted::Accepted
-        })
-        .unwrap();
-        Self { receiver: Some(receiver), stored, fake }
+        let spool = tempfile::tempdir().unwrap();
+        let receiver =
+            Receiver::start(&config, Some(upstream), Some(spool.path()), move |records| {
+                if !accept {
+                    return Admitted::Busy;
+                }
+                sink_stored.lock().unwrap().extend(records);
+                Admitted::Accepted
+            })
+            .unwrap();
+        Self { receiver: Some(receiver), stored, fake, _spool: spool }
     }
 
     fn relay() -> Self {
@@ -470,7 +473,7 @@ fn a_local_only_proxy_stores_without_forwarding() {
     let stored = Arc::new(Mutex::new(Vec::new()));
     let sink_stored = Arc::clone(&stored);
     let config = SentryConfig { enabled: true, addr: "127.0.0.1:0".into(), ..Default::default() };
-    let receiver = Receiver::start(&config, None, move |records| {
+    let receiver = Receiver::start(&config, None, None, move |records| {
         sink_stored.lock().unwrap().extend(records);
         Admitted::Accepted
     })
@@ -490,7 +493,7 @@ fn resign_without_a_dsn_is_a_configuration_error_not_a_silent_drop() {
         upstream_dsn: None,
         ..Default::default()
     };
-    match Receiver::start(&config, None, |_| Admitted::Accepted) {
+    match Receiver::start(&config, None, None, |_| Admitted::Accepted) {
         Err(SentryError::ResignWithoutDsn) => {}
         other => panic!("expected a config error, got {:?}", other.map(|_| "ok")),
     }
@@ -504,7 +507,7 @@ fn a_malformed_dsn_is_refused_at_startup() {
         upstream_dsn: Some("not a dsn".into()),
         ..Default::default()
     };
-    match Receiver::start(&config, None, |_| Admitted::Accepted) {
+    match Receiver::start(&config, None, None, |_| Admitted::Accepted) {
         Err(SentryError::BadDsn { .. }) => {}
         other => panic!("expected a bad DSN error, got {:?}", other.map(|_| "ok")),
     }
@@ -518,7 +521,7 @@ fn an_open_key_policy_refuses_to_bind_a_public_address() {
         allowed_keys: Vec::new(),
         ..Default::default()
     };
-    match Receiver::start(&config, None, |_| Admitted::Accepted) {
+    match Receiver::start(&config, None, None, |_| Admitted::Accepted) {
         Err(SentryError::OpenOnPublicAddress { .. }) => {}
         other => panic!("expected a refusal, got {:?}", other.map(|_| "ok")),
     }
@@ -531,16 +534,108 @@ fn shutdown_drains_what_was_already_acknowledged() {
     for _ in 0..25 {
         post(&h.url("1"), &envelope_bytes(&[("event", AN_ERROR)]), &[AUTH]);
     }
-    let receiver = {
-        let mut this = h;
-        let r = this.receiver.take().unwrap();
-        let fake = Arc::clone(&this.fake);
-        let stats = r.shutdown();
-        assert_eq!(stats.accepted, 25);
-        assert_eq!(fake.sent.lock().unwrap().len(), 25, "queued envelopes must be drained");
-        None::<Receiver>
+    let mut this = h;
+    let r = this.receiver.take().unwrap();
+    let fake = Arc::clone(&this.fake);
+    let stats = r.shutdown();
+    assert_eq!(stats.accepted, 25);
+    assert_eq!(fake.sent.lock().unwrap().len(), 25, "queued envelopes must be drained");
+}
+
+#[test]
+fn envelopes_survive_a_restart_when_upstream_is_down() {
+    // The reason the spool exists: the SDK was told 200 and has discarded its
+    // only copy, so a restart with an unreachable Sentry must not lose it.
+    struct Dead;
+    impl Transport for Dead {
+        fn post(&self, _: &str, _: &[(String, String)], _: &[u8]) -> Result<u16, String> {
+            Err("connection refused".into())
+        }
+        fn post_full(
+            &self,
+            _: &str,
+            _: &[(String, String)],
+            _: &[u8],
+        ) -> Result<Response, String> {
+            Err("connection refused".into())
+        }
+    }
+
+    let spool = tempfile::tempdir().unwrap();
+    let config = SentryConfig {
+        enabled: true,
+        addr: "127.0.0.1:0".into(),
+        upstream_auth: UpstreamAuth::Relay,
+        upstream_dsn: Some("https://u@sentry.example/9".into()),
+        ..Default::default()
     };
-    assert!(receiver.is_none());
+
+    // First run: Sentry is unreachable, so nothing is delivered.
+    let receiver = Receiver::start(
+        &config,
+        Some(Upstream::new(Box::new(Dead))),
+        Some(spool.path()),
+        |_| Admitted::Accepted,
+    )
+    .unwrap();
+    let url = format!("http://{}/api/1/envelope/", receiver.local_addr());
+    for _ in 0..3 {
+        assert_eq!(post(&url, &envelope_bytes(&[("event", AN_ERROR)]), &[AUTH]).0, 200);
+    }
+    receiver.shutdown();
+
+    // Second run: Sentry is back. The envelopes are still there.
+    let fake = FakeSentry::new();
+    let receiver = Receiver::start(
+        &config,
+        Some(Upstream::new(Box::new(FakeHandle(Arc::clone(&fake))))),
+        Some(spool.path()),
+        |_| Admitted::Accepted,
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fake.sent.lock().unwrap().len() < 3 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    receiver.shutdown();
+    assert_eq!(fake.sent.lock().unwrap().len(), 3, "spooled envelopes must be delivered later");
+    assert!(fake.bodies()[0].contains("ValueError"));
+}
+
+#[test]
+fn a_delivered_envelope_is_not_sent_twice_after_a_restart() {
+    let spool = tempfile::tempdir().unwrap();
+    let config = SentryConfig {
+        enabled: true,
+        addr: "127.0.0.1:0".into(),
+        upstream_auth: UpstreamAuth::Relay,
+        upstream_dsn: Some("https://u@sentry.example/9".into()),
+        ..Default::default()
+    };
+    let fake = FakeSentry::new();
+    let receiver = Receiver::start(
+        &config,
+        Some(Upstream::new(Box::new(FakeHandle(Arc::clone(&fake))))),
+        Some(spool.path()),
+        |_| Admitted::Accepted,
+    )
+    .unwrap();
+    let url = format!("http://{}/api/1/envelope/", receiver.local_addr());
+    post(&url, &envelope_bytes(&[("event", AN_ERROR)]), &[AUTH]);
+    receiver.shutdown();
+    assert_eq!(fake.sent.lock().unwrap().len(), 1);
+
+    let again = FakeSentry::new();
+    let receiver = Receiver::start(
+        &config,
+        Some(Upstream::new(Box::new(FakeHandle(Arc::clone(&again))))),
+        Some(spool.path()),
+        |_| Admitted::Accepted,
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    receiver.shutdown();
+    assert!(again.sent.lock().unwrap().is_empty(), "the committed cursor must hold");
 }
 
 #[test]

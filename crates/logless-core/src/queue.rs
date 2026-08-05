@@ -184,6 +184,48 @@ impl IngestConsumer {
         batch
     }
 
+    /// Like [`IngestConsumer::next_batch`], but keeps waiting up to `linger`
+    /// after the first record arrives.
+    ///
+    /// Without it the WAL writes a frame per wake-up: the stdin path measured
+    /// 1.26 records per frame at 62 bytes each, so the 8-byte length and CRC
+    /// header cost more than the data in it. A few milliseconds of linger turns
+    /// that into whole batches, and bounds the added latency at `linger` —
+    /// which is well inside the fsync interval the crash window is already set
+    /// by, so it costs nothing that was not already being waited for.
+    pub fn next_batch_lingering(
+        &self,
+        max: usize,
+        timeout: Duration,
+        linger: Duration,
+    ) -> Vec<LogRecord> {
+        let mut batch = Vec::new();
+        match self.rx.recv_timeout(timeout) {
+            Ok(first) => batch.push(first),
+            Err(_) => return batch,
+        }
+        let deadline = std::time::Instant::now() + linger;
+        while batch.len() < max {
+            // Drain what is already there before waiting again.
+            match self.rx.try_recv() {
+                Ok(r) => {
+                    batch.push(r);
+                    continue;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+            }
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            match self.rx.recv_timeout(left) {
+                Ok(r) => batch.push(r),
+                Err(_) => break,
+            }
+        }
+        batch
+    }
+
     /// Drain everything still queued. Used on shutdown so a clean stop does not
     /// lose what was already accepted.
     pub fn drain(&self) -> Vec<LogRecord> {

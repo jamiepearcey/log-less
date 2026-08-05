@@ -9,7 +9,7 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] Versioned TOML config schema (`schema_version = 1`, `deny_unknown_fields`).
 - [x] LICENCE (BSL 1.1, Change Date 2030-08-04 → Apache-2.0).
 - [x] **Measured stripped release binary: 1.5 MB skeleton, 7.3 MB with arrow+parquet+rusqlite.** Recorded in `docs/architecture.md`. Settles the embedded-engine question: DuckDB would still be ~5× the current binary.
-- [ ] Dep-licence check in CI (deny non-permissive).
+- [x] **Dep-licence check** (`scripts/licences.sh`, run in CI): all 222 dependencies are permissively licensed. Parses SPDX expressions including Cargo's legacy `MIT/Apache-2.0` slash form, which a naive check rejects for no reason.
 
 ## Weeks 1–2 — the invariant: zero-loss, zero-block
 - [x] WAL segments: `u32 len | u32 crc32 | payload`, magic header, roll at size; group `fdatasync` on interval-or-bytes.
@@ -25,11 +25,11 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] **Catalog rebuild from Parquet footers + directory scan.** Verified: catalog deleted, rebuilt to identical 21 files / 120,000 rows.
 - [x] Crash-safe merge ordering (write→rename→commit→delete) with deterministic per-segment file names for idempotent re-merge.
 - [x] UTC-qualified Parquet timestamps so external engines read time correctly.
-- [ ] Batch linger on the WAL writer — the stdin path averaged 1.26 records/frame (62 B/record); frame overhead dominates at that ratio.
-- [ ] Compaction of small per-segment files — 200k records produced 33 files and only 2.5x compression; larger files should approach the 10–20x the design assumes.
-- [ ] Delivery cursors in their own file (atomic rename), NOT the catalog.
-- [ ] **Chaos harness**: automate the `kill -9` loop, add disk-full and io throttle. Assert the accounting invariant across all of them.
-- [ ] Extend the accounting invariant past the WAL: `ingested == committed + dropped + still_in_wal`. The two merge bugs below were both invisible to the current invariant, which stops at the WAL.
+- [x] **Batch linger on the WAL writer** (5 ms, bounded by and far below the fsync interval that already defines the crash window).
+- [x] **Compaction** of small per-segment files, in the maintenance pass and as `logless compact`. Measured: 16 files → 1, **72% smaller**. Write-then-record-then-unlink, so a crash leaves duplicates (recoverable) rather than a gap (not).
+- [x] **Durable spool with delivery cursors** (`spool.rs`): append-only segments, CRC per record, cursor written by atomic rename in its own file — not the catalog, which changes far less often and would drag SQLite into the delivery path.
+- [x] **Chaos harness** (`scripts/chaos.sh`, in CI): repeated SIGKILL mid-write, then recover + merge + verify each round. Measured over 6 rounds: 561,535 records committed, monotonic across rounds, **zero duplicate event ids**. Disk-full and io-throttle injection are still open.
+- [x] **Whole-path accounting**: lifetime counters persisted by atomic rename (`counters.rs`) plus `logless verify` — `received == committed + still_in_wal + dropped`. Catches a deleted committed file; the two merge bugs would both have failed it.
 
 ### Bugs found by end-to-end testing (fixed)
 - **Data loss**: maintenance merged and deleted the segment the writer was actively appending to (`active_segment` sentinel `0` read as "nothing active"). 20,480 of 200,000 records lost to an unlinked file. Fixed by skipping `id >= active` and refusing to merge before the writer publishes.
@@ -44,9 +44,9 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] Templating wired into the merge path; `template_id` lands in Parquet.
 - [x] **Benched: 775,617 lines/s/core release (target ≥500k, met); 15 templates from 2M lines; 0% untemplated.** Debug build is ~39k/s — never bench unoptimised.
 - [x] Fallback path intact: nothing depends on templating: a `None` match writes the record untemplated.
-- [ ] Bench against the real LogHub corpus, not only synthetic lines.
+- [x] **Benchmarked against the 11 real LogHub corpora** with their published ground-truth template counts (`scripts/loghub.sh`). 568k lines/s/core on real logs. **This changed a default**: see below.
 - [ ] **Store template id + parameter columns instead of the body text.** Measured: templating alone left compression unchanged at 2.4×, exactly as the design predicted — the ratio gain needs this step.
-- [ ] Consider masking bracketed service prefixes: `[api]`/`[worker]`/`[auth]` fork one logical shape into three templates (15 rather than 5 in testing).
+- [x] **Bracketed component prefixes are masked** (`<COMP>`): 5 shapes across 3 components now yield 5 templates, not 15. A bracketed *level* is excluded — merging `[ERROR]` with `[INFO]` would put an error's fingerprint on an info line.
 
 ### Bugs found by end-to-end testing (fixed, weeks 2–3)
 - **Data loss on restart**: WAL segment ids restart at 1 once the WAL drains, so the catalog reported a fresh segment 1 as already merged and deleted it unread. Every restart of a drained agent silently lost its first segment. Fixed by giving each segment a UUID in its header and keying both the catalog and the Parquet filename on that.
@@ -61,7 +61,7 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] JSONL pushdown output (`--pushdown-out`) — the forwarders' input until they exist.
 - [x] Demo: 100k lines / 221 errors → every error forwarded, 6 context windows, **132× less data upstream**.
 - [x] Bounds tested: 100k lines through a 1 MB ring stays under budget; one chatty key cannot evict a quiet neighbour.
-- [ ] Storm harness at rate (10k errors/s) rather than by volume; assert bounded RSS from the OS, not just accounted bytes.
+- [x] **Storm harness** (`scripts/storm.sh`, in CI): 10k errors/s sustained, **peak RSS 75 MiB** against a 512 MiB budget, sampled from `ps` rather than from our own accounting — which is exactly what would be wrong if the ring leaked.
 - [ ] Measure dedupe window and windows-per-minute against a real corpus — the 60s/3 defaults are guesses.
 
 ### Bugs found by end-to-end testing (fixed, weeks 4–5)
@@ -84,19 +84,19 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] **Verified against the official OpenTelemetry Python SDK** (an independent encoder, not our own): 20,000 records gzipped in 40 requests → 20,000 received, 20,000 written, zero dropped; `service.name`, resource attributes, typed attribute values, `trace_id`/`span_id` all present in the committed Parquet. Uncompressed path re-verified at 5,000/5,000.
 - [x] **OTLP gRPC** (`:4317`): hand-written HTTP/2 (frames, HPACK via `fluke-hpack`, connection and stream flow control, multiplexed streams, PING keepalive, GOAWAY) plus gRPC message framing, trailers and status codes. No tonic, no tokio.
 - [x] **Verified against the official OpenTelemetry Python gRPC exporter** (grpcio's C-core client): 20,000 records in 40 RPCs uncompressed, then 8,000 in 16 RPCs with gRPC-level gzip — all received, all written, zero errors. `trace_id` present on all 199 errors in the committed Parquet.
-- [ ] OTLP/JSON encoding — currently answered with `415` naming the supported content type, so it fails legibly rather than as a malformed payload.
+- [x] **OTLP/JSON** implemented, chosen by content type, answered in JSON. Handles the two things a naive reader gets wrong: 64-bit fields as decimal strings (a JSON number is a double and loses ~104 days of nanosecond resolution), and hex ids rather than base64.
 - [x] **Splunk HEC receiver**: `/services/collector`, `/event`, `/raw`, `/ack`, `/health`; token auth (header or query), gzip, concatenated-JSON and line-oriented bodies, `sourcetype` → service, typed `fields`, `503 Server is busy` instead of shedding.
 - [x] **Indexer acknowledgement keyed to a real `fdatasync`**, not to receipt. Verified end to end against a third-party HEC client: `false` immediately after the post, `true` 0.11s later, once the WAL had synced.
 - [x] **HTTP plumbing shared** between OTLP and HEC (`httpd.rs`): body limits, gzip bomb cap, worker pool, deterministic shutdown — so the two receivers cannot drift on the parts that were expensive to get right.
 - [x] **Sentry ingest proxy**: `/api/<project>/envelope/` and the legacy `/store/`, gzip, byte-exact forwarding, `relay` vs `resign` upstream identity, per-project routing, deterministic transaction sampling, attachments held locally, unknown item types passed through, upstream rate limits honoured and reflected back to SDKs.
 - [x] **Verified against the real `sentry-sdk`** (2.66.1) with a stand-in upstream: 20 errors + 1 message + 12 transactions → 23 items forwarded, 10 transactions sampled out at `transaction_sample_rate = 0.25`, all 33 stored locally with full payloads. Relay sent `/api/1234/envelope/` with `sentry_key=appkey123`; resign sent `/api/77/envelope/` with `sentry_key=ourteamkey`. Stacktraces, `release`, `environment`, `server_name` and trace context all intact upstream.
-- [ ] Sentry proxy: persist the upstream queue, so envelopes already answered `200` survive a restart rather than living only in memory.
+- [x] **Sentry upstream queue is spooled to disk**, fsynced before the SDK is answered `200`. Tested across a restart with an unreachable upstream: envelopes are delivered later, and a delivered envelope is not re-sent.
 - [ ] Sentry proxy: replay held-back transactions and attachments upstream on demand — the "undo button" for the Sentry path, matching what the log path already promises.
-- [ ] Delivery cursor persisted, so a restart resumes rather than re-sending or dropping.
-- [ ] Tail glob patterns (`/var/log/*.log`) and directory discovery; currently explicit paths only.
-- [ ] Replay scanner: `parquet` + `arrow-rs`, row-group stats pruning, predicate = time + service + level. No SQL engine.
+- [x] **Delivery cursor persisted** for the log forwarder too: undelivered events are replayed on start.
+- [x] **Tail glob patterns** with periodic rediscovery (`*`, `?`, `[a-z]`, `[!…]`). Re-expanded every 5s, because the window in which a new service's log file appears is exactly the window an incident lives in. `**` is deliberately unsupported and matches nothing rather than half-working.
+- [x] **Replay scanner** (`scan.rs`) and `logless replay`: prunes by partition directory, then row-group statistics, then rows. `--explain` shows which files a query would open. Sends matched history to the configured destinations with `--forward` — the undo button.
 - [x] Verified a user's own `duckdb` CLI queries the Parquet dir with hive partitioning — group-by level, time filters, partition pruning all work.
-- [ ] Package the <1h demo as a script rather than an ad-hoc shell pipeline.
+- [x] **Demo packaged** as `scripts/demo.sh`: ingest, storage ratio, mined templates, what would have been forwarded, replay, and a DuckDB query over the same files.
 
 ### Bugs found by end-to-end testing (fixed, gRPC)
 - **A socket accepted from a non-blocking listener inherits non-blocking on BSD/macOS but not on Linux.** Every read returned `EWOULDBLOCK`, so the connection died with `INTERNAL_ERROR` after the first request — and would have behaved differently on the deployment platform than on the development one. Now set explicitly on each accepted socket.
@@ -126,14 +126,36 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - **Aggregate events showed an example instead of a shape**: the rollup's `template` field received the raw body. An aggregate exists to show the shape, so it now carries the masked template text alongside one concrete example.
 - **Long ids classified as `<NUM>`**: a 32-character all-digit trace id matched the numeric check before the hex one. Tokens of 16+ characters are identifiers, not quantities.
 
+## Still open
+
+- **Store template id + parameter columns instead of body text.** The remaining compression work, and the one that needs a schema change: `body` would become derivable rather than stored, so external readers would have to join a template dictionary. Compaction has since delivered 72% on fragmentation, which was the other half of the same problem.
+- **Sentry replay upstream.** History is already stored with the full envelope payload, so replaying held-back transactions and attachments is now a scan plus a re-send — but it is not written.
+- **Dedupe window and windows-per-minute are still guesses** (60s / 3). The LogHub corpora are now downloaded by `scripts/loghub.sh` and carry timestamps, so this is measurable rather than merely stated.
+- **Chaos harness covers SIGKILL only.** Disk-full and io-throttle injection are not automated.
+
 ## Deferred (do not pull in)
 Novelty/rate anomaly layer (EWMA + SpaceSaving + HLL) · k8s DaemonSet · S3 tiering · DuckLake aggregation tier · Flight SQL · syslog · ES `_bulk` · Datadog/OTLP out.
+
+### Measured against real corpora, and what it changed
+
+Benchmarking against LogHub did what benchmarking is for: it contradicted a default.
+
+| similarity_threshold | geometric-mean ratio to ground truth | datasets within 2× |
+|---|---|---|
+| 0.4 (the old default) | 0.59× | 4 / 11 |
+| 0.6 | 0.79× | 8 / 11 |
+| 0.7 | 0.89× | 10 / 11 |
+| **0.8 (new default)** | **0.99×** | **10 / 11** |
+| 0.9 | 1.22× | 10 / 11 |
+
+At 0.4 we were **over-merging badly on every real dataset** — collapsing distinct shapes into one template, which for this product means one Sentry fingerprint covering unrelated failures and a dedupe window suppressing errors that are not duplicates. Synthetic lines never showed it, because we wrote them to be cleanly separable. The default is now 0.8, where over-splitting (which only costs dictionary entries) is the residual error rather than over-merging.
+
+Two datasets still over-split (Proxifier 3.25×, Apache 2.00×); both are dominated by lines whose only variable part is a path or a duration, which our masker splits more finely than LogHub's ground truth does.
 
 ## Known gaps worth stating plainly
 - **HEC index routing is ignored.** We have level buckets, not indexes; `index` is kept as an attribute. An event addressed to an index that does not exist is accepted rather than refused with code 7.
 - **No real Splunk to test against.** Ingest was driven by a third-party HEC client, but the ack contract was polled by hand — no OSS client implements `useACK`. The shapes match Splunk's documented ones; they have not been checked against Splunk itself.
 - **An acked batch could still lose records to severity shedding** if another source fills the ingest queue between the capacity check and the submit. The window is small and the check makes it unlikely, but "unlikely" is not "cannot".
-- **The Sentry proxy's upstream queue is in memory.** An envelope answered `200` and still queued when the agent stops is drained on a clean shutdown, but lost on `SIGKILL` or a crash — unlike the log path, which is WAL-backed. This is the largest remaining gap in the proxy.
 - **Sentry rate limits are tracked per proxy, not per project.** A limit returned for one upstream project suppresses that category for all of them.
 - **No `sentry-trace` / `baggage` continuity checks.** Envelopes are forwarded as-is, so distributed tracing works, but nothing verifies that a sampled-out transaction does not leave a dangling reference upstream.
 - **gRPC is plaintext h2c only.** No TLS: termination belongs to whatever already does it on the node, and the default bind is loopback. A client configured for TLS will fail to connect rather than fall back.

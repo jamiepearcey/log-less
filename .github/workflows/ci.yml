@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail on warnings in CI only. Locally a warning should not block a build
+  # mid-thought; on main it should never land.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      # The agent's own claims, checked on real files rather than in a unit
+      # test: the accounting invariant across SIGKILLs, and bounded memory
+      # under a storm of errors. Both have caught bugs that unit tests could
+      # not see, because both live in the seams between components.
+      - name: Build release
+        run: cargo build --release
+
+      - name: Chaos harness
+        run: ./scripts/chaos.sh 5 200000
+
+      - name: Storm harness
+        run: ./scripts/storm.sh 10000 10 512
+
+  licences:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # log-less is BSL, which is only defensible if everything under it is
+      # permissive. A copyleft dependency arriving through a transitive bump is
+      # the kind of thing nobody notices until a customer's legal review.
+      - name: Dependency licences
+        run: ./scripts/licences.sh
+
+  binary-size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      # "Small enough to run on every node you already own" is a claim the
+      # project makes to justify hand-writing protocol code instead of taking
+      # the obvious dependencies. A limit makes it a fact rather than an
+      # intention — and makes the cost of the next dependency visible in the
+      # diff that adds it.
+      - name: Binary size
+        run: |
+          size=$(stat -c%s target/release/logless)
+          mb=$(( size / 1048576 ))
+          echo "logless is ${mb} MiB (${size} bytes)"
+          if [ "$size" -gt 15728640 ]; then
+            echo "FAIL: binary exceeds 15 MiB" >&2
+            exit 1
+          fi

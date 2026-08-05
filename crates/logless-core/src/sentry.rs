@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use crate::httpd::{self, Handler, Incoming, Limits, Method, Reject, Reply};
 use crate::model::{Attr, AttrValue, LogRecord, Severity};
+use crate::spool::{Spool, SpoolConfig};
 
 pub use dsn::{Dsn, UpstreamAuth};
 pub use envelope::{Envelope, EnvelopeError, Item, ItemType};
@@ -95,6 +96,14 @@ pub struct SentryConfig {
     pub max_body_bytes: usize,
     #[serde(default = "default_sentry_max_decompressed")]
     pub max_decompressed_bytes: usize,
+    /// Spool undelivered envelopes to disk under `<data_dir>/sentry-spool`.
+    ///
+    /// On by default, because the alternative is losing envelopes an SDK was
+    /// told `200` for — it has already discarded its copy, so nothing else can
+    /// replace them. Turning it off makes the proxy strictly in-memory and is
+    /// only reasonable when upstream delivery is best-effort.
+    #[serde(default = "default_true")]
+    pub spool: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -146,6 +155,7 @@ impl Default for SentryConfig {
             forward_unknown: true,
             max_body_bytes: default_sentry_max_body(),
             max_decompressed_bytes: default_sentry_max_decompressed(),
+            spool: true,
         }
     }
 }
@@ -154,6 +164,8 @@ impl Default for SentryConfig {
 pub enum SentryError {
     #[error(transparent)]
     Http(#[from] httpd::HttpError),
+    #[error("cannot open the sentry spool: {0}")]
+    Spool(#[from] crate::spool::SpoolError),
     #[error("sentry.upstream_dsn is malformed: {dsn}")]
     BadDsn { dsn: String },
     #[error("sentry.projects[{index}].dsn is malformed: {dsn}")]
@@ -239,6 +251,38 @@ pub struct Outbound {
     pub envelope: Envelope,
 }
 
+impl Outbound {
+    /// Spool encoding: the target on one line, then the envelope's own bytes.
+    /// The envelope is stored as it will be sent, so a replay after a restart
+    /// forwards exactly what the SDK produced rather than a re-derivation.
+    fn encode(&self) -> Vec<u8> {
+        let mut out = serde_json::json!({
+            "url": self.target.url,
+            "key": self.target.key,
+            "project": self.target.project,
+        })
+        .to_string()
+        .into_bytes();
+        out.push(b'\n');
+        out.extend_from_slice(&self.envelope.to_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let split = bytes.iter().position(|b| *b == b'\n')?;
+        let header: serde_json::Value = serde_json::from_slice(&bytes[..split]).ok()?;
+        let envelope = Envelope::parse(&bytes[split + 1..]).ok()?;
+        Some(Self {
+            target: dsn::UpstreamTarget {
+                url: header.get("url")?.as_str()?.to_string(),
+                key: header.get("key")?.as_str()?.to_string(),
+                project: header.get("project")?.as_str()?.to_string(),
+            },
+            envelope,
+        })
+    }
+}
+
 struct Routes {
     mode: UpstreamAuth,
     configured: Option<Dsn>,
@@ -262,7 +306,12 @@ struct SentryHandler {
     stats: Arc<SentryStats>,
     limits: Arc<RateLimits>,
     sink: Box<dyn Fn(Vec<LogRecord>) -> Admitted + Send + Sync>,
-    outbound: Option<crossbeam_channel::Sender<Outbound>>,
+    /// Durable queue. Written and fsynced *before* the SDK is answered `200`,
+    /// because after that answer the SDK discards its only copy.
+    spool: Option<Arc<std::sync::Mutex<Spool>>>,
+    /// Nudges the forwarder; the spool is the source of truth, so a missed
+    /// wake-up costs latency and never data.
+    wake: Option<crossbeam_channel::Sender<()>>,
 }
 
 impl SentryHandler {
@@ -365,12 +414,25 @@ impl SentryHandler {
         if !env.is_empty() {
             match self.routes.resolve(&key, project) {
                 Some(target) => {
-                    if let Some(tx) = &self.outbound {
-                        // Never block the SDK on upstream latency: a slow
-                        // Sentry must not become slow application code.
-                        if tx.try_send(Outbound { target, envelope: env }).is_err() {
-                            tracing::warn!("sentry proxy queue full; envelope not forwarded");
+                    let outbound = Outbound { target, envelope: env };
+                    if let Some(spool) = &self.spool {
+                        // Durable before the 200. Costs one fsync per envelope,
+                        // which a Sentry SDK — already asynchronous — will not
+                        // notice, and which is the whole difference between an
+                        // acknowledgement and a guess.
+                        let mut spool = spool.lock().unwrap_or_else(|p| p.into_inner());
+                        match spool.push(&outbound.encode()) {
+                            Ok(true) => {
+                                if let Err(e) = spool.sync() {
+                                    tracing::warn!(error = %e, "sentry spool sync failed");
+                                }
+                            }
+                            Ok(false) => tracing::warn!("sentry spool full; envelope not queued"),
+                            Err(e) => tracing::warn!(error = %e, "sentry spool write failed"),
                         }
+                    }
+                    if let Some(wake) = &self.wake {
+                        let _ = wake.try_send(());
                     }
                 }
                 None => tracing::warn!(project, "no upstream route; envelope held locally only"),
@@ -464,7 +526,8 @@ pub struct Receiver {
     server: httpd::Server,
     stats: Arc<SentryStats>,
     forwarder: Option<std::thread::JoinHandle<()>>,
-    outbound: Option<crossbeam_channel::Sender<Outbound>>,
+    wake: Option<crossbeam_channel::Sender<()>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
     upstream_stats: Arc<upstream::UpstreamStats>,
 }
 
@@ -475,6 +538,7 @@ impl Receiver {
     pub fn start<F>(
         config: &SentryConfig,
         upstream: Option<Upstream>,
+        spool_dir: Option<&std::path::Path>,
         sink: F,
     ) -> Result<Self, SentryError>
     where
@@ -509,24 +573,23 @@ impl Receiver {
             .map(|u| Arc::clone(&u.stats))
             .unwrap_or_default();
 
-        let (outbound, forwarder) = match upstream {
+        let spool = match (config.spool, spool_dir, upstream.is_some()) {
+            (true, Some(dir), true) => Some(Arc::new(std::sync::Mutex::new(
+                Spool::open(dir, SpoolConfig::default())?,
+            ))),
+            _ => None,
+        };
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let (wake, forwarder) = match upstream {
             Some(upstream) => {
-                let (tx, rx) = crossbeam_channel::bounded::<Outbound>(1024);
+                let (tx, rx) = crossbeam_channel::bounded::<()>(1024);
+                let spool = spool.clone();
+                let stop = Arc::clone(&stop);
                 let handle = std::thread::Builder::new()
                     .name("sentry-proxy".into())
                     .spawn(move || {
-                        while let Ok(item) = rx.recv() {
-                            let now = crate::now_unix_secs();
-                            match upstream.send(&item.target, &item.envelope, now) {
-                                Delivery::Failed { message } => {
-                                    tracing::warn!(message, "sentry upstream failed")
-                                }
-                                Delivery::Sent { status } if status >= 400 => {
-                                    tracing::warn!(status, "sentry upstream refused an envelope")
-                                }
-                                _ => {}
-                            }
-                        }
+                        forward_loop(&upstream, spool.as_deref(), &rx, &stop);
                     })
                     .expect("spawn sentry forwarder");
                 (Some(tx), Some(handle))
@@ -544,7 +607,8 @@ impl Receiver {
             stats: Arc::clone(&stats),
             limits,
             sink: Box::new(sink),
-            outbound: outbound.clone(),
+            spool: spool.clone(),
+            wake: wake.clone(),
         });
 
         let server = httpd::Server::start(
@@ -558,7 +622,7 @@ impl Receiver {
             handler,
         )?;
 
-        Ok(Self { server, stats, forwarder, outbound, upstream_stats })
+        Ok(Self { server, stats, forwarder, wake, stop, upstream_stats })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -578,12 +642,97 @@ impl Receiver {
     /// agent restarted.
     pub fn shutdown(mut self) -> StatsSnapshot {
         self.server.shutdown();
-        drop(self.outbound.take());
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        drop(self.wake.take());
         if let Some(handle) = self.forwarder.take() {
             let _ = handle.join();
         }
         self.stats.snapshot()
     }
+}
+
+/// Drains the spool until told to stop, then makes one last attempt.
+///
+/// Delivery is committed only after upstream accepts, so a crash mid-send
+/// re-delivers rather than dropping. Sentry deduplicates on `event_id`, which
+/// is what makes at-least-once the right choice here.
+fn forward_loop(
+    upstream: &Upstream,
+    spool: Option<&std::sync::Mutex<Spool>>,
+    wake: &crossbeam_channel::Receiver<()>,
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    loop {
+        let stopping = stop.load(std::sync::atomic::Ordering::Acquire);
+        let sent_any = drain_once(upstream, spool);
+        if stopping && !sent_any {
+            return;
+        }
+        if !sent_any {
+            // Woken by a push, or a timeout so a retry after a failed send
+            // still happens without one.
+            let _ = wake.recv_timeout(std::time::Duration::from_millis(200));
+            if wake.is_empty() && stop.load(std::sync::atomic::Ordering::Acquire) {
+                // One final pass, in case a push landed during shutdown.
+                if !drain_once(upstream, spool) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn drain_once(upstream: &Upstream, spool: Option<&std::sync::Mutex<Spool>>) -> bool {
+    let Some(spool) = spool else { return false };
+    let batch = {
+        let guard = spool.lock().unwrap_or_else(|p| p.into_inner());
+        match guard.peek(64) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "sentry spool read failed");
+                return false;
+            }
+        }
+    };
+    if batch.is_empty() {
+        return false;
+    }
+    let now = crate::now_unix_secs();
+    let mut delivered = None;
+    for (cursor, bytes) in batch {
+        let Some(item) = Outbound::decode(&bytes) else {
+            // Unparseable spool record: skip it rather than wedge the queue
+            // behind one bad entry forever.
+            tracing::warn!("skipping an undecodable sentry spool record");
+            delivered = Some(cursor);
+            continue;
+        };
+        match upstream.send(&item.target, &item.envelope, now) {
+            Delivery::Failed { message } => {
+                tracing::warn!(message, "sentry upstream failed; leaving envelope spooled");
+                break;
+            }
+            Delivery::Sent { status } if status >= 500 => {
+                tracing::warn!(status, "sentry upstream error; leaving envelope spooled");
+                break;
+            }
+            Delivery::Sent { status } if status >= 400 && status != 429 => {
+                // A permanent refusal. Retrying sends the same bytes forever,
+                // so it is consumed and counted rather than looped on.
+                tracing::warn!(status, "sentry upstream refused an envelope");
+                delivered = Some(cursor);
+            }
+            _ => delivered = Some(cursor),
+        }
+    }
+    if let Some(cursor) = delivered {
+        let mut guard = spool.lock().unwrap_or_else(|p| p.into_inner());
+        if let Err(e) = guard.commit(cursor) {
+            tracing::warn!(error = %e, "sentry spool commit failed");
+        }
+        return true;
+    }
+    false
 }
 
 /// Sentry event ids are 32 lowercase hex characters with no dashes.

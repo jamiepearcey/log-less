@@ -7,6 +7,7 @@
 
 pub mod budget;
 pub mod catalog;
+pub mod compact;
 pub mod config;
 pub mod model;
 pub mod partition;
@@ -18,7 +19,10 @@ pub mod mask;
 pub mod merge;
 pub mod otlp;
 pub mod queue;
+pub mod scan;
 pub mod schema;
+pub mod counters;
+pub mod spool;
 pub mod sentry;
 pub mod store;
 pub mod tail;

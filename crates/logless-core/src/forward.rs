@@ -435,7 +435,7 @@ impl Forwarder {
 ///
 /// Carries everything the per-destination shaping needs, so the decision of
 /// *how* to say it stays with the destination rather than the ingest path.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Outbound {
     pub window: ContextWindow,
     /// False when the ring withheld context; the error is still forwarded.
