@@ -172,6 +172,26 @@ This also means the previously recorded "0.4 was 0.59×, 4 of 11 within 2×" was
 
 The Proxifier fix came from a consult: mask by *deleting* optional groups rather than substituting a placeholder. For a miner that buckets by token count, one placeholder is still one token more than the shorter line has, so `1608 bytes (1.57 KB) sent` could never merge with `0 bytes sent`. Deleting the group — and trailing unit words like `sec` after a variable — normalises length. One shape went from seven templates as separate tokens, to three as a placeholder, to one deleted.
 
+### Storage, measured against the baseline a customer actually has
+
+`space` (new) writes the same 22,000 real log lines through every path and compares against gzip and zstd on the same bytes — because nobody keeps uncompressed logs, so "×N vs raw text" is the wrong comparison.
+
+| | bytes/record | vs raw |
+|---|---|---|
+| raw text | 144.5 | 1.00× |
+| **gzip -6 of the file** | **15.0** | **9.63×** |
+| zstd -3 of the file | 14.9 | 9.71× |
+| our Parquet, before | 37.2 | 3.89× |
+| **our Parquet, after** | **27.9** | **5.19×** |
+| …without `event_id` | 21.7 | 6.67× |
+| …and at zstd -9 | 18.5 | 7.80× |
+
+**We are still 1.86× larger than gzip** (was 2.48×). The fix was one line: the two timestamp columns were `PLAIN` 64-bit integers — 8 incompressible bytes each, where zstd cannot see the structure. Log timestamps are near-monotonic, which is what `DELTA_BINARY_PACKED` exists for. They went from a quarter of the file to 0.02 B/record, and the file shrank 25%. Verified readable by DuckDB.
+
+Column breakdown after the fix: `body` 72.7% (20.24 B/rec), `event_id` 22.3% (6.22 B/rec), `template_id` 2.7%, `trace_id` 1.6%, everything else 0.7%.
+
+**What is left, in order of value:** shrink `event_id` to its 74 random bits and derive the time prefix from `observed` (~3 B/rec, schema change); zstd 3→9 on the merge path (~3 B/rec, background CPU); typed attribute columns (unmeasured, but it is also what makes `latency_ms > 500` a pushdown predicate). Those two would bring the format to roughly gzip parity — which is the target, since unlike gzip it also buys per-level retention as a directory delete and row-group pruning.
+
 ## Still open
 
 - **Parsing accuracy is 0.844, and two datasets are poor**: Linux 0.349 and HealthApp 0.717. Both have shapes whose variable parts are unquoted free text, which no masking heuristic separates from the static parts. This is the honest ceiling of masking-plus-fixed-length-bucketing.
