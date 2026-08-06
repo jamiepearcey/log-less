@@ -174,23 +174,33 @@ The Proxifier fix came from a consult: mask by *deleting* optional groups rather
 
 ### Storage, measured against the baseline a customer actually has
 
-`space` (new) writes the same 22,000 real log lines through every path and compares against gzip and zstd on the same bytes — because nobody keeps uncompressed logs, so "×N vs raw text" is the wrong comparison.
+`space` and `why-gzip` write the same 22,000 real log lines through every path and compare against gzip and zstd on the same bytes — because nobody keeps uncompressed logs, so "×N vs raw text" is the wrong comparison.
 
 | | bytes/record | vs raw |
 |---|---|---|
 | raw text | 144.5 | 1.00× |
 | **gzip -6 of the file** | **15.0** | **9.63×** |
-| zstd -3 of the file | 14.9 | 9.71× |
 | our Parquet, before | 37.2 | 3.89× |
-| **our Parquet, after** | **27.9** | **5.19×** |
-| …without `event_id` | 21.7 | 6.67× |
-| …and at zstd -9 | 18.5 | 7.80× |
+| **our Parquet, now** | **23.8** | **6.06×** |
+| …without `event_id` | 17.7 | 8.14× |
+| …and at zstd -9 | 15.2 | 9.47× |
 
-**We are still 1.86× larger than gzip** (was 2.48×). The fix was one line: the two timestamp columns were `PLAIN` 64-bit integers — 8 incompressible bytes each, where zstd cannot see the structure. Log timestamps are near-monotonic, which is what `DELTA_BINARY_PACKED` exists for. They went from a quarter of the file to 0.02 B/record, and the file shrank 25%. Verified readable by DuckDB.
+**gzip is not compressing better than we are — we are storing more.** Decomposing the 8.5 bytes/record gap:
 
-Column breakdown after the fix: `body` 72.7% (20.24 B/rec), `event_id` 22.3% (6.22 B/rec), `template_id` 2.7%, `trace_id` 1.6%, everything else 0.7%.
+| | bytes/record | share of the gap |
+|---|---|---|
+| `event_id` (a UUID the log file does not contain) | 6.4 | 75% |
+| columnar framing (per-chunk, per-page compression windows) | 1.8 | 21% |
+| every other column combined | 0.2 | 3% |
 
-**What is left, in order of value:** shrink `event_id` to its 74 random bits and derive the time prefix from `observed` (~3 B/rec, schema change); zstd 3→9 on the merge path (~3 B/rec, background CPU); typed attribute columns (unmeasured, but it is also what makes `latency_ms > 500` a pushdown predicate). Those two would bring the format to roughly gzip parity — which is the target, since unlike gzip it also buys per-level retention as a directory delete and row-group pruning.
+The `body` column lands within **12%** of a single zstd stream of the same text (16.0 vs 14.9 B/line), and that gap is insensitive to dictionary encoding, page size and sort order — so the columnar format itself was never the expensive part. `event_id` costs 6.38 B/record in our sort order, 6.28 in arrival order and 6.28 sorted by id: it is irreducible entropy (74 random bits of a UUIDv7), not a layout problem.
+
+Two things got us here, and one was a measurement bug:
+
+- **Delta-encoded timestamps.** The two timestamp columns were `PLAIN` 64-bit integers — 8 incompressible bytes each, where zstd cannot see the structure. Log timestamps are near-monotonic, which is what `DELTA_BINARY_PACKED` exists for. One line; they went from a quarter of the file to 0.02 B/record. Verified readable by DuckDB.
+- **The harness was assigning services round-robin** (`i % 4`), interleaving eleven different log formats on every line and destroying exactly the locality the sort order exists to create. Real nodes log in contiguous bursts. Worth 4.1 B/record, and it had made the format look worse than it is — the previously recorded "27.9 B/record, 1.86× gzip" was that artefact.
+
+**What is left:** shrinking `event_id` to its 74 random bits (deriving the time prefix from `observed`) is worth 6.1 B/record, and zstd 3→9 on the merge path another 2.5. Together that is **15.2 B/record against gzip's 15.0** — parity, while keeping per-level retention as a directory delete, row-group pruning, and columns any engine can read.
 
 ## Still open
 
