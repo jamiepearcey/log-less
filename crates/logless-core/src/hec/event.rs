@@ -195,9 +195,10 @@ fn record_from_object(
     Ok(record)
 }
 
-/// HEC severity is a convention, not a field: clients put it in `fields`, or in
-/// the structured event itself, or nowhere. Checked in that order, because an
-/// explicit indexed field is a stronger signal than a word inside the text.
+/// HEC severity is a convention, not a field: clients put it in `fields`, in the
+/// structured event itself, in the text of the line, or nowhere. Checked in that
+/// order, because an explicit indexed field is a stronger signal than a word
+/// inside the text.
 fn infer_severity(
     object: &serde_json::Map<String, serde_json::Value>,
     record: &LogRecord,
@@ -219,6 +220,22 @@ fn infer_severity(
                 }
             }
         }
+        return None;
+    }
+    // A **string** event is a real log line, and a log line's level lives in its
+    // prefix — there is nowhere else for the client to have put it. Without this
+    // an agent fronting an application that sends its existing lines through
+    // `/event` files every record at INFO, which is not merely a wrong column:
+    // partition-by-level collapses to one bucket, errors inherit the `info`
+    // retention policy, and pushdown never fires because nothing reaches
+    // `trigger_severity`. Observed against 1M lines from 11 LogHub corpora —
+    // every one landed in `level=info`, including those containing `[error]`.
+    //
+    // Deliberately not applied to structured events: their keys were checked
+    // above, and scanning their rendered JSON would match the word "error"
+    // inside a message and call it a level.
+    if let Some(serde_json::Value::String(_)) = object.get("event") {
+        return severity_in_line(&record.body);
     }
     None
 }
@@ -248,13 +265,54 @@ fn severity_text(
     None
 }
 
-/// `/raw` has nowhere to put a level, so the leading token is the only signal.
+/// How far into a line to look for a level word.
+///
+/// Three tokens was too few for every real format measured: the level sits
+/// *after* the metadata prefix, and real prefixes are long. Apache puts it at
+/// token 7 (`[Sun Dec 04 04:47:44 2005] [error] …`), HDFS and Zookeeper at 4,
+/// and BGL at 9 (`- 1117838570 2005.06.03 R02-M1-N0-C:J12-U11 … RAS KERNEL INFO
+/// …`). Twelve covers all eleven LogHub corpora with headroom.
+const LEVEL_SCAN_TOKENS: usize = 12;
+
+/// The level named in a line's prefix, if it names one.
+///
+/// Two bounds, because one is not enough. A level belongs to the *prefix* a
+/// logger writes, never to the message a human wrote, and the whole risk here is
+/// reading a word out of the message: classifying `note=the user typed ERROR
+/// into the form` as an error would forward it upstream and page someone.
+///
+/// * **Token count.** Deep enough for BGL's token 9, no deeper than needed.
+/// * **Stop at the first `key=value` token.** Logfmt pairs are where a prefix
+///   ends and content begins; no real prefix contains one. This is the bound
+///   that actually separates BGL's token-9 `FATAL` from prose at token 12,
+///   which a count alone cannot do.
+///
+/// Matching is exact-token after trimming punctuation, never substring, so
+/// `errors=0` and `error_count` are not levels.
+///
+/// `None` rather than a default, so callers can distinguish "the line said
+/// INFO" from "the line said nothing" — [`infer_severity`] needs that to know
+/// whether to keep looking.
+fn severity_in_line(line: &str) -> Option<Severity> {
+    line.split_whitespace()
+        .take(LEVEL_SCAN_TOKENS)
+        .take_while(|token| !is_key_value(token))
+        .find_map(|token| Severity::from_text(token.trim_matches(|c: char| !c.is_alphanumeric())))
+}
+
+/// A logfmt-style pair: a non-empty key, then `=`. `=` alone, or a leading `=`,
+/// is punctuation rather than structure and does not end the prefix.
+fn is_key_value(token: &str) -> bool {
+    match token.find('=') {
+        Some(0) | None => false,
+        Some(_) => true,
+    }
+}
+
+/// `/raw` has nowhere to put a level, so the line itself is the only signal.
 /// Bracketed and bare forms both appear in real logs.
 fn severity_of_line(line: &str) -> Severity {
-    line.split_whitespace()
-        .take(3)
-        .find_map(|token| Severity::from_text(token.trim_matches(|c: char| !c.is_alphanumeric())))
-        .unwrap_or(DEFAULT_SEVERITY)
+    severity_in_line(line).unwrap_or(DEFAULT_SEVERITY)
 }
 
 fn apply_metadata(record: &mut LogRecord, meta: &Metadata) {
@@ -337,6 +395,83 @@ mod tests {
         let records = parse_event_body(body.as_bytes(), &Metadata::default(), NOW).unwrap();
         let bodies: Vec<&str> = records.iter().map(|r| r.body.as_str()).collect();
         assert_eq!(bodies, ["one", "two", "three"]);
+    }
+
+    /// One line per LogHub corpus, verbatim, because the level's *position*
+    /// is the whole point and a paraphrase would move it.
+    #[test]
+    fn a_string_event_gets_its_level_from_the_line() {
+        let cases: [(&str, Severity); 6] = [
+            // Apache — level at token 7, inside brackets.
+            (
+                "[Sun Dec 04 04:47:44 2005] [error] mod_jk child workerEnv in error state 6",
+                Severity::ERROR,
+            ),
+            // HDFS — level at token 4.
+            (
+                "081109 203615 148 INFO dfs.DataNode$PacketResponder: PacketResponder 1 terminating",
+                Severity::INFO,
+            ),
+            // Zookeeper — level at token 4, after a bare dash.
+            (
+                "2015-07-29 17:41:41,648 - WARN  [main:QuorumPeer@1000] - Unexpected exception",
+                Severity::WARN,
+            ),
+            // BGL — level at token 9, the deepest of the eleven corpora.
+            (
+                "- 1117838570 2005.06.03 R02-M1-N0-C:J12-U11 2005-06-03-15.42.50.363779 \
+                 R02-M1-N0-C:J12-U11 RAS KERNEL FATAL instruction cache parity error",
+                Severity::FATAL,
+            ),
+            // Linux syslog names no level at all — the default must still apply.
+            (
+                "Jun 14 15:16:01 combo sshd(pam_unix)[19939]: authentication failure",
+                DEFAULT_SEVERITY,
+            ),
+            // A level word beyond the scan window is prose, not a level. This is
+            // the false-positive the bound exists to prevent.
+            (
+                "2015-07-29 17:41:41,648 svc-checkout req=1 user=42 session=abc path=/pay \
+                 status=200 note=the user typed ERROR into the form",
+                DEFAULT_SEVERITY,
+            ),
+        ];
+        for (line, expected) in cases {
+            let record = one(&serde_json::json!({ "event": line }).to_string());
+            assert_eq!(
+                expected, record.severity,
+                "wrong level for: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_field_still_beats_the_line_text() {
+        // The line says ERROR; the client says DEBUG in an indexed field. The
+        // declared value wins — inference is the last resort, not the first.
+        let record = one(
+            r#"{"event":"2015-07-29 17:41:41,648 - ERROR - boom","fields":{"level":"debug"}}"#,
+        );
+        assert_eq!(Severity::DEBUG, record.severity);
+        assert_eq!(Some("debug".to_string()), record.severity_text);
+    }
+
+    #[test]
+    fn a_structured_event_is_not_scanned_as_text() {
+        // Its keys were already checked. Scanning the rendered JSON would match
+        // the word inside the message and call it a level.
+        let record = one(r#"{"event":{"msg":"error while parsing","code":7}}"#);
+        assert_eq!(DEFAULT_SEVERITY, record.severity);
+    }
+
+    #[test]
+    fn inferring_from_text_is_not_the_client_declaring_a_level() {
+        // `severity_text` means "the client named a level in a field". A level
+        // recovered from the prefix is our reading of their text, not their
+        // statement, and recording it as one would launder a guess into a fact.
+        let record = one(r#"{"event":"081109 203615 148 INFO dfs.DataNode: terminating"}"#);
+        assert_eq!(Severity::INFO, record.severity);
+        assert_eq!(None, record.severity_text);
     }
 
     #[test]
