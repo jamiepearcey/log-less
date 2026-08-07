@@ -53,6 +53,13 @@ See [`.context/project-brief.md`](.context/project-brief.md) for positioning and
 [`docs/architecture.md`](docs/architecture.md) for design decisions and their
 rejected alternatives.
 
+[`docs/platform-thesis.md`](docs/platform-thesis.md) is a separate, **exploratory**
+document: what it would take to stop sitting in front of Splunk and Sentry and
+become the backend instead. It argues for reversing two decisions this repo
+currently holds ("not a system of record", "no embedded query engine"), and
+carries the measurements that support and contradict it. Nothing in it is
+committed to.
+
 ## Try what exists
 
 ```sh
@@ -182,7 +189,8 @@ plus 2 aggregate events covering the other 78 (**0.17% of raw bytes**).
   ```
 
   Timestamps are UTC-qualified so time filters mean what they say. The binary is
-  7.3 MB; embedding a query engine would roughly quintuple it.
+  11 MB; embedding DuckDB would add roughly 30 MB of C++ to serve a filtered
+  scan we already do in ~300 lines.
 - **Collapsing makes things cheaper, never invisible.** Repeated errors stop
   re-sending their context, but every error still goes upstream, and collapsed
   storms surface as aggregate events carrying a count.

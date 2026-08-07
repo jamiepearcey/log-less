@@ -63,16 +63,29 @@ Context windows come from the in-memory ring (§4); bytes-avoided counters and a
 
 **The DuckLake progression is unaffected**: `ducklake` lives at the aggregation tier (separate process, its own Postgres/DuckDB catalog) and ingests the same Parquet files unchanged. DuckDB's `sqlite_scanner` can `ATTACH` the node catalog directly when needed. Nothing about DuckDB-later requires DuckDB-now.
 
-**Measured (2026-08-04, arm64 macOS, `lto=thin`, `strip=true`, `panic=abort`):**
+**Measured (arm64 macOS, `lto=thin`, `strip=true`, `panic=abort`):**
 
-| Build | Stripped release binary |
-|---|---|
-| model, config, WAL, partition, retention, CLI | 1.5 MB |
-| **+ arrow, parquet, rusqlite (current)** | **7.3 MB** |
-| + duckdb | not built; DuckDB static-links ~30 MB → **~5× the current binary** |
-| + datafusion | not needed; the replay scanner uses `parquet`/`arrow-rs` directly |
+| Build | Stripped release binary | Measured |
+|---|---|---|
+| model, config, WAL, partition, retention, CLI | 1.5 MB | 2026-08-04 |
+| + arrow, parquet, rusqlite | 7.3 MB | 2026-08-04 |
+| **current — the above plus every receiver** | **11.05 MB** | **2026-08-07** |
+| + duckdb | not built; DuckDB static-links ~30 MB → **~3.7× the current binary** | — |
+| + datafusion | not needed; the replay scanner uses `parquet`/`arrow-rs` directly | — |
 
-Settled. Even after the storage stack landed, embedding a query engine would still be the majority of the binary — to serve a filtered scan we already do in ~300 lines. Users bring their own engine to the Parquet directory instead, verified working below.
+Settled. Embedding a general-purpose query engine would still cost more than twice the agent that runs it — to serve a filtered scan we already do in ~300 lines. Users bring their own engine to the Parquet directory instead, verified working below.
+
+**A Rust-native engine is a different question, and the answer differs.** Measured 2026-08-07 by linking RAE (`../../rust-analytical-engine`) into `logless-cli` under this profile, with a probe reachable from `main` so LTO could not discard it:
+
+| Node binary | Size | Delta |
+|---|---:|---:|
+| `logless` today | 11.05 MB | — |
+| + push-down kernel (`rae-storage`/`-execution`/`-aggregation`/`-common`) | 11.09 MB | **+0.04 MB** |
+| + the whole engine (also `rae-sql`, `rae-planner`, `rae-runtime`, `rae-joins`) | 11.79 MB | **+0.74 MB** |
+
+Both verified live rather than merely linked: the kernel read 1,000,000 rows from real parts, and the full build answered `SELECT count(*)` from inside the `logless` binary. The marginal cost is below RAE's 1.5 MB standalone size because this agent already links `serde`, `thiserror`, `crossbeam` and `hashbrown`, and thin LTO shares them. RAE's engine crates pull in no `arrow`, no `parquet` and no `tokio` at all.
+
+This does **not** reopen the DuckDB decision — 30 MB of C++ for a filtered scan is still wrong. It records that "no embedded query engine" was a judgement about *cost*, and a 40 KB one does not trigger it. See `docs/platform-thesis.md` §13–§14 for what that unlocks and what it costs in engine features.
 - **DuckLake is rejected at the node tier** and adopted only at the *optional* aggregation tier. Reasons: every merge becomes a catalog transaction, so at 500 nodes × frequent small commits Postgres is a serialisation point (commit conflicts, snapshot/metadata churn, small-file explosion, or catalog bloat via inlining); and 500 agents would need Postgres credentials and connectivity, reintroducing a central dependency into a product whose pitch is "local and cheap".
 - **Cluster tier design**: agents ship *completed Parquet files* to the tier; one (or few) writers commit them to DuckLake. DuckLake v1.0 (April 2026) is production-ready and earns its keep there — snapshots, time travel, multi-writer, Iceberg-compatible deletion vectors.
 
@@ -226,6 +239,8 @@ Two consequences fall out of that and are worth stating because they look like l
 - **Acks retire strictly from the bottom.** The "everything below N is durable" floor is one number, so a durable batch above an undurable one cannot be retired early without either creating a hole that answers `false` forever or a floor that answers `true` for data still in flight.
 - **A stalled channel is refused, not buffered.** One batch that never reaches disk blocks retirement for its channel; at the cap the receiver answers `503 Server is busy`. The client retries — which is exactly the truth of the situation, and better than an ack map that grows without bound.
 
+**Known issue — an oversized batch 503s forever.** The receiver enqueues a whole batch or none, so a batch larger than `ingest.queue_capacity` (65,536) can *never* succeed. `503 Server is busy` + `Retry-After` tells the client to try later, and later never works: measured 2026-08-07, 100k-event batches retried 60 times each and never landed, burning 127 seconds; the same million events at 5k per batch loaded in 3.2 s at 315,957 events/s with zero retries. Splunk's own default HEC limit is 800 KB per request so real clients batch well below this, which is why it has not bitten — but a 503 that can never clear is a lie about what is wrong. It should be a `413` naming the limit, or the receiver should split the batch. Not yet fixed.
+
 **Why not `prost` + `opentelemetry-proto` + `tonic`?** Same judgement as embedded DuckDB. That stack brings a code generator, a build-time `protoc`, and — via tonic — tokio and an HTTP/2 implementation, into a binary whose entire pitch is that it is small enough to run on every node the customer already owns. We decode exactly one message tree, and the wire format it needs is four wire types and a length prefix: ~190 lines in `otlp/proto.rs`, plus ~250 mapping OTLP logs onto `LogRecord`. The receiver itself is `tiny_http` (already a dev-dependency for the fake vendor in tests), so OTLP/HTTP cost **four new crates and ~0.2 MB**, against roughly 40 for the generated stack.
 
 The bet is that the OTLP logs message tree is frozen — protobuf's compatibility guarantee means field numbers never change, and unknown fields are skipped rather than fatal (tested). If OTLP logs ever break that, this decision is wrong and generated code would have been right.
@@ -282,6 +297,8 @@ The bet is that the OTLP logs message tree is frozen — protobuf's compatibilit
 | OTel `severity_number = 0` treated as unspecified | Files every record from a producer that omits severity into `debug` — shed first, deleted first, kept a day | Fall back to `severity_text`, then to INFO; keeping too much is the cheaper error |
 | `tiny_http::Server::unblock()` as the shutdown signal | Pushes one token and calls `notify_one`, so it wakes exactly one worker; multi-worker shutdown hung on join (observed) | Stop flag + `recv_timeout`; `unblock` demoted to a nudge |
 | Acking a HEC batch on receipt | The client discards its only copy; a crash before the `fdatasync` loses it | Ack keyed to the WAL's synced record count |
+| Inferring HEC severity from fields and structured-event keys only | A client sending real log lines as JSON *string* events has nowhere to put a level, so every record defaulted to INFO. Measured on 1M lines from 11 LogHub corpora: **all of them** landed in `level=info`, including every line containing `[error]`. Level partitioning collapsed to one bucket, errors inherited the `info` retention policy, and pushdown never fired (`errors_forwarded=0`) | String events fall back to the level in the line's own prefix. Structured events deliberately do not — their keys are already checked, and scanning rendered JSON would match "error" inside a message |
+| Scanning only the first three tokens for a level | Real formats put the level *after* the metadata prefix: Apache at token 7, HDFS and Zookeeper at 4, BGL at 9. Three tokens found none of them | Twelve tokens, **stopping at the first `key=value`** — logfmt pairs mark where a prefix ends and content begins, and no real prefix contains one. A token count alone cannot separate BGL's token-9 `FATAL` from prose at token 12, which would forward `note=the user typed ERROR into the form` upstream and page someone |
 | Dropping an ack once the client has seen it `true` (what Splunk does) | Clients re-poll windows of ids, so the second poll would answer `false` and trigger a resend | Polls never mutate; retirement happens from the bottom on the next `issue` |
 | Sweeping unreferenced ack watermarks per request | O(outstanding) on every batch — a map sized by the client's backlog, walked per request | Watermark is dropped with the entry that referenced it |
 | `tonic` + `prost` for OTLP gRPC | tokio, hyper, tower, h2 and a code generator, to serve one unary method | ~750 lines of HTTP/2 + gRPC framing, and `fluke-hpack` (no transitive deps) for the one part that must be transcribed rather than derived |
