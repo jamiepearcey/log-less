@@ -697,16 +697,24 @@ does not, and §6 should not be read as claiming it.
 
 ### Two gaps found in the process
 
-**RAE has no timestamp literal.** `WHERE timestamp >= TIMESTAMP '2026-08-01 00:00:00'` is
-a parse error. Instants can only be bound as typed *parameters* (`:lo`, ISO-8601), which is
-a good design for a driver and a blocking one for a console where users type SQL — and
-every log query is time-bounded. This belongs at the top of §6's gap list, above `LIKE`.
+**Both were fixed the same day, under RAE's I-385.** Recorded because the shapes are worth
+keeping, and because §6's gap list should not carry items that are closed.
 
-**RAE's Parquet loader reads only uncompressed Parquet.** Both zstd and snappy fail with
-`Disabled feature at compile time`. Since the log-less store writes zstd, and ClickBench's
-own `hits.parquet` is compressed, this blocks ingestion from the format the thesis calls
-the API. A feature flag on the `parquet` dependency, not a design problem — but it is
-currently load-bearing.
+**RAE had no timestamp literal.** `WHERE timestamp >= TIMESTAMP '2026-08-01 00:00:00'` was
+a parse error; instants bound only as typed *parameters* (`:lo`, ISO-8601). Good design for
+a driver, blocking for a console where users type SQL — and every log query is
+time-bounded. Re-verified after the fix: the literal parses and prunes identically to the
+parameter form (85.59% of granules and 1/2 parts pruned, 136,480 rows counted from granule
+metadata without being read).
+
+**RAE's Parquet loader read only uncompressed Parquet.** zstd and snappy both failed with
+`Disabled feature at compile time` — `parquet` was declared `default-features = false`,
+silently dropping every decompressor. Since the log-less store writes zstd, this blocked
+ingestion from the format this document calls the API; stock `hits.parquet` is compressed
+too, so ClickBench could not have been loaded either. Re-verified after the fix: the zstd
+store loads directly, 1M rows in 0.45 s.
+
+Full write-up in RAE's `benchmarks/results/B-433_log_workload.md`.
 
 ---
 
@@ -792,8 +800,8 @@ DuckDB already has:
 
 | | why it blocks |
 |---|---|
-| **Timestamp literals** (§13) | every log query is time-bounded; currently parameters only |
-| **Compressed Parquet reads** (§13) | zstd and snappy both disabled; blocks the format we call the API |
+| ~~Timestamp literals~~ | ~~every log query is time-bounded~~ — **closed by I-385** |
+| ~~Compressed Parquet reads~~ | ~~blocks the format we call the API~~ — **closed by I-385** |
 | `LIKE` / substring | mandatory for logs |
 | `date_trunc` / time bucketing | every timechart |
 | `HAVING`, `CASE WHEN`, `count(DISTINCT)` | alerting queries |
@@ -801,6 +809,7 @@ DuckDB already has:
 | Subqueries / CTEs | correlation searches |
 | **Hash aggregation throughput** (B-402, still `todo`) | 1.8–2.4x behind DuckDB native |
 
-The first two are small and immediate. The last is the real engineering. **Accepted as the
-price of the four properties above** — but it should be a decision taken with the list
+The first two closed within a day of being found, which is some evidence the bill is
+payable. The last is the real engineering. **Accepted as the price of the four properties
+above** — but it should be a decision taken with the list
 visible, not discovered one query at a time.
