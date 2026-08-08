@@ -237,6 +237,11 @@ Honest read of RAE's current state (from `docs/task-board.md`, `benchmarks/resul
 **So do not enter this as a general-purpose SQL engine race.** We would lose it, publicly,
 against two engines with a decade of head start.
 
+> **Correction (§15).** The resolution below — Parquet at the edge, RAE parts centrally —
+> contradicts §14's edge push-down, because RAE cannot read Parquet at all. §15 measures the
+> cheapest way out and finds that §13's time-window numbers were taken on a sort order this
+> product does not produce. Read both before relying on either.
+
 > **Tested 2026-08-07 (§13).** On the log shape specifically, the B-403 result does not
 > reproduce: against DuckDB over Parquet, RAE never loses by more than 1.6x and wins three
 > of six queries. But against DuckDB *native* it loses 1.8–2.4x on every aggregate shape.
@@ -813,3 +818,105 @@ The first two closed within a day of being found, which is some evidence the bil
 payable. The last is the real engineering. **Accepted as the price of the four properties
 above** — but it should be a decision taken with the list
 visible, not discovered one query at a time.
+
+---
+
+## 15. The contradiction in §6, and what pruning actually costs
+
+§13 and §14 left an error in this document. This section is that error, measured.
+
+### The contradiction
+
+§6 resolves the format question by saying **Parquet stays the durable edge and object-store
+format; RAE-native parts are an accelerated layer for the central hot tier.** §14 then
+prices edge push-down at 40 KB and treats it as unlocked.
+
+Both cannot be true. RAE cannot read Parquet — at all:
+
+```
+rae -t logs=…/logs.parquet   bad magic: expected [82, 65, 69, 49]   # "RAE1"
+rae -t logs=…/store          table logs has no parts
+```
+
+Parquet is an *import* path — `raebench-clickbench-load` converts Parquet into `.part`
+files, offline, and it lives in `benchmarks`, not in the engine. I-385 taught that loader to
+decompress; it did not make RAE a Parquet reader. So a node that stores Parquet has nothing
+the 40 KB kernel can read.
+
+Four ways out:
+
+| | cost |
+|---|---|
+| Node writes Parquet only | no edge push-down without on-the-fly conversion |
+| Node writes both | ~2.8x disk (Parquet 1.0x + parts 1.8x) against a product selling cheap local retention |
+| Node writes parts only | breaks "Parquet is the API" — no user DuckDB/Polars/Grafana against the store |
+| **Node's Parquet is read as parts** | needs work, but no dual storage and no broken API |
+
+### The fourth option is cheaper than it looks
+
+The objection is that Parquet libraries are large. Measured, same profile, verified by
+reading 1,000,000 rows so nothing is stripped:
+
+| binary | size |
+|---|---:|
+| baseline, no dependencies | 0.32 MB |
+| + `arrow` + `parquet`, reader path only | 4.67 MB |
+| **marginal** | **+4.35 MB** |
+
+That is ~3x RAE's entire engine, and it is why `parquet` belongs in `benchmarks` rather than
+in the engine crates — adding it to a 1.5 MB standalone `rae` would nearly quadruple it.
+
+**But log-less already pays that 4.35 MB**, because it writes the store. So the adapter
+belongs where the format already is: log-less hosts a Parquet-to-parts read path, RAE's
+engine crates stay dependency-free, and the node pays nothing extra in libraries.
+
+For scale: DuckDB ~30 MB · arrow+parquet 4.35 MB · RAE's whole engine 0.74 MB marginal.
+
+### Whether pruning survives — and the flaw it exposes in §13
+
+The open question was whether Parquet row-group statistics can drive RAE's granule pruning
+well enough to keep §13's time-window win. Measured on the real store and on §13's own
+fixture, 24 windows swept across the range:
+
+| layout | groups | rows/group | median coverage of full range | 1h window reads | 1d reads |
+|---|---:|---:|---:|---:|---:|
+| **the real store** — sorted `(service, trace_id, observed)` | 23 | 43,478 | **0.465** | **47.1%** | 55.1% |
+| **§13's fixture** — sorted `timestamp` | 9 | 111,111 | 0.123 | **12.3%** | 23.3% |
+
+**Sort order dominates, not the format.** Time-sorting cuts a one-hour window from 47.1% of
+rows to 12.3% — 3.8x better — *despite* row groups being 2.6x larger. Parquet statistics
+prune fine; they can only prune what the sort order has clustered. Granularity is the
+remaining gap (111k-row groups against RAE's ~4,500-row granules) and row-group size is a
+writer parameter log-less already controls.
+
+**So §13's headline is measured on a layout this product does not produce.** The 21.6x
+time-window win and the 85.59% granule pruning came from a fixture I sorted by `timestamp`
+before loading. The store sorts by `(service, trace_id, observed)` — deliberately, per
+`architecture.md` §2, to make "everything for trace X" a range scan and to cluster templates
+for zstd. Against the store's real layout, a time-bounded query touches roughly half the
+data. **The time-pruning story and the existing sort order are in direct conflict, and
+nothing in §13 revealed it because the benchmark quietly assumed the conflict away.**
+
+One caveat that cuts the other way, and it matters. Partitioning is `hour=…/level=…` keyed
+on **`observed`**, not `timestamp`. Under live ingestion the two are nearly equal, so
+directory pruning already answers time queries and none of the above bites. They diverge
+only for replayed or clock-skewed sources — which is exactly what this fixture is (1M rows
+ingested at once carrying seven days of event time), and exactly what headline #2, "turn
+yesterday's verbosity up, today", is *made* of. So the pathological case is not exotic; it
+is a named feature.
+
+### What this selects
+
+Not resolvable from first principles, and now the most important open question in the
+document:
+
+1. **Sort time-first and lose the trace range scan**, or sort service-first and lose time
+   pruning. `architecture.md` §2 chose service-first for reasons that were good and did not
+   have this in view.
+2. **Or partition on event time as well as ingest time**, so replayed data still lands
+   somewhere prunable — at the cost of the clean "retention is a directory delete" property.
+3. **Or shrink row groups**, which is free and helps regardless, but only after 1 or 2.
+
+None of the three is chosen here. What is settled is that §6's format contradiction has a
+cheap resolution, and §13's benchmark needs re-running against the store's real sort order
+before any of its time-window numbers can be quoted about this product.
