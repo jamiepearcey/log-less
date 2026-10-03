@@ -383,6 +383,26 @@ fn read_full(file: &mut File, buf: &mut [u8]) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// True for a segment whose header was never fully written: a crash (or a
+/// second process that died) between creating the file and the header write.
+/// The header is synced before the first append, so such a file holds no
+/// records, and what is there is a prefix of the magic.
+pub fn is_incomplete_header(path: &Path) -> Result<bool, WalError> {
+    let mut file = File::open(path).map_err(io(path))?;
+    let mut buf = [0u8; HEADER_BYTES as usize];
+    let mut read = 0;
+    while read < buf.len() {
+        match file.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io(path)(e)),
+        }
+    }
+    let magic_seen = read.min(MAGIC.len());
+    Ok(read < HEADER_BYTES as usize && buf[..magic_seen] == MAGIC[..magic_seen])
+}
+
 /// Read a segment's UUID from its header without replaying it.
 pub fn segment_uuid(path: &Path) -> Result<Uuid, WalError> {
     let mut file = File::open(path).map_err(io(path))?;

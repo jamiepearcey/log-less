@@ -35,6 +35,10 @@ pub struct Config {
     /// Polars and Grafana consume the logs directly. Off by default.
     #[serde(default)]
     pub serve_s3: crate::s3_serve::S3ServeConfig,
+    /// Runtime policy API (`docs/admin-api.md`). Off by default; it needs a
+    /// bearer token before it will bind at all.
+    #[serde(default)]
+    pub admin: crate::admin_api::AdminConfig,
     /// Sentry ingest proxy: your SDK keeps its DSN, only the host changes.
     #[serde(default)]
     pub sentry: crate::sentry::SentryConfig,
@@ -133,6 +137,15 @@ pub struct StorageConfig {
     /// from this: shed-and-expire at 80%, stop WAL'ing debug at 95%.
     #[serde(default = "default_disk_budget")]
     pub disk_budget_bytes: u64,
+    /// Fraction of the budget at which files start expiring ahead of retention.
+    #[serde(default = "default_high_water")]
+    pub high_water: f64,
+    /// Fraction at which DEBUG also stops entering the WAL.
+    #[serde(default = "default_critical_water")]
+    pub critical_water: f64,
+    /// Fraction early reclaim stops at once triggered.
+    #[serde(default = "default_reclaim_target")]
+    pub reclaim_target: f64,
     #[serde(default = "default_segment_bytes")]
     pub wal_segment_bytes: u64,
     /// Group-commit interval. The crash loss window is bounded by this.
@@ -144,6 +157,15 @@ pub struct StorageConfig {
 
 fn default_disk_budget() -> u64 {
     32 * 1024 * 1024 * 1024
+}
+fn default_high_water() -> f64 {
+    crate::budget::Watermarks::default().high
+}
+fn default_critical_water() -> f64 {
+    crate::budget::Watermarks::default().critical
+}
+fn default_reclaim_target() -> f64 {
+    crate::budget::Watermarks::default().reclaim_target
 }
 fn default_segment_bytes() -> u64 {
     128 * 1024 * 1024
@@ -233,6 +255,27 @@ impl Default for LevelBuckets {
     }
 }
 
+/// Why `name` cannot be a bucket, `None` when it can. Names become directory
+/// names (`level=<name>`) on any filesystem, so the alphabet is deliberately
+/// small: ASCII letters, digits, `_`, `-`, `+`. That excludes path separators,
+/// whitespace, control and bidi-format characters, and `. = : * ? " < > |`, and
+/// Windows device names are refused because they cannot be created there.
+pub fn bucket_name_problem(name: &str) -> Option<&'static str> {
+    if name.is_empty() || name.len() > 64 {
+        return Some("must be 1 to 64 characters");
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+')) {
+        return Some("may contain only ASCII letters, digits, _ - and + (it is a directory name on disk)");
+    }
+    let upper = name.to_ascii_uppercase();
+    let device = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0');
+    device.then_some("is a reserved device name on Windows filesystems")
+}
+
 impl LevelBuckets {
     pub fn new(mut buckets: Vec<LevelBucket>) -> Result<Self, ConfigError> {
         if buckets.is_empty() {
@@ -248,14 +291,16 @@ impl LevelBuckets {
             }
         }
         for b in &buckets {
-            if b.name.is_empty() || b.name.contains(['/', '\\', '=', '.']) {
+            if bucket_name_problem(&b.name).is_some() {
                 return Err(ConfigError::BadBucketName(b.name.clone()));
             }
             if b.retention.is_zero() {
                 return Err(ConfigError::ZeroRetention(b.name.clone()));
             }
         }
-        let mut names: Vec<&str> = buckets.iter().map(|b| b.name.as_str()).collect();
+        // Case-insensitive: the name is a directory, and `INFO` and `info` are
+        // one directory on a case-insensitive filesystem (macOS, Windows).
+        let mut names: Vec<String> = buckets.iter().map(|b| b.name.to_lowercase()).collect();
         names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
             return Err(ConfigError::DuplicateBucketName);
@@ -300,12 +345,14 @@ pub enum ConfigError {
     DuplicateMinSeverity(u8),
     #[error("two level buckets share a name")]
     DuplicateBucketName,
-    #[error("level bucket name {0:?} is empty or contains a path separator")]
+    #[error("level bucket name {0:?} is not a safe directory name (1 to 64 ASCII letters, digits, _ - +; no Windows device names)")]
     BadBucketName(String),
     #[error("level bucket {0:?} has zero retention; remove the bucket instead")]
     ZeroRetention(String),
     #[error("unsupported config schema_version {found}, expected {expected}")]
     UnsupportedSchema { found: u32, expected: u32 },
+    #[error("invalid policy value at {path}: {message}")]
+    Policy { path: String, message: String },
 }
 
 impl Config {
@@ -319,7 +366,17 @@ impl Config {
         // Re-run bucket invariants: a config deserialised from TOML bypasses
         // LevelBuckets::new.
         LevelBuckets::new(self.retention.buckets.clone())?;
+        // The runtime policy API edits these same values, so the file must
+        // satisfy the same rules or the first API read would be an invalid
+        // document nobody can PUT back.
+        if let Some(p) = crate::policy::Policies::from_config(self).validate().into_iter().next() {
+            return Err(ConfigError::Policy { path: p.path, message: p.message });
+        }
         Ok(())
+    }
+
+    pub fn catalog_path(&self) -> PathBuf {
+        self.storage.data_dir.join("catalog.sqlite")
     }
 
     pub fn wal_dir(&self) -> PathBuf {
@@ -344,6 +401,9 @@ mod tests {
             storage: StorageConfig {
                 data_dir: "/tmp/x".into(),
                 disk_budget_bytes: 1,
+                high_water: 0.8,
+                critical_water: 0.95,
+                reclaim_target: 0.7,
                 wal_segment_bytes: 1,
                 wal_fsync_interval: Duration::from_millis(1),
                 wal_fsync_bytes: 1,
@@ -354,6 +414,7 @@ mod tests {
             otlp: crate::otlp::ReceiverConfig::default(),
             hec: crate::hec::HecConfig::default(),
             serve_s3: crate::s3_serve::S3ServeConfig::default(),
+            admin: crate::admin_api::AdminConfig::default(),
             sentry: crate::sentry::SentryConfig::default(),
             tail: Vec::new(),
             destinations: Vec::new(),

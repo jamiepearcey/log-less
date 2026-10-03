@@ -65,6 +65,32 @@ Leave `destinations` empty for store-only mode. See
 logless serve --config /tmp/logless.toml --serve-s3-addr 127.0.0.1:9000
 ```
 
+## Change policy while it runs
+
+`logless run` can expose a small, token-protected admin API on loopback for
+retention buckets, the disk budget and watermarks, queue settings and pushdown.
+It is off by default.
+
+```toml
+[admin]
+enabled = true
+addr = "127.0.0.1:9101"
+# token comes from LOGLESS_ADMIN_TOKEN (preferred) or `token = "..."` here
+```
+
+```sh
+export LOGLESS_ADMIN_TOKEN='a-long-random-secret'
+./target/release/logless run --config /tmp/logless.toml --otlp &
+curl -s -H "Authorization: Bearer $LOGLESS_ADMIN_TOKEN" http://127.0.0.1:9101/admin/v1/policies
+```
+
+Changes are previewed against the real store first, destructive ones need an
+explicit confirmation bound to that preview, bucket renames that would strand
+data are refused, and every change is audited and restorable. Most settings
+apply live; `ingest.queue_capacity` waits for a restart. Config-file values stay
+the defaults and runtime changes override them field by field. Full contract,
+validation rules and curl examples in [`docs/admin-api.md`](docs/admin-api.md).
+
 ## Try what exists
 
 ```sh

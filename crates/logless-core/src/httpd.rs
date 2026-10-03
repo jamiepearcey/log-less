@@ -49,6 +49,7 @@ impl Default for Limits {
 pub enum Method {
     Get,
     Post,
+    Put,
     Other,
 }
 
@@ -62,7 +63,23 @@ pub struct Incoming<'a> {
     pub body: Vec<u8>,
 }
 
-impl Incoming<'_> {
+impl<'a> Incoming<'a> {
+    pub(crate) fn new(
+        method: Method,
+        path: &'a str,
+        query: &'a str,
+        headers: &'a [(String, String)],
+        body: Vec<u8>,
+    ) -> Self {
+        Self { method, path, query, headers, body }
+    }
+
+    /// How many headers carry this name. A header that must be unique (Host)
+    /// is ambiguous when this is above one.
+    pub fn header_count(&self, name: &str) -> usize {
+        self.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)).count()
+    }
+
     /// Case-insensitive header lookup. Returns the first match, which is what
     /// every header here is defined to have at most one of.
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -247,6 +264,7 @@ fn dispatch(mut request: tiny_http::Request, limits: Limits, handler: &dyn Handl
     let method = match request.method() {
         tiny_http::Method::Get => Method::Get,
         tiny_http::Method::Post => Method::Post,
+        tiny_http::Method::Put => Method::Put,
         _ => Method::Other,
     };
     let headers: Vec<(String, String)> = request

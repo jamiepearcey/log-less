@@ -5,15 +5,20 @@
 //! the agent must never block the application and must account for every record
 //! it accepts.
 
+pub mod admin_api;
 pub mod budget;
 pub mod catalog;
 pub mod compact;
 pub mod config;
 pub mod model;
 pub mod partition;
+pub mod policy;
+pub mod policy_impact;
+pub mod policy_store;
 pub mod drain;
 pub mod forward;
 pub mod hec;
+pub mod bounded_http;
 pub mod httpd;
 pub mod mask;
 pub mod merge;

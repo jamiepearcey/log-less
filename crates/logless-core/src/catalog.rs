@@ -248,6 +248,11 @@ impl Catalog {
             .collect())
     }
 
+    pub fn file_count(&self) -> Result<u64, CatalogError> {
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
     pub fn totals(&self) -> Result<(u64, u64), CatalogError> {
         let (rows, bytes): (i64, i64) = self.conn.query_row(
             "SELECT COALESCE(SUM(rows), 0), COALESCE(SUM(bytes), 0) FROM files",

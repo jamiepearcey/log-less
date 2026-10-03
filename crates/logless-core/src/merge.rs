@@ -86,6 +86,15 @@ pub fn merge_all(
         }
 
         let segment_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if wal::is_incomplete_header(&path)? {
+            // Holds no records, and would otherwise fail every pass and block
+            // the segments behind it.
+            tracing::warn!(path = %path.display(), "removing wal segment whose header was never written");
+            if std::fs::remove_file(&path).is_ok() {
+                report.segments_skipped += 1;
+            }
+            continue;
+        }
         let segment_uuid = wal::segment_uuid(&path)?;
 
         if catalog.is_segment_merged(segment_uuid)? {
@@ -340,6 +349,23 @@ mod tests {
 
         assert_eq!(report.segments_merged, 0, "nothing at or above active");
         assert_eq!(wal::list_segments(&wal_dir).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_segment_whose_header_was_never_written_is_removed_and_does_not_wedge_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, store_dir) = (tmp.path().join("wal"), tmp.path().join("store"));
+        write_wal(&wal_dir, vec![(0..5).map(|i| record(i, Severity::INFO, "ok")).collect()]);
+        // A zero-byte segment, and one cut inside the magic, both ahead of the active id.
+        std::fs::write(wal_dir.join("000000000002.wal"), b"").unwrap();
+        std::fs::write(wal_dir.join("000000000003.wal"), &wal::MAGIC[..5]).unwrap();
+        write_wal(&wal_dir, vec![(0..5).map(|i| record(i, Severity::INFO, "ok2")).collect()]);
+
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let report =
+            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), Some(99), 0).unwrap();
+        assert_eq!(report.records, 10, "segments behind the empty one still merge");
+        assert!(wal::list_segments(&wal_dir).unwrap().is_empty(), "empty segments freed");
     }
 
     #[test]

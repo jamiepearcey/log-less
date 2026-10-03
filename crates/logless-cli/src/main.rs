@@ -13,11 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use logless_core::budget::{self, DiskUsage, Pressure};
+use logless_core::admin_api::{self, AdminServer, AdminService, IngestProbe, ListenerInfo};
+use logless_core::budget::{self, DiskUsage, Pressure, Watermarks};
 use logless_core::catalog::Catalog;
 use logless_core::drain::{Drain, DrainConfig};
 use logless_core::config::{Config, IngestConfig, LevelBuckets, PushdownConfig, StorageConfig};
 use logless_core::model::{LevelClass, LogRecord, Severity};
+use logless_core::policy::PolicyHandle;
 use logless_core::forward::{Dispatch, ForwardStats, Forwarder, HttpTransport, Outbound};
 use logless_core::ring::{Capture, ContextLine, ContextWindow, KeyTier, Ring, RingConfig, Suppressed};
 use logless_core::hec::{self, Admitted};
@@ -268,6 +270,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 storage: StorageConfig {
                     data_dir,
                     disk_budget_bytes: 32 * 1024 * 1024 * 1024,
+                    high_water: Watermarks::default().high,
+                    critical_water: Watermarks::default().critical,
+                    reclaim_target: Watermarks::default().reclaim_target,
                     wal_segment_bytes: 128 * 1024 * 1024,
                     wal_fsync_interval: Duration::from_millis(100),
                     wal_fsync_bytes: 4 * 1024 * 1024,
@@ -278,6 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 otlp: otlp::ReceiverConfig::default(),
                 hec: hec::HecConfig::default(),
                 serve_s3: s3_serve::S3ServeConfig::default(),
+                admin: admin_api::AdminConfig::default(),
                 sentry: sentry::SentryConfig::default(),
                 tail: Vec::new(),
                 destinations: Vec::new(),
@@ -558,10 +564,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Status { config } => {
             let config = load(&config)?;
             let catalog = Catalog::open(&catalog_path(&config))?;
+            // The runtime policy is what the agent enforces, so it is what
+            // status must judge pressure against.
+            let policy = admin_api::startup(&config)?.effective;
             let usage = DiskUsage::measure(
                 &config.wal_dir(),
                 &catalog,
-                config.storage.disk_budget_bytes,
+                policy.storage.disk_budget_bytes,
             );
             let (rows, _) = catalog.totals()?;
             println!(
@@ -571,7 +580,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 human(usage.used()),
                 human(usage.budget_bytes),
                 usage.fraction() * 100.0,
-                usage.pressure()
+                usage.pressure(&policy.watermarks())
             );
             println!(
                 "rows={} parquet_files={} wal_segments={}",
@@ -652,7 +661,7 @@ fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
 }
 
 fn catalog_path(config: &Config) -> PathBuf {
-    config.storage.data_dir.join("catalog.sqlite")
+    config.catalog_path()
 }
 
 fn human(bytes: u64) -> String {
@@ -700,6 +709,25 @@ fn run(
     tail_paths: Vec<PathBuf>,
     tail_from_end: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Runtime policy (policy.json) overrides the file field by field. Everything
+    // below that is sized once from `config` (queue capacity) sees the effective
+    // value; everything hot reads `policy` instead.
+    let startup = admin_api::startup(config)?;
+    let effective_config = startup.effective.apply_to_config(config)?;
+    let config = &effective_config;
+    let policy = PolicyHandle::new(startup.effective.clone())?;
+    if let Some(meta) = &startup.meta {
+        tracing::info!(
+            version = meta.version,
+            updated_by = %meta.updated_by,
+            overrides = meta.overrides.len(),
+            "runtime policy applied over the config file"
+        );
+    }
+    if config.admin.enabled && !maintenance {
+        tracing::warn!("admin api is on but maintenance is disabled: retention and budget changes will be stored and never enforced");
+    }
+
     // Templating happens at ingest, not at merge: pushdown needs a stable
     // template id to hash flows and to rate-limit by error shape, and by merge
     // time the error has long since been forwarded. The maintenance thread
@@ -798,6 +826,7 @@ fn run(
         config.ingest.queue_capacity,
         config.ingest.critical_enqueue_timeout,
     );
+    let queue = queue.with_timeout_cell(policy.critical_timeout_cell());
     // Shared with the HEC receiver threads, which check the depth before
     // admitting a batch they will have to acknowledge.
     let queue = Arc::new(queue);
@@ -825,6 +854,9 @@ fn run(
     // critical disk pressure. An integer rather than a lock: it is read on
     // every record.
     let pressure = Arc::new(AtomicU8::new(0));
+    // Mirror of `refused_debug` for the admin info endpoint, which reads from
+    // another thread while the record path owns the plain counter.
+    let refused_debug_pressure = Arc::new(AtomicU64::new(0));
 
     let writer = {
         let stop = Arc::clone(&stop);
@@ -887,6 +919,7 @@ fn run(
         let pressure = Arc::clone(&pressure);
         let drain = Arc::clone(&drain);
         let config = config.clone();
+        let policy = Arc::clone(&policy);
         Some(
             std::thread::Builder::new()
                 .name("logless-maint".into())
@@ -903,6 +936,7 @@ fn run(
                         let writer_done = phase.load(Ordering::Acquire) == PHASE_WRITER_DONE;
                         maintenance_pass(
                             &config,
+                            &policy,
                             &mut catalog,
                             &drain,
                             &active,
@@ -973,6 +1007,44 @@ fn run(
     let mut s3_server = if config.serve_s3.enabled {
         let server = s3_serve::S3Server::start(&config.serve_s3, config.store_dir())?;
         tracing::info!(addr = %server.local_addr(), "s3 serve listening (read-only)");
+        Some(server)
+    } else {
+        None
+    };
+
+    let mut admin_server = if config.admin.enabled {
+        let mut listeners = Vec::new();
+        let mut listen = |kind: &str, addr: &str| {
+            listeners.push(ListenerInfo { kind: kind.into(), addr: addr.into() });
+        };
+        if config.otlp.enabled {
+            listen("otlp_http", &config.otlp.addr);
+        }
+        if config.otlp.grpc.enabled {
+            listen("otlp_grpc", &config.otlp.grpc.addr);
+        }
+        if config.hec.enabled {
+            listen("hec", &config.hec.addr);
+        }
+        if config.serve_s3.enabled {
+            listen("s3", &config.serve_s3.addr);
+        }
+        if config.sentry.enabled {
+            listen("sentry", &config.sentry.addr);
+        }
+        let service = AdminService::new(
+            config,
+            startup,
+            Arc::clone(&policy),
+            IngestProbe {
+                stats: Arc::clone(&stats),
+                written: Arc::clone(&synced_records),
+                refused_debug_pressure: Arc::clone(&refused_debug_pressure),
+            },
+            listeners,
+        );
+        let server = AdminServer::start(&config.admin, service)?;
+        tracing::info!(addr = %server.local_addr(), "admin api listening");
         Some(server)
     } else {
         None
@@ -1084,9 +1156,9 @@ fn run(
             }
         }
 
-        if config.pushdown.enabled {
+        if policy.pushdown_enabled() {
             ring.observe(&record);
-            if record.severity.0 >= config.pushdown.trigger_severity {
+            if record.severity.0 >= policy.pushdown_trigger() {
                 // Every error is forwarded. Only the context is economised on.
                 *errors_forwarded += 1;
                 let (json, outbound) = match ring.capture(&record) {
@@ -1132,6 +1204,7 @@ fn run(
         // rather than only the backlog being deleted.
         if pressure.load(Ordering::Relaxed) == 2 && record.level_class() == LevelClass::Debug {
             *refused_debug += 1;
+            refused_debug_pressure.fetch_add(1, Ordering::Relaxed);
         } else {
             queue.submit(record);
         }
@@ -1393,6 +1466,10 @@ fn run(
         );
         sentry_summary = Some(s);
         sentry_upstream_summary = Some(upstream);
+    }
+    if let Some(server) = admin_server.take() {
+        server.shutdown();
+        tracing::info!("admin api stopped");
     }
     if let Some(server) = s3_server.take() {
         let s = server.stats();
@@ -1763,12 +1840,17 @@ fn replay_to_sentry(
 
 fn maintenance_pass(
     config: &Config,
+    policy: &PolicyHandle,
     catalog: &mut Catalog,
     drain: &Arc<Mutex<Drain>>,
     active_segment: &AtomicU64,
     pressure: &AtomicU8,
     writer_done: bool,
 ) {
+    // Re-read every pass: this is what makes retention and budget changes made
+    // through the admin API hot. One snapshot per pass so merge, expiry and
+    // pressure relief all judge by the same policy.
+    let rt = policy.runtime();
     // 0 means the writer has not published a segment id yet. Merging with
     // `None` here would treat every segment as inactive — including the one the
     // writer is about to append to — so skip merging entirely until it reports.
@@ -1788,7 +1870,7 @@ fn maintenance_pass(
             &config.wal_dir(),
             &config.store_dir(),
             catalog,
-            &config.retention,
+            &rt.buckets,
             &mut drain,
             active,
             now_unix_secs(),
@@ -1830,48 +1912,41 @@ fn maintenance_pass(
         Err(e) => tracing::error!(error = %e, "merge failed"),
     }
 
-    let expiry = retention::enforce(
+    let outcome = budget::expire_and_relieve(
         &config.store_dir(),
-        &config.retention,
-        now_unix_secs(),
-        false,
-    );
-    if !expiry.expired.is_empty() {
-        tracing::info!(
-            partitions = expiry.expired.len(),
-            bytes = expiry.bytes_reclaimed,
-            "retention expired partitions"
-        );
-        if let Err(e) = catalog.forget_missing_files() {
-            tracing::error!(error = %e, "catalog cleanup after retention failed");
-        }
-    }
-
-    let usage = DiskUsage::measure(
         &config.wal_dir(),
         catalog,
-        config.storage.disk_budget_bytes,
+        &rt.buckets,
+        rt.disk_budget_bytes,
+        &rt.watermarks,
+        now_unix_secs(),
     );
-    let level = match usage.pressure() {
-        Pressure::Normal => 0,
-        Pressure::High => 1,
-        Pressure::Critical => 2,
-    };
-    pressure.store(level, Ordering::Relaxed);
-
-    if level > 0 {
-        match budget::reclaim(&config.store_dir(), catalog, &config.retention, usage, false) {
-            Ok(r) if !r.files_dropped.is_empty() => tracing::warn!(
-                files = r.files_dropped.len(),
-                partitions = r.partitions_touched.len(),
-                bytes = r.bytes_reclaimed,
-                rows = r.rows_lost,
-                exhausted = r.exhausted,
-                "disk pressure: dropped partitions ahead of retention"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::error!(error = %e, "reclaim failed"),
-        }
+    if !outcome.expiry.expired.is_empty() {
+        tracing::info!(
+            partitions = outcome.expiry.expired.len(),
+            bytes = outcome.expiry.bytes_reclaimed,
+            "retention expired partitions"
+        );
+    }
+    pressure.store(
+        match outcome.pressure {
+            Pressure::Normal => 0,
+            Pressure::High => 1,
+            Pressure::Critical => 2,
+        },
+        Ordering::Relaxed,
+    );
+    match outcome.reclaim {
+        Some(Ok(r)) if !r.files_dropped.is_empty() => tracing::warn!(
+            files = r.files_dropped.len(),
+            partitions = r.partitions_touched.len(),
+            bytes = r.bytes_reclaimed,
+            rows = r.rows_lost,
+            exhausted = r.exhausted,
+            "disk pressure: dropped partitions ahead of retention"
+        ),
+        Some(Err(e)) => tracing::error!(error = %e, "reclaim failed"),
+        _ => {}
     }
 }
 

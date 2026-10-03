@@ -4,12 +4,18 @@
 //! release valve, never "stop ingest"**. Under pressure we give up fidelity in
 //! a defined order rather than blocking the application or filling the disk.
 //!
+//! With the default [`Watermarks`]:
+//!
 //! * below 80% — normal;
 //! * at 80% (`High`) — delete files *ahead of* their retention, cheapest bucket
 //!   first, oldest data first, stopping the moment we are back under the
-//!   low-water mark;
+//!   reclaim target (70%);
 //! * at 95% (`Critical`) — additionally stop writing DEBUG to the WAL, so the
 //!   inflow shrinks rather than only the backlog.
+//!
+//! The three fractions are runtime policy (`docs/admin-api.md`), so every
+//! function that applies them takes a `&Watermarks` instead of reading a
+//! constant.
 //!
 //! Reclaim order is deliberately "cheapest data first": a bucket the operator
 //! configured to keep for 1 day is, by their own policy, worth less than one
@@ -18,18 +24,31 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::catalog::{Catalog, CatalogError};
+use crate::catalog::{Catalog, CatalogError, FileEntry};
 use crate::config::LevelBuckets;
 use crate::partition::PartitionKey;
+use crate::retention::{self, RetentionReport};
 use crate::wal;
 
-/// Fraction of budget at which we start expiring data early.
-pub const HIGH_WATER: f64 = 0.80;
-/// Fraction at which we also stop admitting DEBUG to the WAL.
-pub const CRITICAL_WATER: f64 = 0.95;
-/// Reclaim target once triggered — below the high-water mark, with hysteresis
-/// so we are not re-triggering on every check.
-pub const RECLAIM_TARGET: f64 = 0.70;
+/// The three fractions of the disk budget that drive pressure relief.
+/// Invariant (enforced by policy validation): `0 < reclaim_target < high <
+/// critical <= 1`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Watermarks {
+    /// Fraction of budget at which we start expiring data early.
+    pub high: f64,
+    /// Fraction at which we also stop admitting DEBUG to the WAL.
+    pub critical: f64,
+    /// Reclaim target once triggered — below the high-water mark, with
+    /// hysteresis so we are not re-triggering on every check.
+    pub reclaim_target: f64,
+}
+
+impl Default for Watermarks {
+    fn default() -> Self {
+        Self { high: 0.80, critical: 0.95, reclaim_target: 0.70 }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pressure {
@@ -73,11 +92,11 @@ impl DiskUsage {
         self.used() as f64 / self.budget_bytes as f64
     }
 
-    pub fn pressure(self) -> Pressure {
+    pub fn pressure(self, wm: &Watermarks) -> Pressure {
         let f = self.fraction();
-        if f >= CRITICAL_WATER {
+        if f >= wm.critical {
             Pressure::Critical
-        } else if f >= HIGH_WATER {
+        } else if f >= wm.high {
             Pressure::High
         } else {
             Pressure::Normal
@@ -114,18 +133,40 @@ pub fn reclaim(
     catalog: &mut Catalog,
     buckets: &LevelBuckets,
     usage: DiskUsage,
+    wm: &Watermarks,
     dry_run: bool,
 ) -> Result<ReclaimReport, CatalogError> {
+    let files = catalog.list_files()?;
+    let report = reclaim_files(files, store_dir, buckets, usage, wm, |path| {
+        dry_run || std::fs::remove_file(path).is_ok()
+    });
+    if !dry_run && !report.files_dropped.is_empty() {
+        catalog.forget_missing_files()?;
+    }
+    Ok(report)
+}
+
+/// The selection loop of [`reclaim`], over an explicit file list with the
+/// deletion injected. Policy preview calls it with a delete that always
+/// succeeds, so what it predicts is the real ordering and the real stop point,
+/// not a parallel reimplementation.
+pub fn reclaim_files(
+    mut files: Vec<FileEntry>,
+    store_dir: &Path,
+    buckets: &LevelBuckets,
+    usage: DiskUsage,
+    wm: &Watermarks,
+    mut delete: impl FnMut(&Path) -> bool,
+) -> ReclaimReport {
     let mut report = ReclaimReport::default();
-    let target = (usage.budget_bytes as f64 * RECLAIM_TARGET) as u64;
+    let target = (usage.budget_bytes as f64 * wm.reclaim_target) as u64;
     let mut used = usage.used();
     if used <= target {
-        return Ok(report);
+        return report;
     }
 
     // Cheapest bucket first, then oldest data within it. A bucket missing from
     // the config sorts last: we do not know its policy, so we do not spend it.
-    let mut files = catalog.list_files()?;
     files.sort_by_key(|f| {
         let retention = buckets
             .by_name(&f.key.bucket)
@@ -149,7 +190,7 @@ pub fn reclaim(
             tracing::warn!(path = %f.path.display(), "catalog row outside the store; not deleting");
             continue;
         }
-        if !dry_run && std::fs::remove_file(&f.path).is_err() {
+        if !delete(&f.path) {
             continue;
         }
         used = used.saturating_sub(f.stats.bytes);
@@ -160,13 +201,45 @@ pub fn reclaim(
     }
     report.partitions_touched = touched.into_keys().collect();
 
-    if !dry_run && !report.files_dropped.is_empty() {
-        catalog.forget_missing_files()?;
-    }
     // Everything deletable is gone and we are still over target: the budget is
     // too small for the inflow, which is an operator problem, not a bug.
     report.exhausted = used > target;
-    Ok(report)
+    report
+}
+
+/// What one maintenance pass did to disk: retention first, then pressure
+/// relief against the budget that remains.
+pub struct PassOutcome {
+    pub expiry: RetentionReport,
+    pub usage: DiskUsage,
+    pub pressure: Pressure,
+    /// `None` when pressure was normal and nothing was attempted.
+    pub reclaim: Option<Result<ReclaimReport, CatalogError>>,
+}
+
+/// The expiry-and-relief half of a maintenance pass, with every policy value
+/// passed in. The agent calls it with values re-read from the live policy each
+/// tick, which is what makes retention and budget changes hot.
+pub fn expire_and_relieve(
+    store_dir: &Path,
+    wal_dir: &Path,
+    catalog: &mut Catalog,
+    buckets: &LevelBuckets,
+    budget_bytes: u64,
+    wm: &Watermarks,
+    now_unix_secs: u64,
+) -> PassOutcome {
+    let expiry = retention::enforce(store_dir, buckets, now_unix_secs, false);
+    if !expiry.expired.is_empty() {
+        if let Err(e) = catalog.forget_missing_files() {
+            tracing::error!(error = %e, "catalog cleanup after retention failed");
+        }
+    }
+    let usage = DiskUsage::measure(wal_dir, catalog, budget_bytes);
+    let pressure = usage.pressure(wm);
+    let reclaim = (pressure != Pressure::Normal)
+        .then(|| reclaim(store_dir, catalog, buckets, usage, wm, false));
+    PassOutcome { expiry, usage, pressure, reclaim }
 }
 
 #[cfg(test)]
@@ -251,18 +324,19 @@ mod tests {
 
     #[test]
     fn pressure_thresholds() {
+        const W: Watermarks = Watermarks { high: 0.80, critical: 0.95, reclaim_target: 0.70 };
         let u = |used: u64| DiskUsage {
             wal_bytes: used,
             store_bytes: 0,
             budget_bytes: 100,
         };
-        assert_eq!(u(0).pressure(), Pressure::Normal);
-        assert_eq!(u(79).pressure(), Pressure::Normal);
-        assert_eq!(u(80).pressure(), Pressure::High);
-        assert_eq!(u(94).pressure(), Pressure::High);
-        assert_eq!(u(95).pressure(), Pressure::Critical);
-        assert!(u(80).pressure().admits_debug());
-        assert!(!u(95).pressure().admits_debug(), "debug stops at critical");
+        assert_eq!(u(0).pressure(&W), Pressure::Normal);
+        assert_eq!(u(79).pressure(&W), Pressure::Normal);
+        assert_eq!(u(80).pressure(&W), Pressure::High);
+        assert_eq!(u(94).pressure(&W), Pressure::High);
+        assert_eq!(u(95).pressure(&W), Pressure::Critical);
+        assert!(u(80).pressure(&W).admits_debug());
+        assert!(!u(95).pressure(&W).admits_debug(), "debug stops at critical");
     }
 
     #[test]
@@ -273,7 +347,7 @@ mod tests {
             store_bytes: 0,
             budget_bytes: 0,
         };
-        assert_eq!(u.pressure(), Pressure::Normal);
+        assert_eq!(u.pressure(&Watermarks::default()), Pressure::Normal);
     }
 
     #[test]
@@ -288,7 +362,7 @@ mod tests {
             store_bytes: s.bytes,
             budget_bytes: s.bytes * 100,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, false).unwrap();
+        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
         assert_eq!(report, ReclaimReport::default());
         assert_eq!(cat.list_files().unwrap().len(), 1);
     }
@@ -317,7 +391,7 @@ mod tests {
             budget_bytes: (total as f64 / 0.75) as u64,
         };
 
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, false).unwrap();
+        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
 
         assert!(!report.files_dropped.is_empty());
         assert!(
@@ -360,7 +434,7 @@ mod tests {
             budget_bytes: (total as f64 / 0.85) as u64,
         };
 
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, false).unwrap();
+        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
 
         assert!(!report.files_dropped.is_empty());
         let first = &report.partitions_touched[0];
@@ -392,7 +466,7 @@ mod tests {
             store_bytes: total,
             budget_bytes: (total as f64 / 0.85) as u64,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, false).unwrap();
+        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
 
         assert_eq!(report.partitions_touched[0].bucket, "debug");
         assert!(
@@ -414,7 +488,7 @@ mod tests {
             store_bytes: s.bytes,
             budget_bytes: 1000,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, false).unwrap();
+        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
         assert!(report.exhausted, "must surface that relief failed");
         assert_eq!(cat.list_files().unwrap().len(), 0);
     }
@@ -454,7 +528,7 @@ mod tests {
             store_bytes: total,
             budget_bytes: (total as f64 / 0.99) as u64,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, false).unwrap();
+        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
 
         assert!(outside.exists(), "must not delete outside the store");
         assert!(report.files_dropped.iter().all(|p| p.starts_with(&store)));
@@ -473,7 +547,7 @@ mod tests {
             store_bytes: total,
             budget_bytes: (total as f64 / 0.99) as u64,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, true).unwrap();
+        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), true).unwrap();
         assert!(!report.files_dropped.is_empty());
         assert_eq!(cat.list_files().unwrap().len(), 1, "dry run must not delete");
     }

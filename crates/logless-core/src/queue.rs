@@ -82,7 +82,9 @@ impl StatsSnapshot {
 pub struct IngestQueue {
     tx: Sender<LogRecord>,
     stats: Arc<IngestStats>,
-    critical_timeout: Duration,
+    /// Milliseconds, shared so the runtime policy can change it without
+    /// rebuilding the queue (capacity, by contrast, is fixed at construction).
+    critical_timeout_ms: Arc<AtomicU64>,
 }
 
 pub struct IngestConsumer {
@@ -95,13 +97,22 @@ pub fn channel(capacity: usize, critical_timeout: Duration) -> (IngestQueue, Ing
         IngestQueue {
             tx,
             stats: Arc::new(IngestStats::default()),
-            critical_timeout,
+            critical_timeout_ms: Arc::new(AtomicU64::new(critical_timeout.as_millis() as u64)),
         },
         IngestConsumer { rx },
     )
 }
 
 impl IngestQueue {
+    /// Replaces the timeout with a cell owned by the policy handle. The cell
+    /// is seeded with this queue's current value first so there is no window
+    /// in which WARN+ waits for zero.
+    pub fn with_timeout_cell(mut self, cell: Arc<AtomicU64>) -> Self {
+        cell.store(self.critical_timeout_ms.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.critical_timeout_ms = cell;
+        self
+    }
+
     pub fn stats(&self) -> Arc<IngestStats> {
         Arc::clone(&self.stats)
     }
@@ -132,7 +143,10 @@ impl IngestQueue {
                 }
                 // WARN+ earns a bounded wait — but only bounded. A stalled disk
                 // must not become a stalled application.
-                match self.tx.send_timeout(record, self.critical_timeout) {
+                match self.tx.send_timeout(
+                    record,
+                    Duration::from_millis(self.critical_timeout_ms.load(Ordering::Relaxed)),
+                ) {
                     Ok(()) => {
                         self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
                         Admission::Enqueued
