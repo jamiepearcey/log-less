@@ -21,10 +21,11 @@ use logless_core::model::{LevelClass, LogRecord, Severity};
 use logless_core::forward::{Dispatch, ForwardStats, Forwarder, HttpTransport, Outbound};
 use logless_core::ring::{Capture, ContextLine, ContextWindow, KeyTier, Ring, RingConfig, Suppressed};
 use logless_core::hec::{self, Admitted};
+use logless_core::s3_serve;
 use logless_core::sentry;
 use logless_core::otlp::{self, Accepted};
 use logless_core::spool::{Spool, SpoolConfig};
-use logless_core::tail::Tailer;
+use logless_core::tail::{TailSource, Tailer};
 use logless_core::{merge, now_unix_nanos, now_unix_secs, partition, queue, retention, store, wal};
 
 /// How often the maintenance thread merges, expires and checks disk pressure.
@@ -116,6 +117,13 @@ enum Command {
         /// Listen address for the HEC receiver, overriding `hec.addr`.
         #[arg(long)]
         hec_addr: Option<String>,
+        /// Serve the Parquet store over read-only S3, overriding
+        /// `serve_s3.enabled` in the config.
+        #[arg(long)]
+        serve_s3: bool,
+        /// Listen address for the S3 endpoint, overriding `serve_s3.addr`.
+        #[arg(long)]
+        serve_s3_addr: Option<String>,
         /// Act as a Sentry ingest proxy, overriding `sentry.enabled`.
         #[arg(long)]
         sentry: bool,
@@ -127,6 +135,15 @@ enum Command {
         /// the feature is demonstrated and tested.
         #[arg(long)]
         pushdown_out: Option<PathBuf>,
+    },
+    /// Serve an existing store over read-only S3 until SIGINT/SIGTERM. No
+    /// ingest and no WAL, so it can run beside (or without) an agent.
+    Serve {
+        #[arg(long)]
+        config: PathBuf,
+        /// Listen address, overriding `serve_s3.addr`.
+        #[arg(long)]
+        serve_s3_addr: Option<String>,
     },
     /// Replay the WAL, reporting (and optionally repairing) torn tails.
     Recover {
@@ -260,7 +277,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pushdown: PushdownConfig::default(),
                 otlp: otlp::ReceiverConfig::default(),
                 hec: hec::HecConfig::default(),
+                serve_s3: s3_serve::S3ServeConfig::default(),
                 sentry: sentry::SentryConfig::default(),
+                tail: Vec::new(),
                 destinations: Vec::new(),
             };
             print!("{}", toml::to_string_pretty(&config)?);
@@ -278,6 +297,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             otlp_grpc_addr,
             hec,
             hec_addr,
+            serve_s3,
+            serve_s3_addr,
             sentry: sentry_proxy,
             sentry_addr,
             pushdown_out,
@@ -305,6 +326,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.hec.enabled = true;
                 config.hec.addr = addr;
             }
+            if serve_s3 {
+                config.serve_s3.enabled = true;
+            }
+            if let Some(addr) = serve_s3_addr {
+                config.serve_s3.enabled = true;
+                config.serve_s3.addr = addr;
+            }
             if sentry_proxy {
                 config.sentry.enabled = true;
             }
@@ -320,6 +348,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tail,
                 from_end,
             )?
+        }
+
+        Command::Serve {
+            config,
+            serve_s3_addr,
+        } => {
+            let mut config = load(&config)?;
+            config.serve_s3.enabled = true;
+            if let Some(addr) = serve_s3_addr {
+                config.serve_s3.addr = addr;
+            }
+            serve(&config)?
         }
 
         Command::Replay {
@@ -631,6 +671,27 @@ fn human(bytes: u64) -> String {
 }
 
 /// stdin → bounded queue → writer thread → WAL, with background maintenance.
+fn serve(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(signal, Arc::clone(&stop))?;
+    }
+    let server = s3_serve::S3Server::start(&config.serve_s3, config.store_dir())?;
+    tracing::info!(addr = %server.local_addr(), bucket = %config.serve_s3.bucket, "s3 serve listening (read-only)");
+    while !stop.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let s = server.stats();
+    server.shutdown();
+    tracing::info!(
+        requests = s.requests,
+        range_requests = s.range_requests,
+        bytes_served = s.bytes_served,
+        "s3 serve stopped"
+    );
+    Ok(())
+}
+
 fn run(
     config: &Config,
     max_records: u64,
@@ -909,6 +970,14 @@ fn run(
     drop(hec_tx);
     let mut hec_summary: Option<hec::StatsSnapshot> = None;
 
+    let mut s3_server = if config.serve_s3.enabled {
+        let server = s3_serve::S3Server::start(&config.serve_s3, config.store_dir())?;
+        tracing::info!(addr = %server.local_addr(), "s3 serve listening (read-only)");
+        Some(server)
+    } else {
+        None
+    };
+
     // The Sentry proxy has its own channel: unlike the log receivers it carries
     // whole envelopes, and the records it produces are a *copy* for the local
     // store — the bytes forwarded upstream are the SDK's own, untouched.
@@ -1070,7 +1139,7 @@ fn run(
         !(max_records > 0 && *count >= max_records)
     };
 
-    if tail_paths.is_empty() && otlp_rx.is_none() && hec_rx.is_none() && sentry_rx.is_none() {
+    if tail_paths.is_empty() && config.tail.is_empty() && otlp_rx.is_none() && hec_rx.is_none() && sentry_rx.is_none() {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             if stop.load(Ordering::Relaxed) {
@@ -1102,8 +1171,17 @@ fn run(
         // single-threaded and a file error and an OTLP error of the same shape
         // share one dedupe window.
         let checkpoint = config.storage.data_dir.join("tail.ckpt");
-        let mut tailer = (!tail_paths.is_empty())
-            .then(|| Tailer::new(tail_paths.clone(), tail_from_end).with_checkpoint(checkpoint));
+        let mut tail_sources = config.tail.clone();
+        if !tail_paths.is_empty() {
+            tail_sources.push(TailSource {
+                paths: tail_paths.clone(),
+                exclude: Vec::new(),
+                from_end: tail_from_end,
+                service: None,
+            });
+        }
+        let mut tailer = (!tail_sources.is_empty())
+            .then(|| Tailer::from_sources(tail_sources).with_checkpoint(checkpoint));
         if otlp_receiver.is_some() {
             tracing::info!(addr = %config.otlp.addr, "otlp/http receiver listening");
         }
@@ -1118,8 +1196,11 @@ fn run(
                 "sentry proxy listening"
             );
         }
-        if !tail_paths.is_empty() {
-            tracing::info!(files = tail_paths.len(), "tailing");
+        if tailer.is_some() {
+            tracing::info!(
+                sources = config.tail.len() + usize::from(!tail_paths.is_empty()),
+                "tailing"
+            );
         }
         // Network receivers must be able to wake the loop. Sleeping a fixed
         // interval when idle is right for a file — nothing is waiting on the
@@ -1147,14 +1228,22 @@ fn run(
         while !done {
             let mut idle = true;
 
-            let mut batch: Vec<String> = Vec::new();
+            let mut batch: Vec<(Option<String>, String)> = Vec::new();
             if let Some(t) = tailer.as_mut() {
-                t.poll(|_, line| batch.push(line.to_string()));
+                t.poll_labeled(|_, service, line| {
+                    batch.push((service.map(str::to_string), line.to_string()))
+                });
             }
-            for line in &batch {
+            for (service, line) in &batch {
                 idle = false;
+                let mut record = parse_line(line);
+                // A service named in the line itself is more specific than the
+                // source's label.
+                if record.service.is_none() {
+                    record.service = service.clone();
+                }
                 if !process(
-                    parse_line(line),
+                    record,
                     line.len() as u64 + 1,
                     &mut raw_bytes_seen,
                     &mut count,
@@ -1304,6 +1393,16 @@ fn run(
         );
         sentry_summary = Some(s);
         sentry_upstream_summary = Some(upstream);
+    }
+    if let Some(server) = s3_server.take() {
+        let s = server.stats();
+        server.shutdown();
+        tracing::info!(
+            requests = s.requests,
+            range_requests = s.range_requests,
+            bytes_served = s.bytes_served,
+            "s3 serve stopped"
+        );
     }
     if let Some(r) = hec_receiver.take() {
         let s = r.shutdown();

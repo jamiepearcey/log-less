@@ -53,6 +53,18 @@ See [`.context/project-brief.md`](.context/project-brief.md) for positioning and
 [`docs/architecture.md`](docs/architecture.md) for design decisions and their
 rejected alternatives.
 
+## Consume instead of forward
+
+The Parquet store can be read in place: `logless serve` (or `run --serve-s3`)
+exposes it as a read-only S3 endpoint, so DuckDB, Polars and Grafana query it
+with HTTP Range requests and nothing has to be shipped to a vendor first.
+Leave `destinations` empty for store-only mode. See
+[`docs/s3-serve.md`](docs/s3-serve.md) for config, auth and DuckDB usage.
+
+```
+logless serve --config /tmp/logless.toml --serve-s3-addr 127.0.0.1:9000
+```
+
 ## Try what exists
 
 ```sh

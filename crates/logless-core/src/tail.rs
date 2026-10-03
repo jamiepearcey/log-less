@@ -28,6 +28,8 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 /// Identity of a file, independent of its name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
@@ -78,20 +80,52 @@ pub struct TailStats {
     pub read_errors: u64,
 }
 
-/// Tails a fixed set of paths.
+/// One `[[tail]]` section: a set of paths or glob patterns sharing exclusions,
+/// a start position and a service label. Sources are independent so a noisy
+/// debug log can be tailed from the end while an audit log is read in full.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TailSource {
+    /// Literal paths or globs. `*`, `?` and `[..]` match within one path
+    /// component; a component of exactly `**` matches any number of directories.
+    pub paths: Vec<PathBuf>,
+    /// Matched against the file name, or against the full path when the pattern
+    /// contains a `/` (so a suffix match needs a leading `**/`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// For files already present at startup, skip their history. Files that
+    /// appear later are always read from the beginning: skipping their first
+    /// lines would drop exactly what a new service logs while starting up.
+    #[serde(default)]
+    pub from_end: bool,
+    /// Service attached to lines that do not name one themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+}
+
+struct Source {
+    patterns: Vec<PathBuf>,
+    exclude: Vec<String>,
+    from_end: bool,
+    service: Option<String>,
+}
+
+/// Tails a set of paths and patterns.
 pub struct Tailer {
+    sources: Vec<Source>,
     paths: Vec<PathBuf>,
+    /// Which source claimed each path; the first source to match wins.
+    origin: HashMap<PathBuf, usize>,
     /// Patterns like `/var/log/*.log`, re-expanded periodically. A fleet's log
     /// files appear and disappear — a new service deploys, a container starts —
     /// so expanding once at startup would silently miss everything created
     /// afterwards, which is exactly the window an incident lives in.
-    patterns: Vec<PathBuf>,
     last_expansion: Option<Instant>,
     cursors: HashMap<PathBuf, Cursor>,
     checkpoint_path: Option<PathBuf>,
-    /// Start at the end of a file seen for the first time, rather than
-    /// replaying its whole history on first run.
-    start_at_end: bool,
+    /// False until the first poll has run; only files seen by then count as
+    /// "already present" for `from_end`.
+    started: bool,
     pub stats: TailStats,
 }
 
@@ -103,6 +137,102 @@ const REDISCOVER_INTERVAL: Duration = Duration::from_secs(5);
 /// Characters that make a path a pattern rather than a name.
 fn is_pattern(path: &Path) -> bool {
     path.to_string_lossy().contains(['*', '?', '['])
+}
+
+fn is_pattern_segment(segment: &str) -> bool {
+    segment.contains(['*', '?', '['])
+}
+
+/// Expands a path pattern against the filesystem, returning matching files.
+///
+/// Wildcards apply per path component, and a component of exactly `**` spans
+/// any number of directories. Descent never follows directory symlinks, so a
+/// link cycle cannot make `**` loop.
+fn glob_paths(pattern: &Path) -> Vec<PathBuf> {
+    use std::path::Component;
+    let mut root = PathBuf::new();
+    let mut segments: Vec<String> = Vec::new();
+    for component in pattern.components() {
+        match component {
+            Component::Normal(s) => segments.push(s.to_string_lossy().into_owned()),
+            other => root.push(other.as_os_str()),
+        }
+    }
+    // A trailing `**` means "every file below", not "directories only".
+    if segments.last().is_some_and(|s| s == "**") {
+        segments.push("*".into());
+    }
+    if root.as_os_str().is_empty() {
+        root.push(".");
+    }
+    let mut out = Vec::new();
+    walk_glob(&root, &segments, &mut out);
+    out
+}
+
+fn walk_glob(dir: &Path, segments: &[String], out: &mut Vec<PathBuf>) {
+    let Some((segment, rest)) = segments.split_first() else {
+        return;
+    };
+    if segment == "**" {
+        walk_glob(dir, rest, out);
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                walk_glob(&entry.path(), segments, out);
+            }
+        }
+        return;
+    }
+    if !is_pattern_segment(segment) {
+        let path = dir.join(segment);
+        if rest.is_empty() {
+            if path.is_file() {
+                out.push(path);
+            }
+        } else {
+            walk_glob(&path, rest, out);
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
+        if !glob_match(segment, &name) {
+            continue;
+        }
+        let path = entry.path();
+        if rest.is_empty() {
+            if path.is_file() {
+                out.push(path);
+            }
+        } else if path.is_dir() {
+            walk_glob(&path, rest, out);
+        }
+    }
+}
+
+fn excluded(patterns: &[String], path: &Path) -> bool {
+    patterns.iter().any(|pattern| {
+        if pattern.contains('/') {
+            let p: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
+            let full = path.to_string_lossy();
+            let n: Vec<&str> = full.split('/').filter(|s| !s.is_empty()).collect();
+            segments_match(&p, &n)
+        } else {
+            path.file_name().and_then(|n| n.to_str()).is_some_and(|n| glob_match(pattern, n))
+        }
+    })
+}
+
+fn segments_match(pattern: &[&str], path: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => (0..=path.len()).any(|skip| segments_match(rest, &path[skip..])),
+        Some((segment, rest)) => path
+            .split_first()
+            .is_some_and(|(head, tail)| glob_match(segment, head) && segments_match(rest, tail)),
+    }
 }
 
 /// Matches one path component against a glob, supporting `*`, `?` and
@@ -179,13 +309,63 @@ fn class_match(pattern: &[char], c: char) -> Option<(bool, usize)> {
 }
 
 impl Tailer {
+    /// Splits literal paths from glob patterns. A path containing `*`, `?` or
+    /// `[` is treated as a pattern; anything else is taken literally, so a file
+    /// that genuinely has a bracket in its name still needs no escaping until
+    /// it also needs a wildcard.
+    pub fn new(paths: Vec<PathBuf>, start_at_end: bool) -> Self {
+        Self::from_sources(vec![TailSource {
+            paths,
+            exclude: Vec::new(),
+            from_end: start_at_end,
+            service: None,
+        }])
+    }
+
+    pub fn from_sources(sources: Vec<TailSource>) -> Self {
+        let mut tailer = Self {
+            sources: Vec::new(),
+            paths: Vec::new(),
+            origin: HashMap::new(),
+            last_expansion: None,
+            cursors: HashMap::new(),
+            checkpoint_path: None,
+            started: false,
+            stats: TailStats::default(),
+        };
+        for (index, source) in sources.into_iter().enumerate() {
+            let (patterns, literals): (Vec<PathBuf>, Vec<PathBuf>) =
+                source.paths.into_iter().partition(|p| is_pattern(p));
+            tailer.sources.push(Source {
+                patterns,
+                exclude: source.exclude,
+                from_end: source.from_end,
+                service: source.service,
+            });
+            for path in literals {
+                tailer.claim(index, path);
+            }
+        }
+        tailer
+    }
+
+    /// Registers `path` for `source` unless it is excluded or already claimed.
+    fn claim(&mut self, source: usize, path: PathBuf) -> bool {
+        if self.origin.contains_key(&path) || excluded(&self.sources[source].exclude, &path) {
+            return false;
+        }
+        self.origin.insert(path.clone(), source);
+        self.paths.push(path);
+        true
+    }
+
     /// Expands patterns into concrete paths, adding files that have appeared.
     ///
     /// Only ever adds. A file that matched and has since been rotated away is
     /// left in `paths` so its cursor survives — dropping it would restart the
     /// file from zero if it came back under the same name.
     fn expand_patterns(&mut self) {
-        if self.patterns.is_empty() {
+        if self.sources.iter().all(|s| s.patterns.is_empty()) {
             return;
         }
         let now = Instant::now();
@@ -194,38 +374,17 @@ impl Tailer {
         }
         self.last_expansion = Some(now);
 
-        for pattern in &self.patterns {
-            let Some(parent) = pattern.parent() else { continue };
-            let Some(name) = pattern.file_name().and_then(|n| n.to_str()) else { continue };
-            let Ok(entries) = std::fs::read_dir(parent) else { continue };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                    continue;
-                }
-                let Some(found) = path.file_name().and_then(|n| n.to_str()) else { continue };
-                if glob_match(name, found) && !self.paths.contains(&path) {
-                    tracing::info!(path = %path.display(), "tailing a newly matched file");
-                    self.paths.push(path);
-                }
+        let mut found = Vec::new();
+        for (index, source) in self.sources.iter().enumerate() {
+            for pattern in &source.patterns {
+                found.extend(glob_paths(pattern).into_iter().map(|p| (index, p)));
             }
         }
-    }
-    /// Splits literal paths from glob patterns. A path containing `*`, `?` or
-    /// `[` is treated as a pattern; anything else is taken literally, so a file
-    /// that genuinely has a bracket in its name still needs no escaping until
-    /// it also needs a wildcard.
-    pub fn new(paths: Vec<PathBuf>, start_at_end: bool) -> Self {
-        let (patterns, paths): (Vec<PathBuf>, Vec<PathBuf>) =
-            paths.into_iter().partition(|p| is_pattern(p));
-        Self {
-            paths,
-            patterns,
-            last_expansion: None,
-            cursors: HashMap::new(),
-            checkpoint_path: None,
-            start_at_end,
-            stats: TailStats::default(),
+        for (index, path) in found {
+            let shown = path.clone();
+            if self.claim(index, path) {
+                tracing::info!(path = %shown.display(), "tailing a newly matched file");
+            }
         }
     }
 
@@ -244,15 +403,24 @@ impl Tailer {
     ///
     /// `emit` receives complete lines only.
     pub fn poll(&mut self, mut emit: impl FnMut(&Path, &str)) {
+        self.poll_labeled(|path, _, line| emit(path, line));
+    }
+
+    /// Like `poll`, also passing the owning source's service label.
+    pub fn poll_labeled(&mut self, mut emit: impl FnMut(&Path, Option<&str>, &str)) {
         self.expand_patterns();
-        let paths = self.paths.clone();
-        for path in paths {
-            self.poll_one(&path, &mut emit);
+        let initial = !self.started;
+        self.started = true;
+        for path in self.paths.clone() {
+            let source = &self.sources[self.origin[&path]];
+            let service = source.service.clone();
+            let start_at_end = source.from_end && initial;
+            self.poll_one(&path, start_at_end, &mut |p, line| emit(p, service.as_deref(), line));
         }
         self.save_checkpoint();
     }
 
-    fn poll_one(&mut self, path: &Path, emit: &mut impl FnMut(&Path, &str)) {
+    fn poll_one(&mut self, path: &Path, start_at_end: bool, emit: &mut impl FnMut(&Path, &str)) {
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(_) => {
@@ -270,7 +438,6 @@ impl Tailer {
         let id = FileId::of(&meta);
         let len = meta.len();
 
-        let start_at_end = self.start_at_end;
         let cursor = self.cursors.entry(path.to_path_buf()).or_insert_with(|| Cursor {
             id,
             offset: if start_at_end { len } else { 0 },
@@ -772,5 +939,121 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "good line");
         assert_eq!(lines[2], "after");
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    fn source(paths: Vec<PathBuf>) -> TailSource {
+        TailSource { paths, exclude: vec![], from_end: false, service: None }
+    }
+
+    fn poll_all(tailer: &mut Tailer) -> Vec<(Option<String>, String)> {
+        let mut out = Vec::new();
+        tailer.poll_labeled(|_, svc, line| out.push((svc.map(str::to_string), line.to_string())));
+        out
+    }
+
+    #[test]
+    fn directory_wildcards_and_double_star_find_nested_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in ["a/app", "b/app", "c/deep/er"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        std::fs::write(dir.path().join("a/app/x.log"), "a\n").unwrap();
+        std::fs::write(dir.path().join("b/app/x.log"), "b\n").unwrap();
+        std::fs::write(dir.path().join("c/deep/er/y.log"), "c\n").unwrap();
+        std::fs::write(dir.path().join("a/app/skip.txt"), "no\n").unwrap();
+
+        let mut one = Tailer::new(vec![dir.path().join("*/app/*.log")], false);
+        let mut lines = Vec::new();
+        one.poll(|_, l| lines.push(l.to_string()));
+        lines.sort();
+        assert_eq!(lines, ["a", "b"]);
+
+        let mut all = Tailer::new(vec![dir.path().join("**/*.log")], false);
+        let mut lines = Vec::new();
+        all.poll(|_, l| lines.push(l.to_string()));
+        lines.sort();
+        assert_eq!(lines, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn exclude_patterns_match_names_and_full_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("old")).unwrap();
+        std::fs::write(dir.path().join("app.log"), "keep\n").unwrap();
+        std::fs::write(dir.path().join("debug.log"), "drop by name\n").unwrap();
+        std::fs::write(dir.path().join("old/app.log"), "drop by dir\n").unwrap();
+
+        let mut tailer = Tailer::from_sources(vec![TailSource {
+            exclude: vec!["debug*".into(), "**/old/*".into()],
+            ..source(vec![dir.path().join("**/*.log")])
+        }]);
+        let lines: Vec<String> = poll_all(&mut tailer).into_iter().map(|(_, l)| l).collect();
+        assert_eq!(lines, ["keep"]);
+    }
+
+    #[test]
+    fn each_source_has_its_own_service_and_start_position() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("web.log"), "old web\n").unwrap();
+        std::fs::write(dir.path().join("db.log"), "old db\n").unwrap();
+        let mut tailer = Tailer::from_sources(vec![
+            TailSource {
+                from_end: true,
+                service: Some("web".into()),
+                ..source(vec![dir.path().join("web.log")])
+            },
+            TailSource { service: Some("db".into()), ..source(vec![dir.path().join("db.log")]) },
+        ]);
+        assert_eq!(poll_all(&mut tailer), [(Some("db".into()), "old db".into())]);
+        assert!(poll_all(&mut tailer).is_empty());
+    }
+
+    #[test]
+    fn a_new_file_is_read_from_the_start_even_with_from_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tailer = Tailer::from_sources(vec![TailSource {
+            from_end: true,
+            ..source(vec![dir.path().join("*.log")])
+        }]);
+        assert!(poll_all(&mut tailer).is_empty());
+        std::fs::write(dir.path().join("late.log"), "boot line\n").unwrap();
+        tailer.last_expansion = None;
+        assert_eq!(poll_all(&mut tailer), [(None, "boot line".into())]);
+    }
+
+    #[test]
+    fn a_globbed_file_still_drains_across_rotation_and_resumes_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let ckpt = dir.path().join("tail.ckpt");
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, "one\n").unwrap();
+        let pattern = vec![dir.path().join("*.log")];
+
+        let mut tailer = Tailer::new(pattern.clone(), false).with_checkpoint(ckpt.clone());
+        let mut lines = Vec::new();
+        tailer.poll(|_, l| lines.push(l.to_string()));
+        assert_eq!(lines, ["one"]);
+
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(f, "before rotate").unwrap();
+        std::fs::rename(&log, dir.path().join("app.log.1")).unwrap();
+        std::fs::write(&log, "after rotate\n").unwrap();
+        let mut lines = Vec::new();
+        tailer.poll(|_, l| lines.push(l.to_string()));
+        assert_eq!(lines, ["before rotate", "after rotate"]);
+        drop(tailer);
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(f, "while down").unwrap();
+        let mut resumed = Tailer::new(pattern, false).with_checkpoint(ckpt);
+        let mut lines = Vec::new();
+        resumed.poll(|_, l| lines.push(l.to_string()));
+        assert_eq!(lines, ["while down"], "no replay of one/after rotate, no loss");
     }
 }

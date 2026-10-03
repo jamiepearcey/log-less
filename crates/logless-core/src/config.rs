@@ -31,9 +31,16 @@ pub struct Config {
     /// Splunk HEC receiver. Off by default, same reasoning.
     #[serde(default)]
     pub hec: crate::hec::HecConfig,
+    /// Read-only S3-compatible endpoint over the Parquet store, so DuckDB,
+    /// Polars and Grafana consume the logs directly. Off by default.
+    #[serde(default)]
+    pub serve_s3: crate::s3_serve::S3ServeConfig,
     /// Sentry ingest proxy: your SDK keeps its DSN, only the host changes.
     #[serde(default)]
     pub sentry: crate::sentry::SentryConfig,
+    /// File tailing sources (`[[tail]]`). Combined with any `--tail` flags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tail: Vec<crate::tail::TailSource>,
     /// Where curated events go. Empty means "forward nowhere" — useful for
     /// measuring what *would* be sent before pointing at a real vendor.
     ///
@@ -346,7 +353,9 @@ mod tests {
             pushdown: PushdownConfig::default(),
             otlp: crate::otlp::ReceiverConfig::default(),
             hec: crate::hec::HecConfig::default(),
+            serve_s3: crate::s3_serve::S3ServeConfig::default(),
             sentry: crate::sentry::SentryConfig::default(),
+            tail: Vec::new(),
             destinations: Vec::new(),
         })
         .unwrap();
@@ -360,6 +369,53 @@ mod tests {
         );
         let parsed: Config = toml::from_str(&extended).expect("appended config must parse");
         assert_eq!(parsed.destinations.len(), 1);
+    }
+
+    const MINIMAL: &str = "[storage]\ndata_dir = \"/tmp/x\"\n";
+
+    #[test]
+    fn serve_s3_is_off_by_default_and_parses_when_given() {
+        let c: Config = toml::from_str(MINIMAL).unwrap();
+        assert!(!c.serve_s3.enabled);
+
+        let c: Config = toml::from_str(&format!(
+            "{MINIMAL}\n[serve_s3]\nenabled = true\naddr = \"127.0.0.1:9100\"\nbucket = \"b\"\naccess_key = \"ak\"\nsecret_key = \"sk\"\n"
+        ))
+        .unwrap();
+        assert!(c.serve_s3.enabled);
+        assert_eq!(c.serve_s3.addr, "127.0.0.1:9100");
+        assert_eq!(c.serve_s3.bucket, "b");
+        assert_eq!(c.serve_s3.access_key.as_deref(), Some("ak"));
+
+        let back: Config = toml::from_str(&toml::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+    }
+
+    #[test]
+    fn serve_s3_starts_and_stops_from_a_parsed_config() {
+        use std::io::{Read, Write};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c: Config = toml::from_str(&format!(
+            "[storage]\ndata_dir = {:?}\n\n[serve_s3]\nenabled = true\naddr = \"127.0.0.1:0\"\n",
+            tmp.path()
+        ))
+        .unwrap();
+        c.serve_s3.access_key = None;
+        let server = crate::s3_serve::S3Server::start(&c.serve_s3, c.store_dir()).unwrap();
+        let addr = server.local_addr();
+        let mut conn = std::net::TcpStream::connect(addr).unwrap();
+        conn.write_all(b"GET /logs?list-type=2 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = String::new();
+        conn.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        server.shutdown();
+        assert!(std::net::TcpStream::connect(addr).is_err());
+    }
+
+    #[test]
+    fn serve_s3_rejects_unknown_keys() {
+        let err = toml::from_str::<Config>(&format!("{MINIMAL}\n[serve_s3]\nbogus = 1\n"));
+        assert!(err.is_err());
     }
 
     #[test]
