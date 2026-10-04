@@ -40,7 +40,7 @@ Everything above the S3 line is one process, one config file, no external depend
 
 ### Committed state
 
-- **Partitioned Parquet + a local SQLite catalog.** Catalog tables: files (path, partition keys, min/max ts, row count, template-dict version), templates (id, text, first_seen, counters). Atomic commit = write Parquet to temp → fsync → insert catalog row in one transaction.
+- **Partitioned Parquet + a local SQLite catalog.** Catalog tables: files (path, partition keys, min/max ts, row count, template-dict version), templates (id, text, first_seen, counters), template_services (per-service first/last observed, written in the merge transaction), meta (the template id space). The dictionary is exported after each merge as `store/_meta/templates.pq` so readers of the store can resolve `template_id` to text (`docs/s3-serve.md`). Atomic commit = write Parquet to temp → fsync → insert catalog row in one transaction.
 - **The catalog is DERIVED STATE, not source of truth.** It must be fully rebuildable by scanning Parquet footers + the directory tree. Delete it, corrupt it, `kill -9` mid-write — the agent rebuilds on boot. Hard invariant, tested in the week 1–2 chaos harness. It also makes the engine choice reversible. Accepted loss on rebuild: template `first_seen` resets to the earliest retained data, so novelty detection needs a warm-up window.
 - **Stays out of the catalog**: the WAL (bespoke append-only, §1) and per-destination delivery cursors (higher write rate — own small file, atomic rename).
 

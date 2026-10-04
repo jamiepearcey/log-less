@@ -180,7 +180,8 @@ printf 'ERROR\tboom\nDEBUG\tcontext\n' | ./target/release/logless run --config /
 # Expire partitions past their bucket's retention; --dry-run to preview
 ./target/release/logless retention --config /tmp/logless.toml --dry-run
 
-# Show the mined template dictionary
+# Show the mined template dictionary; --export rewrites store/_meta/templates.pq
+# (also rewritten after every merge, and served over S3; see docs/s3-serve.md)
 ./target/release/logless templates --config /tmp/logless.toml
 
 # Measure template-mining throughput
@@ -226,6 +227,8 @@ plus 2 aggregate events covering the other 78 (**0.17% of raw bytes**).
                                                       hive_partitioning=true) GROUP BY level;"
   ```
 
+  Template text is exported beside the logs as `store/_meta/templates.pq`
+  (`.pq`, so the glob above never reads it) to join on `template_id`.
   Timestamps are UTC-qualified so time filters mean what they say. The binary is
   11 MB; embedding DuckDB would add roughly 30 MB of C++ to serve a filtered
   scan we already do in ~300 lines.

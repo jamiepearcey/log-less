@@ -1472,7 +1472,7 @@ mod tests {
                 path,
                 key: PartitionKey { epoch_hour: 1_000_000, bucket: "warn_plus".into() },
                 stats: crate::store::FileStats { rows: 1, bytes: 1000, min_observed_nanos: 0, max_observed_nanos: 0 },
-            }], 0)
+            }], &[], 0)
             .unwrap();
         let pass = |catalog: &mut Catalog| {
             let rt = r.handle.runtime();

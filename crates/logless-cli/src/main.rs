@@ -213,6 +213,10 @@ enum Command {
         config: PathBuf,
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Rewrite `<store>/_meta/templates.pq` from the catalog now, instead
+        /// of waiting for the next merge.
+        #[arg(long)]
+        export: bool,
     },
     /// Query committed history, and optionally push it upstream.
     ///
@@ -438,6 +442,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.new_templates,
                 drain.template_count()
             );
+            match (report.dictionary_rows, &report.dictionary_error) {
+                (Some(rows), _) => println!(
+                    "exported {} rows to {}",
+                    rows,
+                    logless_core::template_dict::dict_path(&config.store_dir()).display()
+                ),
+                (None, Some(e)) => println!("template dictionary not exported: {e}"),
+                (None, None) => {}
+            }
         }
 
         Command::Verify { config, tolerance } => {
@@ -590,12 +603,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Command::Templates { config, limit } => {
+        Command::Templates { config, limit, export } => {
             let config = load(&config)?;
             let catalog = Catalog::open(&catalog_path(&config))?;
+            if export {
+                let r = logless_core::template_dict::export(&config.store_dir(), &catalog)?;
+                println!(
+                    "dictionary={} rows={} bytes={}",
+                    logless_core::template_dict::dict_path(&config.store_dir()).display(),
+                    r.rows,
+                    r.bytes
+                );
+            }
             let templates = catalog.top_templates(limit)?;
             let total: u64 = catalog.load_templates()?.iter().map(|t| t.count).sum();
-            println!("templates={} lines_covered={}", catalog.load_templates()?.len(), total);
+            println!(
+                "templates={} lines_covered={} id_space={}",
+                catalog.load_templates()?.len(),
+                total,
+                catalog.template_id_space()?
+            );
             for t in templates {
                 println!("  id={:<5} count={:<9} {}", t.id, t.count, t.text());
             }
