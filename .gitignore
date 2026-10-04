@@ -1,5 +1,7 @@
 # --- Rust -------------------------------------------------------------------
 /target
+# Per-worktree cargo target dirs (CARGO_TARGET_DIR=target_local etc.).
+target_*/
 **/*.rs.bk
 # Only a library publishes without a lockfile; this workspace ships a binary,
 # so Cargo.lock is committed deliberately and is NOT ignored here.

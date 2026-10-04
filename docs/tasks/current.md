@@ -42,6 +42,7 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] Rust Drain port; fixed-depth parse tree; stable `template_id`; wildcard merging; bounded fan-out and template cap.
 - [x] Template dictionary persisted in the catalog and restored on startup, so ids survive restarts.
 - [x] Templating wired into the merge path; `template_id` lands in Parquet.
+- [x] Template dictionary exported as `store/_meta/templates.pq` after every merge (atomic rewrite), one row per (template_id, service) with text, first/last seen, the catalog's id space (`agent`) and a content-derived `global_id`; served over the S3 endpoint. `.pq` keeps it out of the logs glob.
 - [x] **Benched: 775,617 lines/s/core release (target ≥500k, met); 15 templates from 2M lines; 0% untemplated.** Debug build is ~39k/s — never bench unoptimised.
 - [x] Fallback path intact: nothing depends on templating: a `None` match writes the record untemplated.
 - [x] **Benchmarked against the 11 real LogHub corpora** with their published ground-truth template counts (`scripts/loghub.sh`). 568k lines/s/core on real logs. **This changed a default**: see below.
@@ -228,6 +229,8 @@ At 0.4 we were **over-merging badly on every real dataset** — collapsing disti
 Two datasets still over-split (Proxifier 3.25×, Apache 2.00×); both are dominated by lines whose only variable part is a path or a duration, which our masker splits more finely than LogHub's ground truth does.
 
 ## Known gaps worth stating plainly
+- **The template dictionary is not rebuildable from Parquet.** `catalog --rebuild` restores `files` only; the per-service sightings behind `_meta/templates.pq` (like the templates themselves) live only in the catalog. A lost catalog restarts template ids under a new `agent` id, and rows written before the loss keep ids the new dictionary does not describe.
+- **Rows carry no agent column.** `_meta/templates.pq` names its id space, but a store that mixes files from several agents under one prefix cannot tell their `template_id`s apart; join such stores on `global_id` via each agent's own dictionary, or keep one prefix per agent.
 - **HEC index routing is ignored.** We have level buckets, not indexes; `index` is kept as an attribute. An event addressed to an index that does not exist is accepted rather than refused with code 7.
 - **No real Splunk to test against.** Ingest was driven by a third-party HEC client, but the ack contract was polled by hand — no OSS client implements `useACK`. The shapes match Splunk's documented ones; they have not been checked against Splunk itself.
 - **An acked batch could still lose records to severity shedding** if another source fills the ingest queue between the capacity check and the submit. The window is small and the check makes it unlikely, but "unlikely" is not "cannot".
