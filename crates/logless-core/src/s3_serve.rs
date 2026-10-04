@@ -516,10 +516,10 @@ impl Inner {
     }
 
     /// Maps a decoded key to a file under the store, or `None` for anything
-    /// that is not a visible regular `.parquet` reachable without a symlink.
+    /// that is not a servable regular file reachable without a symlink.
     fn resolve(&self, key: &str) -> Option<PathBuf> {
         let segments = safe_segments(key)?;
-        if !segments.last()?.ends_with(".parquet") {
+        if !servable(key) {
             return None;
         }
         let mut path = self.store_dir.clone();
@@ -845,7 +845,7 @@ impl Walker<'_> {
             let Ok(ft) = entry.file_type() else { continue };
             if ft.is_dir() {
                 entries.push((format!("{name}/"), name, true));
-            } else if ft.is_file() && name.ends_with(".parquet") {
+            } else if ft.is_file() && servable(&format!("{key_prefix}{name}")) {
                 if !format!("{key_prefix}{name}").starts_with(self.p.prefix) {
                     continue;
                 }
@@ -948,6 +948,14 @@ fn list_base(store_dir: &Path, prefix: &str) -> Option<(PathBuf, String)> {
         }
     }
     Some((path, base.to_string()))
+}
+
+/// The keys this server will list or return: the store's `.parquet` files and
+/// the template dictionary (`_meta/templates.pq`, see [`crate::template_dict`]),
+/// whose `.pq` extension keeps it out of every `**/*.parquet` glob. Anything
+/// else under the store — temp files, stray uploads — stays invisible.
+fn servable(key: &str) -> bool {
+    key.ends_with(".parquet") || key == crate::template_dict::DICT_KEY
 }
 
 fn safe_segments(key: &str) -> Option<Vec<&str>> {
@@ -1444,6 +1452,41 @@ mod tests {
         assert_eq!(keys, vec![K_ERR_B, K_INFO_A, K_INFO_E, K_H1_C]);
         // A directory is not an object either.
         assert_eq!(f.get(&obj("hour=2026-01-01T00")).status, 404);
+    }
+
+    #[test]
+    fn the_template_dictionary_is_served_and_listed_but_no_other_pq() {
+        let f = Fixture::new();
+        let rows = vec![crate::template_dict::DictRow {
+            template_id: 1,
+            service: Some("api".into()),
+            text: "user <*> logged in".into(),
+            first_seen_micros: 1,
+            last_seen_micros: 2,
+            agent: "space".into(),
+            global_id: crate::drain::fingerprint_of("user <*> logged in"),
+        }];
+        crate::template_dict::write(&f.store, &rows).unwrap();
+        let meta = f.store.join("_meta");
+        fs::write(meta.join(".templates.pq.tmp"), b"partial").unwrap();
+        fs::write(meta.join("other.pq"), b"not the dictionary").unwrap();
+        fs::write(f.store.join("hour=2026-01-01T00/level=info/x.pq"), b"stray").unwrap();
+
+        let r = f.get(&obj("_meta/templates.pq"));
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, fs::read(meta.join("templates.pq")).unwrap());
+        assert!(r.body.starts_with(b"PAR1"));
+        for key in ["_meta/.templates.pq.tmp", "_meta/other.pq", "hour=2026-01-01T00/level=info/x.pq"] {
+            assert_eq!(f.get(&obj(key)).status, 404, "{key}");
+        }
+
+        let keys = tags(&f.list("").text(), "Key");
+        assert_eq!(keys, vec!["_meta/templates.pq", K_ERR_B, K_INFO_A, K_INFO_E, K_H1_C]);
+        let keys = tags(&f.list("prefix=_meta%2F").text(), "Key");
+        assert_eq!(keys, vec!["_meta/templates.pq"]);
+        // A `**/*.parquet` glob filters the listing by suffix; the dictionary
+        // never matches it.
+        assert!(!keys[0].ends_with(".parquet"));
     }
 
     #[test]

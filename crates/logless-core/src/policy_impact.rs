@@ -355,7 +355,7 @@ mod tests {
                 .collect();
             let stats = store::write_partition_file(&path, &recs).unwrap();
             f.catalog
-                .commit_merge(segment, uuid::Uuid::from_u128(segment as u128), &[FileEntry { path, key, stats: stats.clone() }], 0)
+                .commit_merge(segment, uuid::Uuid::from_u128(segment as u128), &[FileEntry { path, key, stats: stats.clone() }], &[], 0)
                 .unwrap();
             stats.bytes
         };

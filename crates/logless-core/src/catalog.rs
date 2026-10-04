@@ -39,6 +39,25 @@ pub struct FileEntry {
     pub stats: FileStats,
 }
 
+/// Rows of one template in one service within a merged segment, by `observed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateSighting {
+    pub template_id: u64,
+    pub service: Option<String>,
+    pub first_observed_nanos: i64,
+    pub last_observed_nanos: i64,
+}
+
+/// One `(template_id, service)` pair of the exported dictionary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DictionaryEntry {
+    pub template_id: u64,
+    pub service: Option<String>,
+    pub text: String,
+    pub first_observed_nanos: i64,
+    pub last_observed_nanos: i64,
+}
+
 pub struct Catalog {
     conn: Connection,
 }
@@ -111,9 +130,50 @@ impl Catalog {
                 first_seen INTEGER NOT NULL,
                 last_seen  INTEGER NOT NULL
             );
+
+            -- Which services each template has been seen in, and when (by the
+            -- rows' `observed` time, nanoseconds). Written in the same
+            -- transaction as the merge that produced the rows, so every
+            -- (template_id, service) pair in Parquet has a row here. Feeds the
+            -- exported dictionary (`template_dict`). `has_service` keeps a NULL
+            -- service distinct from an empty one inside the primary key.
+            CREATE TABLE IF NOT EXISTS template_services (
+                template_id    INTEGER NOT NULL,
+                has_service    INTEGER NOT NULL,
+                service        TEXT    NOT NULL,
+                first_observed INTEGER NOT NULL,
+                last_observed  INTEGER NOT NULL,
+                PRIMARY KEY (template_id, has_service, service)
+            );
+
+            -- Small key/value facts about this catalog. `template_id_space`
+            -- names the namespace template ids are minted in: ids are a counter
+            -- local to this catalog, so they mean nothing without it.
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
             "#,
         )?;
+        // Minted once, with the templates table it qualifies. A lost catalog
+        // restarts template ids at 1 and gets a new space with them, which is
+        // exactly right: the old ids and the new ones are different namespaces.
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('template_id_space', ?1)",
+            params![uuid::Uuid::now_v7().to_string()],
+        )?;
         Ok(Self { conn })
+    }
+
+    /// The namespace this catalog's template ids are minted in (a UUID). Two
+    /// agents can both hold template 7 for different shapes; `(agent, id)` is
+    /// unambiguous.
+    pub fn template_id_space(&self) -> Result<String, CatalogError> {
+        Ok(self.conn.query_row(
+            "SELECT value FROM meta WHERE key = 'template_id_space'",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// Record one segment's merge output. Atomic: either the files and the
@@ -123,9 +183,27 @@ impl Catalog {
         segment_id: u64,
         segment_uuid: uuid::Uuid,
         files: &[FileEntry],
+        sightings: &[TemplateSighting],
         now_unix_secs: u64,
     ) -> Result<(), CatalogError> {
         let tx = self.conn.transaction()?;
+        for s in sightings {
+            tx.execute(
+                "INSERT INTO template_services
+                    (template_id, has_service, service, first_observed, last_observed)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(template_id, has_service, service) DO UPDATE SET
+                    first_observed = MIN(first_observed, excluded.first_observed),
+                    last_observed  = MAX(last_observed, excluded.last_observed)",
+                params![
+                    s.template_id as i64,
+                    s.service.is_some(),
+                    s.service.as_deref().unwrap_or(""),
+                    s.first_observed_nanos,
+                    s.last_observed_nanos,
+                ],
+            )?;
+        }
         for f in files {
             tx.execute(
                 "INSERT INTO files (path, epoch_hour, bucket, rows, bytes, min_observed, max_observed)
@@ -325,6 +403,33 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// One entry per `(template_id, service)` pair ever merged into the store,
+    /// with the template's current text. Templates that no merged row carries
+    /// yet are left out: nothing in Parquet can refer to them.
+    pub fn template_dictionary(&self) -> Result<Vec<DictionaryEntry>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.template_id, s.has_service, s.service, t.tokens,
+                    s.first_observed, s.last_observed
+             FROM template_services s JOIN templates t ON t.id = s.template_id
+             ORDER BY s.template_id, s.has_service, s.service",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let has_service: bool = row.get(1)?;
+            let service: String = row.get(2)?;
+            let tokens: String = row.get(3)?;
+            Ok(DictionaryEntry {
+                template_id: row.get::<_, i64>(0)? as u64,
+                service: has_service.then_some(service),
+                // Same rendering as `Template::text`: tokens are tab-joined in
+                // storage and space-joined for display.
+                text: tokens.split('\t').collect::<Vec<_>>().join(" "),
+                first_observed_nanos: row.get(4)?,
+                last_observed_nanos: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Templates ordered by how often they have been seen.
     pub fn top_templates(&self, limit: usize) -> Result<Vec<crate::drain::Template>, CatalogError> {
         let mut all = self.load_templates()?;
@@ -418,7 +523,7 @@ mod tests {
         let entry = write_file(tmp.path(), 100, "info", 1, 10);
 
         assert!(!cat.is_segment_merged(seg_uuid(1)).unwrap());
-        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&entry), 0).unwrap();
+        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&entry), &[], 0).unwrap();
         assert!(cat.is_segment_merged(seg_uuid(1)).unwrap());
         assert_eq!(cat.list_files().unwrap(), vec![entry]);
         assert_eq!(cat.totals().unwrap().0, 10);
@@ -430,8 +535,8 @@ mod tests {
         let mut cat = Catalog::open(&tmp.path().join("catalog.sqlite")).unwrap();
         let entry = write_file(tmp.path(), 100, "info", 1, 10);
 
-        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&entry), 0).unwrap();
-        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&entry), 0).unwrap();
+        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&entry), &[], 0).unwrap();
+        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&entry), &[], 0).unwrap();
 
         assert_eq!(cat.list_files().unwrap().len(), 1);
         assert_eq!(cat.totals().unwrap(), (10, entry.stats.bytes));
@@ -446,8 +551,8 @@ mod tests {
         let c = write_file(&store, 101, "info", 2, 5);
 
         let mut cat = Catalog::open(&tmp.path().join("catalog.sqlite")).unwrap();
-        cat.commit_merge(1, seg_uuid(1), &[a.clone(), b.clone()], 0).unwrap();
-        cat.commit_merge(2, seg_uuid(2), std::slice::from_ref(&c), 0).unwrap();
+        cat.commit_merge(1, seg_uuid(1), &[a.clone(), b.clone()], &[], 0).unwrap();
+        cat.commit_merge(2, seg_uuid(2), std::slice::from_ref(&c), &[], 0).unwrap();
         let before = cat.list_files().unwrap();
 
         // Lose the catalog entirely.
@@ -466,7 +571,7 @@ mod tests {
         let store = tmp.path().join("store");
         let a = write_file(&store, 100, "info", 1, 10);
         let mut cat = Catalog::open_in_memory().unwrap();
-        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&a), 0).unwrap();
+        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&a), &[], 0).unwrap();
 
         assert_eq!(cat.rebuild(&store).unwrap(), 1);
         assert_eq!(cat.rebuild(&store).unwrap(), 1);
@@ -484,7 +589,7 @@ mod tests {
         let a = write_file(&store, 100, "debug", 1, 10);
         let b = write_file(&store, 100, "info", 1, 10);
         let mut cat = Catalog::open_in_memory().unwrap();
-        cat.commit_merge(1, seg_uuid(1), &[a.clone(), b.clone()], 0).unwrap();
+        cat.commit_merge(1, seg_uuid(1), &[a.clone(), b.clone()], &[], 0).unwrap();
 
         std::fs::remove_dir_all(a.key.dir(&store)).unwrap();
         assert_eq!(cat.forget_missing_files().unwrap(), 1);
@@ -529,8 +634,8 @@ mod tests {
         let debug = write_file(&store, 200, "debug", 2, 10);
 
         let mut cat = Catalog::open_in_memory().unwrap();
-        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&early), 0).unwrap();
-        cat.commit_merge(2, seg_uuid(2), &[late.clone(), debug.clone()], 0).unwrap();
+        cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&early), &[], 0).unwrap();
+        cat.commit_merge(2, seg_uuid(2), &[late.clone(), debug.clone()], &[], 0).unwrap();
 
         let window = cat
             .files_overlapping(late.stats.min_observed_nanos, late.stats.max_observed_nanos, None)

@@ -22,12 +22,13 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::catalog::{Catalog, CatalogError, FileEntry};
+use crate::catalog::{Catalog, CatalogError, FileEntry, TemplateSighting};
 use crate::config::LevelBuckets;
 use crate::drain::Drain;
 use crate::model::LogRecord;
 use crate::partition::PartitionKey;
 use crate::schema;
+use crate::template_dict;
 use crate::store::{self, StoreError};
 use crate::wal;
 
@@ -59,6 +60,11 @@ pub struct MergeReport {
     pub untemplated: u64,
     /// Templates seen for the first time in this merge — the novelty signal.
     pub new_templates: u64,
+    /// Rows written to `_meta/templates.pq`, when this pass rewrote it.
+    pub dictionary_rows: Option<usize>,
+    /// Why the dictionary could not be rewritten. Never fails the merge: the
+    /// data is committed and the next merge rewrites the whole file.
+    pub dictionary_error: Option<String>,
 }
 
 /// Merge every eligible WAL segment.
@@ -123,6 +129,7 @@ pub fn merge_all(
         report.records += outcome.records;
 
         let mut entries = Vec::with_capacity(partitions.len());
+        let mut sightings: BTreeMap<(u64, Option<String>), (i64, i64)> = BTreeMap::new();
         for (key, mut records) in partitions {
             // Templating normally happens at ingest, so pushdown can use the
             // id while the error is still in flight. This is the fallback for
@@ -144,6 +151,20 @@ pub fn merge_all(
                     None => report.untemplated += 1,
                 }
             }
+            // Every (template, service) pair that reaches Parquet is recorded
+            // with the commit, so the exported dictionary covers every row.
+            for record in &records {
+                if let Some(id) = record.template_id {
+                    let t = record.observed_unix_nano as i64;
+                    sightings
+                        .entry((id, record.service.clone()))
+                        .and_modify(|(lo, hi)| {
+                            *lo = (*lo).min(t);
+                            *hi = (*hi).max(t);
+                        })
+                        .or_insert((t, t));
+                }
+            }
             schema::sort_records(&mut records);
             let file_path = key
                 .dir(store_dir)
@@ -158,7 +179,16 @@ pub fn merge_all(
         }
         report.files_written += entries.len();
 
-        catalog.commit_merge(segment_id, segment_uuid, &entries, now_unix_secs)?;
+        let sightings: Vec<TemplateSighting> = sightings
+            .into_iter()
+            .map(|((template_id, service), (first, last))| TemplateSighting {
+                template_id,
+                service,
+                first_observed_nanos: first,
+                last_observed_nanos: last,
+            })
+            .collect();
+        catalog.commit_merge(segment_id, segment_uuid, &entries, &sightings, now_unix_secs)?;
         // Persist the dictionary alongside the data it describes. Ids must
         // outlive the process or every downstream baseline resets.
         let templates: Vec<_> = drain.templates().cloned().collect();
@@ -168,6 +198,27 @@ pub fn merge_all(
             report.wal_bytes_freed += segment_bytes;
         }
         report.segments_merged += 1;
+    }
+
+    // Once per pass, not per segment: the file is rewritten whole, and every
+    // segment's sightings are already committed. Also rewritten when it has
+    // gone missing and there is something to say, so a wiped `_meta` comes back
+    // without waiting for new data, while an empty pass stays a true no-op.
+    let missing = !template_dict::dict_path(store_dir).exists();
+    if report.segments_merged > 0 || missing {
+        let written = template_dict::rows_from_catalog(catalog).and_then(|rows| {
+            if report.segments_merged == 0 && rows.is_empty() {
+                return Ok(None);
+            }
+            template_dict::write(store_dir, &rows).map(|_| Some(rows.len()))
+        });
+        match written {
+            Ok(rows) => report.dictionary_rows = rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "template dictionary not rewritten");
+                report.dictionary_error = Some(e.to_string());
+            }
+        }
     }
 
     Ok(report)
@@ -280,7 +331,7 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         // Pretend the previous run committed but died before deleting.
         let uuid = wal::segment_uuid(&wal::list_segments(&wal_dir).unwrap()[0].1).unwrap();
-        cat.commit_merge(1, uuid, &[], 0).unwrap();
+        cat.commit_merge(1, uuid, &[], &[], 0).unwrap();
 
         let report =
             merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), None, 0).unwrap();
@@ -396,6 +447,96 @@ mod tests {
         assert_eq!(report.truncated, 1);
         assert_eq!(report.records, 10);
         assert_eq!(cat.totals().unwrap().0, 10);
+    }
+
+    /// Every distinct (service, template_id) in the store's Parquet.
+    fn pairs_in_store(store_dir: &Path) -> std::collections::BTreeSet<(Option<String>, u64)> {
+        let mut out = std::collections::BTreeSet::new();
+        for path in store::list_parquet_files(store_dir) {
+            let file = std::fs::File::open(&path).unwrap();
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap()
+                .build()
+                .unwrap();
+            for batch in reader {
+                for r in schema::from_record_batch(&batch.unwrap()) {
+                    if let Some(id) = r.template_id {
+                        out.insert((r.service, id));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn exports_a_dictionary_row_for_every_service_and_template_in_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, store_dir) = (tmp.path().join("wal"), tmp.path().join("store"));
+        let with_service = |ts: u64, body: &str, service: Option<&str>| {
+            let mut r = record(ts, Severity::ERROR, body);
+            r.service = service.map(str::to_string);
+            r
+        };
+        write_wal(
+            &wal_dir,
+            vec![vec![
+                with_service(10, "payment 1 failed for order 7", Some("api")),
+                with_service(20, "payment 2 failed for order 8", Some("worker")),
+                with_service(30, "payment 3 failed for order 9", Some("api")),
+                with_service(40, "cache miss for key 5", None),
+            ]],
+        );
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let mut drain = Drain::default();
+        let report =
+            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, None, 0).unwrap();
+        assert_eq!(report.dictionary_rows, Some(3));
+        assert_eq!(report.dictionary_error, None);
+
+        let path = template_dict::dict_path(&store_dir);
+        let rows = template_dict::read(&path).unwrap();
+        let in_dict: std::collections::BTreeSet<_> =
+            rows.iter().map(|r| (r.service.clone(), r.template_id)).collect();
+        assert_eq!(in_dict, pairs_in_store(&store_dir), "the dictionary covers every row's key");
+        assert_eq!(rows.len(), in_dict.len(), "one row per (service, template_id)");
+
+        let api = rows.iter().find(|r| r.service.as_deref() == Some("api")).unwrap();
+        assert_eq!(api.text, "payment <NUM> failed for order <NUM>");
+        assert_eq!((api.first_seen_micros, api.last_seen_micros), (10_000_000, 30_000_000));
+        let worker = rows.iter().find(|r| r.service.as_deref() == Some("worker")).unwrap();
+        assert_eq!(worker.template_id, api.template_id, "one shape, one id, two services");
+        assert_eq!(worker.global_id, api.global_id);
+        assert!(rows.iter().all(|r| r.agent == cat.template_id_space().unwrap()));
+
+        // A later merge rewrites the file: bounds move, new pairs appear.
+        write_wal(
+            &wal_dir,
+            vec![vec![
+                with_service(50, "payment 4 failed for order 1", Some("api")),
+                with_service(60, "payment 5 failed for order 2", Some("billing")),
+            ]],
+        );
+        let report =
+            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, None, 0).unwrap();
+        assert_eq!(report.dictionary_rows, Some(4));
+        let rows = template_dict::read(&path).unwrap();
+        let api = rows.iter().find(|r| r.service.as_deref() == Some("api")).unwrap();
+        assert_eq!((api.first_seen_micros, api.last_seen_micros), (10_000_000, 50_000_000));
+        let in_dict: std::collections::BTreeSet<_> =
+            rows.iter().map(|r| (r.service.clone(), r.template_id)).collect();
+        assert_eq!(in_dict, pairs_in_store(&store_dir));
+
+        // A pass that merges nothing leaves an existing file alone...
+        let report =
+            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, None, 0).unwrap();
+        assert_eq!(report.dictionary_rows, None);
+        // ...but restores one that went missing.
+        std::fs::remove_file(&path).unwrap();
+        let report =
+            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, None, 0).unwrap();
+        assert_eq!(report.dictionary_rows, Some(4));
+        assert_eq!(template_dict::read(&path).unwrap(), rows);
     }
 
     #[test]

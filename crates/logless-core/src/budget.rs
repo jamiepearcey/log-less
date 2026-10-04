@@ -285,6 +285,7 @@ mod tests {
                 key,
                 stats: stats.clone(),
             }],
+            &[],
             0,
         )
         .unwrap();
@@ -316,6 +317,7 @@ mod tests {
                 key,
                 stats: stats.clone(),
             }],
+            &[],
             0,
         )
         .unwrap();
@@ -518,6 +520,7 @@ mod tests {
                 key: PartitionKey { epoch_hour: 1, bucket: "debug".into() },
                 stats: real.clone(),
             }],
+            &[],
             0,
         )
         .unwrap();
