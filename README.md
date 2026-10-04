@@ -65,6 +65,19 @@ Leave `destinations` empty for store-only mode. See
 logless serve --config /tmp/logless.toml --serve-s3-addr 127.0.0.1:9000
 ```
 
+### Typed attribute columns
+
+Attribute keys that a service sets on most of its records with one type are
+promoted out of the `attributes` JSON into typed columns (`attr_latency_ms
+BIGINT`, `attr_http_route VARCHAR`, `attr_request_start TIMESTAMPTZ`, ...), so
+predicates on them read one narrow column instead of parsing JSON. Bounded per
+service and in total; values that do not fit a column's type stay in the JSON.
+Files differ in which typed columns they hold, so read with
+`union_by_name=true`. On a synthetic 500k-record workload, `latency_ms > 500`
+read 0.035x the bytes and took 1.3 ms against 319 ms, and writes got 0.75x
+cheaper to encode; row-group pruning on these attributes was 0 of 8. Contract,
+config and measurements: [`docs/typed-columns.md`](docs/typed-columns.md).
+
 ## Change policy while it runs
 
 `logless run` can expose a small, token-protected admin API on loopback for
@@ -216,7 +229,8 @@ plus 2 aggregate events covering the other 78 (**0.17% of raw bytes**).
 
   ```sh
   duckdb -c "SELECT level, count(*) FROM read_parquet('/tmp/logless-data/store/**/*.parquet',
-                                                      hive_partitioning=true) GROUP BY level;"
+                                                      hive_partitioning=true, union_by_name=true)
+             WHERE attr_latency_ms > 500 GROUP BY level;"
   ```
 
   Timestamps are UTC-qualified so time filters mean what they say. The binary is

@@ -1067,6 +1067,7 @@ dependencies = [
  "logless-core",
  "parquet",
  "postcard",
+ "serde_json",
  "signal-hook",
  "toml",
  "tracing",

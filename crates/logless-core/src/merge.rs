@@ -69,6 +69,9 @@ pub struct MergeReport {
 /// `active_segment` is the id the writer currently owns. That segment and every
 /// higher id are left alone. Pass `None` only when no writer is running (the
 /// standalone `logless merge` command).
+// Each argument is an independent piece of state the caller owns; bundling
+// them into a struct would only move the list.
+#[allow(clippy::too_many_arguments)]
 pub fn merge_all(
     wal_dir: &Path,
     store_dir: &Path,

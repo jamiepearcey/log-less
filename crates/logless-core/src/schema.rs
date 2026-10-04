@@ -95,7 +95,9 @@ pub fn typed_columns_of(schema: &Schema) -> Vec<TypedColumn> {
 }
 
 /// A typed column's values from a batch, as attribute values, by row.
-fn typed_reader<'a>(array: &'a ArrayRef, ty: ColumnType) -> Option<Box<dyn Fn(usize) -> Option<AttrValue> + 'a>> {
+type TypedReader<'a> = Box<dyn Fn(usize) -> Option<AttrValue> + 'a>;
+
+fn typed_reader(array: &ArrayRef, ty: ColumnType) -> Option<TypedReader<'_>> {
     macro_rules! read {
         ($arr:ty, $wrap:expr) => {{
             let a = array.as_any().downcast_ref::<$arr>()?;
@@ -155,7 +157,7 @@ pub fn from_record_batch(batch: &RecordBatch) -> Vec<LogRecord> {
     let attributes = strings("attributes");
     let template_id = column("template_id").and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
     let schema = batch.schema();
-    let typed_columns: Vec<(String, Box<dyn Fn(usize) -> Option<AttrValue> + '_>)> =
+    let typed_columns: Vec<(String, TypedReader<'_>)> =
         typed_columns_of(&schema)
             .into_iter()
             .filter_map(|c| {

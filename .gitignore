@@ -68,3 +68,6 @@ Thumbs.db
 .vscode/
 *.swp
 *~
+
+# Per-worktree cargo target dirs (CARGO_TARGET_DIR=target_local etc.)
+target_*/

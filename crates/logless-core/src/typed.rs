@@ -234,6 +234,16 @@ pub fn conform(value: &AttrValue, ty: ColumnType) -> Option<Cell<'_>> {
     }
 }
 
+/// Rows per [`plan`] call whose attributes are inspected; see the stride.
+const SAMPLE_ROWS: usize = 32 * 1024;
+
+#[derive(Default)]
+struct ServiceStats<'a> {
+    rows: usize,
+    sampled: usize,
+    keys: HashMap<&'a str, KeyStats>,
+}
+
 #[derive(Default)]
 struct KeyStats {
     present: usize,
@@ -298,32 +308,45 @@ pub fn plan(
         return Vec::new();
     }
 
-    let mut services: BTreeMap<&str, (usize, HashMap<&str, KeyStats>)> = BTreeMap::new();
-    let mut seen: HashSet<&str> = HashSet::new();
-    for r in records {
-        let (rows, keys) = services.entry(r.service.as_deref().unwrap_or("")).or_default();
-        *rows += 1;
-        seen.clear();
-        for attr in &r.attributes {
-            // First occurrence only: a duplicated key on one record is one
-            // observation, and only the first can land in the column.
-            if !seen.insert(attr.key.as_str()) || layout.index_of(&attr.key).is_some() {
+    // Key statistics come from a deterministic stride sample: a fraction and
+    // a type share are as well estimated from 32k rows as from a million, and
+    // judging every attribute of every row cost more than the Parquet write
+    // it precedes. `min_rows` is still checked against the full count.
+    let stride = (records.len() / SAMPLE_ROWS).max(1);
+    let mut services: BTreeMap<&str, ServiceStats> = BTreeMap::new();
+    for (row, r) in records.iter().enumerate() {
+        let stats = services.entry(r.service.as_deref().unwrap_or("")).or_default();
+        stats.rows += 1;
+        if row % stride != 0 {
+            continue;
+        }
+        stats.sampled += 1;
+        for (i, attr) in r.attributes.iter().enumerate() {
+            // Registered keys are the common case once a store has run for a
+            // while, so they are skipped before anything else is paid for.
+            if layout.index_of(&attr.key).is_some() {
                 continue;
             }
-            keys.entry(attr.key.as_str()).or_default().observe(&attr.value);
+            // First occurrence only: a duplicated key on one record is one
+            // observation, and only the first can land in the column. Linear,
+            // because attribute lists are short and a set costs more.
+            if r.attributes[..i].iter().any(|a| a.key == attr.key) {
+                continue;
+            }
+            stats.keys.entry(attr.key.as_str()).or_default().observe(&attr.value);
         }
     }
 
     let mut taken: HashSet<String> = layout.columns().iter().map(|c| c.column.clone()).collect();
     let mut out = Vec::new();
-    for (service, (rows, keys)) in services {
-        if rows < config.min_rows {
+    for (service, ServiceStats { rows, sampled, keys }) in services {
+        if rows < config.min_rows || sampled == 0 {
             continue;
         }
         let mut budget = config.max_per_service.saturating_sub(layout.charged_to(service));
         let mut candidates: Vec<(&str, &KeyStats, ColumnType)> = keys
             .iter()
-            .filter(|(_, s)| s.present as f64 >= config.min_presence * rows as f64)
+            .filter(|(_, s)| s.present as f64 >= config.min_presence * sampled as f64)
             .filter_map(|(k, s)| {
                 s.stable_type(config.min_type_share, config.max_string_bytes).map(|t| (*k, s, t))
             })
@@ -414,7 +437,7 @@ pub fn format_timestamp(nanos: i64) -> String {
 /// `None`, which keeps it in the JSON byte-for-byte.
 pub fn parse_canonical_timestamp(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    if b.len() < 20 || *b.last()? != b'Z' {
+    if !(20..=30).contains(&b.len()) || b[b.len() - 1] != b'Z' {
         return None;
     }
     let num = |range: std::ops::Range<usize>| -> Option<i64> {
@@ -445,11 +468,24 @@ pub fn parse_canonical_timestamp(s: &str) -> Option<i64> {
         }
         _ => return None,
     };
+    // Canonical means the minimal fraction, the one `format_timestamp` would
+    // choose: `.000Z` or `.100000Z` would replay as a different string, so
+    // they are not accepted. Checked arithmetically — this runs on every
+    // string attribute a promotion pass sees.
+    let minimal_digits = if frac == 0 {
+        0
+    } else if frac % 1_000_000 == 0 {
+        3
+    } else if frac % 1_000 == 0 {
+        6
+    } else {
+        9
+    };
+    if b.len() != 20 + if minimal_digits == 0 { 0 } else { minimal_digits + 1 } {
+        return None;
+    }
     let secs = days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec;
-    let nanos = secs.checked_mul(NANOS_PER_SEC)?.checked_add(frac)?;
-    // Canonical means the minimal fraction: `.000Z` or `.100000Z` would
-    // replay as a different string, so they are not accepted.
-    (format_timestamp(nanos) == s).then_some(nanos)
+    secs.checked_mul(NANOS_PER_SEC)?.checked_add(frac)
 }
 
 #[cfg(test)]
@@ -609,6 +645,26 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(plan(&records, &TypedLayout::default(), &cfg, 1), first);
         }
+    }
+
+    #[test]
+    fn large_batches_are_judged_on_a_sample_with_the_same_thresholds() {
+        // 100k rows: well past SAMPLE_ROWS, so the stride sample decides.
+        let records: Vec<_> = (0..100_000i64)
+            .map(|i| {
+                let mut attrs = vec![];
+                if i % 10 < 6 {
+                    attrs.push(("often", AttrValue::I64(i)));
+                }
+                if i % 10 < 4 {
+                    attrs.push(("sometimes", AttrValue::I64(i)));
+                }
+                rec("a", attrs)
+            })
+            .collect();
+        let new = plan(&records, &TypedLayout::default(), &TypedColumnsConfig::default(), 0);
+        let keys: Vec<_> = new.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, vec!["often"], "60% clears min_presence 0.5, 40% does not");
     }
 
     #[test]
