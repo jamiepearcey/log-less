@@ -280,6 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ingest: IngestConfig::default(),
                 retention: LevelBuckets::default(),
                 pushdown: PushdownConfig::default(),
+                typed_columns: logless_core::typed::TypedColumnsConfig::default(),
                 otlp: otlp::ReceiverConfig::default(),
                 hec: hec::HecConfig::default(),
                 serve_s3: s3_serve::S3ServeConfig::default(),
@@ -418,6 +419,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut catalog,
                 &config.retention,
                 &mut drain,
+                &config.typed_columns,
                 None,
                 now_unix_secs(),
             )?;
@@ -438,6 +440,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.new_templates,
                 drain.template_count()
             );
+            println!("typed_columns_promoted={}", report.columns_promoted);
         }
 
         Command::Verify { config, tolerance } => {
@@ -488,7 +491,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let report = logless_core::compact::compact(
                 &config.store_dir(),
                 &mut catalog,
-                &logless_core::compact::CompactConfig::default(),
+                &logless_core::compact::CompactConfig {
+                    typed: config.typed_columns,
+                    ..Default::default()
+                },
                 None,
             )?;
             println!(
@@ -558,6 +564,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             if files.len() > 50 {
                 println!("  … {} more", files.len() - 50);
+            }
+            let layout = catalog.typed_layout()?;
+            println!("typed_columns={}", layout.len());
+            for c in layout.columns() {
+                println!(
+                    "  {:<32} {:<9} key={} service={} promoted_at={}",
+                    c.column,
+                    c.ty.as_str(),
+                    c.key,
+                    c.service,
+                    c.promoted_at
+                );
             }
         }
 
@@ -1872,6 +1890,7 @@ fn maintenance_pass(
             catalog,
             &rt.buckets,
             &mut drain,
+            &config.typed_columns,
             active,
             now_unix_secs(),
         )
@@ -1882,7 +1901,10 @@ fn maintenance_pass(
     match logless_core::compact::compact(
         &config.store_dir(),
         catalog,
-        &logless_core::compact::CompactConfig::default(),
+        &logless_core::compact::CompactConfig {
+            typed: config.typed_columns,
+            ..Default::default()
+        },
         active_hour,
     ) {
         Ok(r) if r.partitions_compacted > 0 => tracing::info!(

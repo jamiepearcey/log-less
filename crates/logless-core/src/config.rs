@@ -24,6 +24,10 @@ pub struct Config {
     pub retention: LevelBuckets,
     #[serde(default)]
     pub pushdown: PushdownConfig,
+    /// Which attribute keys get their own typed Parquet column
+    /// (`docs/typed-columns.md`).
+    #[serde(default)]
+    pub typed_columns: crate::typed::TypedColumnsConfig,
     /// OTLP/HTTP receiver. Off by default — binding a port is not something to
     /// start doing because someone upgraded the agent.
     #[serde(default)]
@@ -411,6 +415,7 @@ mod tests {
             ingest: IngestConfig::default(),
             retention: LevelBuckets::default(),
             pushdown: PushdownConfig::default(),
+            typed_columns: crate::typed::TypedColumnsConfig::default(),
             otlp: crate::otlp::ReceiverConfig::default(),
             hec: crate::hec::HecConfig::default(),
             serve_s3: crate::s3_serve::S3ServeConfig::default(),

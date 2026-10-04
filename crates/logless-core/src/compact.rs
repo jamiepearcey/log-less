@@ -36,6 +36,11 @@ pub enum CompactError {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompactConfig {
+    /// Promotion thresholds. Compaction sees more rows per partition than one
+    /// merge does, so it may promote keys a single segment was too small to
+    /// judge; and it rewrites older files into the current layout, which is
+    /// how JSON-only files written before a promotion gain the typed column.
+    pub typed: crate::typed::TypedColumnsConfig,
     /// Compact a partition only when it has at least this many files. Below it,
     /// the rewrite costs more than the fragmentation.
     pub min_files: usize,
@@ -52,6 +57,7 @@ pub struct CompactConfig {
 impl Default for CompactConfig {
     fn default() -> Self {
         Self {
+            typed: crate::typed::TypedColumnsConfig::default(),
             min_files: 4,
             target_bytes: 128 * 1024 * 1024,
             keep_above_bytes: 32 * 1024 * 1024,
@@ -68,6 +74,8 @@ pub struct CompactReport {
     pub rows: u64,
     pub bytes_before: u64,
     pub bytes_after: u64,
+    /// Attribute keys promoted to typed columns by this compaction.
+    pub columns_promoted: u64,
 }
 
 impl CompactReport {
@@ -145,6 +153,14 @@ pub fn compact(
         schema::sort_records(&mut records);
         let rows = records.len() as u64;
 
+        let mut layout = catalog.typed_layout()?;
+        let promoted = crate::typed::plan(&records, &layout, &config.typed, crate::now_unix_secs());
+        if !promoted.is_empty() {
+            catalog.register_typed_columns(&promoted)?;
+            report.columns_promoted += promoted.len() as u64;
+            layout.extend(promoted);
+        }
+
         // A compacted file is identified by a fresh UUID and a segment id of 0.
         // Zero is reserved: no WAL segment has it, so a compacted file can
         // never be confused with a merged one, and `is_segment_merged` cannot
@@ -154,7 +170,7 @@ pub fn compact(
         std::fs::create_dir_all(&dir)
             .map_err(|source| StoreError::Io { path: dir.clone(), source })?;
         let out_path = dir.join(out_name);
-        let stats = store::write_partition_file(&out_path, &records)?;
+        let stats = store::write_partition_file_with(&out_path, &records, &layout)?;
 
         // Recorded before the inputs are removed. A crash here leaves both, and
         // duplicate rows are recoverable; a gap is not.
@@ -257,6 +273,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.records.len(), 800);
+    }
+
+    #[test]
+    fn compaction_rewrites_json_only_files_into_the_typed_layout() {
+        use crate::model::{Attr, AttrValue};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        // Four files, each too small (60 rows) for a merge to have promoted
+        // anything; together they clear `min_rows`.
+        for segment in 1..=4u64 {
+            let key = PartitionKey { epoch_hour: 10, bucket: "info".into() };
+            let records: Vec<LogRecord> = (0..60u64)
+                .map(|i| {
+                    let ts = 10 * HOUR_NS + segment * 1000 + i;
+                    let mut r = LogRecord::new(ts, Severity::INFO, "served");
+                    r.observed_unix_nano = ts;
+                    r.service = Some("api".into());
+                    r.attributes = vec![
+                        Attr { key: "status".into(), value: AttrValue::I64(200 + (i % 3) as i64) },
+                        Attr { key: "note".into(), value: AttrValue::Str(format!("n{i}")) },
+                    ];
+                    r
+                })
+                .collect();
+            let path = key.dir(tmp.path()).join(store::file_name_for_segment(segment, uuid::Uuid::now_v7()));
+            store::write_partition_file(&path, &records).unwrap();
+        }
+        let config = CompactConfig {
+            typed: crate::typed::TypedColumnsConfig { min_rows: 200, ..Default::default() },
+            ..Default::default()
+        };
+        let report = compact(tmp.path(), &mut catalog, &config, None).unwrap();
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.columns_promoted, 2);
+
+        let out = store::list_parquet_files(tmp.path());
+        let declared: Vec<_> = store::read_typed_columns(&out[0]).unwrap().into_iter().map(|c| c.column).collect();
+        assert_eq!(declared, vec!["attr_note", "attr_status"]);
+        let back = read_all(&out[0]).unwrap();
+        assert_eq!(back.len(), 240);
+        assert!(back.iter().all(|r| r.attributes.len() == 2));
     }
 
     #[test]

@@ -111,6 +111,18 @@ impl Catalog {
                 first_seen INTEGER NOT NULL,
                 last_seen  INTEGER NOT NULL
             );
+
+            -- Promoted attribute keys (`crate::typed`). A column's type never
+            -- changes once registered: every file that has the column agrees
+            -- on it, which is what lets readers union schemas by name.
+            -- Recoverable from file footers (`logless.typed_columns`).
+            CREATE TABLE IF NOT EXISTS typed_columns (
+                column_name TEXT PRIMARY KEY,
+                attr_key    TEXT    NOT NULL UNIQUE,
+                column_type TEXT    NOT NULL,
+                service     TEXT    NOT NULL,
+                promoted_at INTEGER NOT NULL
+            );
             "#,
         )?;
         Ok(Self { conn })
@@ -333,12 +345,67 @@ impl Catalog {
         Ok(all)
     }
 
+    /// The registered typed columns, as the layout a writer applies.
+    pub fn typed_layout(&self) -> Result<crate::typed::TypedLayout, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT column_name, attr_key, column_type, service, promoted_at FROM typed_columns",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+        let mut columns = Vec::new();
+        for row in rows {
+            let (column, key, ty, service, promoted_at) = row?;
+            // An unknown type name can only come from a newer build; skipping
+            // it keeps that key in the JSON, which is always correct.
+            if let Some(ty) = crate::typed::ColumnType::parse(&ty) {
+                columns.push(crate::typed::TypedColumn {
+                    column,
+                    key,
+                    ty,
+                    service,
+                    promoted_at: promoted_at.max(0) as u64,
+                });
+            }
+        }
+        Ok(crate::typed::TypedLayout::new(columns))
+    }
+
+    /// Register promotions. Existing columns and keys are left exactly as
+    /// they are — a type is never changed — so this is safe to repeat.
+    pub fn register_typed_columns(
+        &mut self,
+        columns: &[crate::typed::TypedColumn],
+    ) -> Result<(), CatalogError> {
+        let tx = self.conn.transaction()?;
+        for c in columns {
+            tx.execute(
+                "INSERT OR IGNORE INTO typed_columns (column_name, attr_key, column_type, service, promoted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![c.column, c.key, c.ty.as_str(), c.service, c.promoted_at as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Reconstruct `files` by scanning the store and reading Parquet footers.
     ///
     /// Safe to run at any time; it is the recovery path for a lost or corrupt
     /// catalog, and the correctness check for one we still trust.
+    ///
+    /// Typed columns declared in footers are registered too (never removed:
+    /// a registered column with no file yet is harmless, a forgotten one could
+    /// be re-promoted with a different type).
     pub fn rebuild(&mut self, store_dir: &Path) -> Result<usize, CatalogError> {
         let mut entries = Vec::new();
+        let mut typed = Vec::new();
         for path in store::list_parquet_files(store_dir) {
             let Some(key) = key_from_path(store_dir, &path) else {
                 continue;
@@ -347,8 +414,12 @@ impl Catalog {
                 path: path.clone(),
                 source,
             })?;
+            typed.extend(store::read_typed_columns(&path).map_err(|source| {
+                CatalogError::Store { path: path.clone(), source }
+            })?);
             entries.push(FileEntry { path, key, stats });
         }
+        self.register_typed_columns(&typed)?;
 
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM files", [])?;
@@ -458,6 +529,38 @@ mod tests {
 
         assert_eq!(rebuilt.rebuild(&store).unwrap(), 3);
         assert_eq!(rebuilt.list_files().unwrap(), before);
+    }
+
+    #[test]
+    fn typed_registry_never_changes_a_type_and_rebuilds_from_footers() {
+        use crate::model::{Attr, AttrValue};
+        use crate::typed::{ColumnType, TypedColumn, TypedLayout};
+        let col = |key: &str, ty| TypedColumn {
+            column: crate::typed::column_name(key).unwrap(),
+            key: key.into(),
+            ty,
+            service: "api".into(),
+            promoted_at: 1,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cat = Catalog::open(&tmp.path().join("catalog.sqlite")).unwrap();
+        cat.register_typed_columns(&[col("latency_ms", ColumnType::Int64)]).unwrap();
+        // A second registration with another type is ignored, not applied.
+        cat.register_typed_columns(&[col("latency_ms", ColumnType::String)]).unwrap();
+        assert_eq!(cat.typed_layout().unwrap().columns(), &[col("latency_ms", ColumnType::Int64)]);
+
+        // A file declaring a column; a fresh catalog learns it from the footer.
+        let key = PartitionKey { epoch_hour: 5, bucket: "info".into() };
+        let path = key.dir(tmp.path()).join(store::file_name_for_segment(1, seg_uuid(1)));
+        let mut r = LogRecord::new(5 * 3600 * 1_000_000_000, Severity::INFO, "x");
+        r.observed_unix_nano = r.timestamp_unix_nano;
+        r.attributes = vec![Attr { key: "ok".into(), value: AttrValue::Bool(true) }];
+        let layout = TypedLayout::new(vec![col("ok", ColumnType::Bool)]);
+        store::write_partition_file_with(&path, &[r], &layout).unwrap();
+
+        let mut fresh = Catalog::open_in_memory().unwrap();
+        fresh.rebuild(tmp.path()).unwrap();
+        assert_eq!(fresh.typed_layout().unwrap().columns(), &[col("ok", ColumnType::Bool)]);
     }
 
     #[test]

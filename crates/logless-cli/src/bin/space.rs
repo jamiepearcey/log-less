@@ -125,7 +125,7 @@ fn write_variant(
     use parquet::basic::{Compression, Encoding, ZstdLevel};
     use parquet::file::properties::WriterProperties;
 
-    let full = schema::to_record_batch(records).unwrap();
+    let full = schema::to_record_batch(records, &Default::default()).unwrap();
     let batch = if drop_id {
         let indices: Vec<usize> = (0..full.num_columns())
             .filter(|i| full.schema().field(*i).name() != "event_id")

@@ -31,6 +31,7 @@ pub mod spool;
 pub mod sentry;
 pub mod store;
 pub mod tail;
+pub mod typed;
 pub mod retention;
 pub mod s3_serve;
 pub mod s3_sigv4;

@@ -29,6 +29,7 @@ use crate::model::LogRecord;
 use crate::partition::PartitionKey;
 use crate::schema;
 use crate::store::{self, StoreError};
+use crate::typed::{self, TypedColumnsConfig};
 use crate::wal;
 
 #[derive(Debug, thiserror::Error)]
@@ -59,6 +60,8 @@ pub struct MergeReport {
     pub untemplated: u64,
     /// Templates seen for the first time in this merge — the novelty signal.
     pub new_templates: u64,
+    /// Attribute keys promoted to typed columns by this merge.
+    pub columns_promoted: u64,
 }
 
 /// Merge every eligible WAL segment.
@@ -72,6 +75,7 @@ pub fn merge_all(
     catalog: &mut Catalog,
     buckets: &LevelBuckets,
     drain: &mut Drain,
+    typed_config: &TypedColumnsConfig,
     active_segment: Option<u64>,
     now_unix_secs: u64,
 ) -> Result<MergeReport, MergeError> {
@@ -79,6 +83,7 @@ pub fn merge_all(
         temp_files_cleaned: store::clean_temp_files(store_dir),
         ..Default::default()
     };
+    let mut layout = catalog.typed_layout()?;
 
     for (segment_id, path) in wal::list_segments(wal_dir)? {
         if active_segment.is_some_and(|active| segment_id >= active) {
@@ -145,10 +150,20 @@ pub fn merge_all(
                 }
             }
             schema::sort_records(&mut records);
+            // Registered before the file is written, so the registry is always
+            // a superset of what any file holds. A crash in between leaves a
+            // column with no file, which is harmless; the re-merge makes the
+            // same decision because `plan` is deterministic.
+            let promoted = typed::plan(&records, &layout, typed_config, now_unix_secs);
+            if !promoted.is_empty() {
+                catalog.register_typed_columns(&promoted)?;
+                report.columns_promoted += promoted.len() as u64;
+                layout.extend(promoted);
+            }
             let file_path = key
                 .dir(store_dir)
                 .join(store::file_name_for_segment(segment_id, segment_uuid));
-            let stats = store::write_partition_file(&file_path, &records)?;
+            let stats = store::write_partition_file_with(&file_path, &records, &layout)?;
             report.bytes_written += stats.bytes;
             entries.push(FileEntry {
                 path: file_path,
@@ -218,6 +233,7 @@ mod tests {
             &mut cat,
             &LevelBuckets::default(),
             &mut Drain::default(),
+            &TypedColumnsConfig::default(),
             None,
             0,
         )
@@ -258,13 +274,13 @@ mod tests {
         let segment = wal::list_segments(&wal_dir).unwrap()[0].1.clone();
         let saved = std::fs::read(&segment).unwrap();
         let mut doomed = Catalog::open_in_memory().unwrap();
-        merge_all(&wal_dir, &store_dir, &mut doomed, &LevelBuckets::default(), &mut Drain::default(), None, 0).unwrap();
+        merge_all(&wal_dir, &store_dir, &mut doomed, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
         std::fs::write(&segment, &saved).unwrap();
 
         // Restart with a catalog that never saw the commit.
         let mut cat = Catalog::open_in_memory().unwrap();
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
 
         assert_eq!(report.segments_merged, 1);
         assert_eq!(cat.totals().unwrap().0, 50, "rows must not double");
@@ -283,7 +299,7 @@ mod tests {
         cat.commit_merge(1, uuid, &[], 0).unwrap();
 
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
 
         assert_eq!(report.segments_skipped, 1);
         assert_eq!(report.segments_merged, 0);
@@ -309,6 +325,7 @@ mod tests {
             &mut cat,
             &LevelBuckets::default(),
             &mut Drain::default(),
+            &TypedColumnsConfig::default(),
             Some(active),
             0,
         )
@@ -342,6 +359,7 @@ mod tests {
             &mut cat,
             &LevelBuckets::default(),
             &mut Drain::default(),
+            &TypedColumnsConfig::default(),
             Some(segments[0].0),
             0,
         )
@@ -363,7 +381,7 @@ mod tests {
 
         let mut cat = Catalog::open_in_memory().unwrap();
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), Some(99), 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), Some(99), 0).unwrap();
         assert_eq!(report.records, 10, "segments behind the empty one still merge");
         assert!(wal::list_segments(&wal_dir).unwrap().is_empty(), "empty segments freed");
     }
@@ -391,7 +409,7 @@ mod tests {
 
         let mut cat = Catalog::open_in_memory().unwrap();
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
 
         assert_eq!(report.truncated, 1);
         assert_eq!(report.records, 10);
@@ -412,7 +430,7 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         let mut drain = Drain::default();
         let first = merge_all(
-            &wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, None, 0,
+            &wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0,
         )
         .unwrap();
 
@@ -431,7 +449,7 @@ mod tests {
         );
         let mut restored = Drain::restore(Default::default(), cat.load_templates().unwrap());
         let second = merge_all(
-            &wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut restored, None, 0,
+            &wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut restored, &TypedColumnsConfig::default(), None, 0,
         )
         .unwrap();
 
@@ -458,7 +476,7 @@ mod tests {
 
         write_wal(&wal_dir, vec![vec![record(1, Severity::INFO, "first run")]]);
         assert_eq!(wal::list_segments(&wal_dir).unwrap()[0].0, 1);
-        merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, None, 0)
+        merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0)
             .unwrap();
         assert!(wal::list_segments(&wal_dir).unwrap().is_empty(), "wal drained");
 
@@ -467,7 +485,7 @@ mod tests {
         assert_eq!(wal::list_segments(&wal_dir).unwrap()[0].0, 1, "id reused");
 
         let second = merge_all(
-            &wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, None, 0,
+            &wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0,
         )
         .unwrap();
 
@@ -492,10 +510,66 @@ mod tests {
             &mut cat,
             &LevelBuckets::default(),
             &mut Drain::default(),
+            &TypedColumnsConfig::default(),
             None,
             0,
         )
         .unwrap();
         assert_eq!(report, MergeReport::default());
+    }
+
+    #[test]
+    fn promotes_frequent_keys_registers_them_and_keeps_their_type() {
+        use crate::model::{Attr, AttrValue};
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, store_dir) = (tmp.path().join("wal"), tmp.path().join("store"));
+        let with = |i: u64, v: AttrValue| {
+            let mut r = record(i, Severity::INFO, "request done");
+            r.attributes = vec![
+                Attr { key: "latency_ms".into(), value: v },
+                Attr { key: "rare".into(), value: AttrValue::I64(1) },
+            ];
+            if i % 10 != 0 {
+                r.attributes.pop();
+            }
+            r
+        };
+        write_wal(&wal_dir, vec![(0..50).map(|i| with(i, AttrValue::I64(i as i64))).collect()]);
+
+        let cfg = TypedColumnsConfig { min_rows: 10, ..Default::default() };
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let run = |cat: &mut Catalog| {
+            merge_all(&wal_dir, &store_dir, cat, &LevelBuckets::default(), &mut Drain::default(), &cfg, None, 0)
+                .unwrap()
+        };
+        let report = run(&mut cat);
+        assert_eq!(report.columns_promoted, 1);
+        let layout = cat.typed_layout().unwrap();
+        assert_eq!(layout.columns()[0].column, "attr_latency_ms");
+        assert_eq!(layout.columns()[0].ty, typed::ColumnType::Int64);
+        let files = store::list_parquet_files(&store_dir);
+        assert_eq!(store::read_typed_columns(&files[0]).unwrap().len(), 1);
+
+        // Later the key arrives as a string: the column keeps its type and
+        // those values stay in the JSON, nothing is lost.
+        write_wal(&wal_dir, vec![(100..150).map(|i| with(i, AttrValue::Str("fast".into()))).collect()]);
+        let report = run(&mut cat);
+        assert_eq!(report.columns_promoted, 0);
+        assert_eq!(cat.typed_layout().unwrap().columns()[0].ty, typed::ColumnType::Int64);
+
+        let all = crate::scan::scan(&store_dir, &crate::scan::Query { limit: 1000, ..Default::default() }).unwrap();
+        assert_eq!(all.records.len(), 100);
+        let strings = all
+            .records
+            .iter()
+            .filter(|r| r.attributes.iter().any(|a| a.value == AttrValue::Str("fast".into())))
+            .count();
+        assert_eq!(strings, 50);
+        let ints = all
+            .records
+            .iter()
+            .filter(|r| r.attributes.iter().any(|a| a.key == "latency_ms" && matches!(a.value, AttrValue::I64(_))))
+            .count();
+        assert_eq!(ints, 50);
     }
 }
