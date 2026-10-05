@@ -169,6 +169,17 @@ All under `/admin/v1`.
 `written` is records synced to the WAL. `pressure` is `normal`, `high` or
 `critical` against the live watermarks.
 
+### `GET /typed-columns`
+
+```
+{"columns": [{"column", "key", "type", "service", "promoted_at"}]}
+```
+
+The registry of attribute keys promoted to typed Parquet columns
+(`docs/typed-columns.md`). `type` is one of `int64`, `float64`, `bool`,
+`string`, `timestamp`; `service` is the one charged for the promotion;
+`promoted_at` is unix seconds. Read only; promotion is automatic.
+
 ### `GET /policies`
 
 ```

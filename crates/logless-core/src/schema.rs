@@ -8,17 +8,24 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, RecordBatch, StringArray,
-    StringBuilder, TimestampNanosecondArray, UInt64Array, UInt64Builder, UInt8Array,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
+    Float64Array, Float64Builder, Int64Array, Int64Builder, RecordBatch, StringArray,
+    StringBuilder, TimestampNanosecondArray, TimestampNanosecondBuilder, UInt64Array,
+    UInt64Builder, UInt8Array,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
-use crate::model::LogRecord;
+use crate::model::{Attr, AttrValue, LogRecord};
+use crate::typed::{self, Cell, ColumnType, TypedColumn, TypedLayout};
 
 /// Bumped when the column set changes. Written into Parquet key-value metadata
 /// so a reader can tell which generation produced a file.
-pub const SCHEMA_VERSION: &str = "1";
+///
+/// 2: typed `attr_*` columns after the base columns (`crate::typed`).
+pub const SCHEMA_VERSION: &str = "2";
 
 /// Timestamps are UTC and say so. See the note on the `timestamp` field.
 const UTC: &str = "UTC";
@@ -51,12 +58,61 @@ pub fn schema() -> SchemaRef {
         Field::new("trace_id", DataType::FixedSizeBinary(16), true),
         Field::new("span_id", DataType::FixedSizeBinary(8), true),
         Field::new("template_id", DataType::UInt64, true),
-        // TODO(templating): JSON for now. Typed attribute columns arrive with
-        // template parameter extraction (§3), which is the point at which typed
-        // predicate pushdown (`latency_ms > 500`) becomes possible. Documented
-        // as a known gap rather than pretended to be the final shape.
+        // JSON for every attribute that is not promoted to a typed `attr_*`
+        // column (see `crate::typed`), and for any value that does not conform
+        // to its column's type. Typed columns follow the base columns, vary
+        // per file, and are discovered from field metadata.
         Field::new("attributes", DataType::Utf8, true),
     ]))
+}
+
+/// The Arrow field for a typed attribute column, carrying the original key
+/// and the type name so a file is self-describing.
+pub fn typed_field(column: &TypedColumn) -> Field {
+    Field::new(&column.column, column.ty.arrow_type(), true).with_metadata(HashMap::from([
+        (typed::FIELD_META_KEY.to_string(), column.key.clone()),
+        (typed::FIELD_META_TYPE.to_string(), column.ty.as_str().to_string()),
+    ]))
+}
+
+/// Typed columns present in a batch's schema, from field metadata.
+pub fn typed_columns_of(schema: &Schema) -> Vec<TypedColumn> {
+    schema
+        .fields()
+        .iter()
+        .filter_map(|f| {
+            let key = f.metadata().get(typed::FIELD_META_KEY)?;
+            let ty = ColumnType::parse(f.metadata().get(typed::FIELD_META_TYPE)?)?;
+            Some(TypedColumn {
+                column: f.name().clone(),
+                key: key.clone(),
+                ty,
+                service: String::new(),
+                promoted_at: 0,
+            })
+        })
+        .collect()
+}
+
+/// A typed column's values from a batch, as attribute values, by row.
+type TypedReader<'a> = Box<dyn Fn(usize) -> Option<AttrValue> + 'a>;
+
+fn typed_reader(array: &ArrayRef, ty: ColumnType) -> Option<TypedReader<'_>> {
+    macro_rules! read {
+        ($arr:ty, $wrap:expr) => {{
+            let a = array.as_any().downcast_ref::<$arr>()?;
+            Some(Box::new(move |row: usize| (!a.is_null(row)).then(|| $wrap(a.value(row)))))
+        }};
+    }
+    match ty {
+        ColumnType::Int64 => read!(Int64Array, AttrValue::I64),
+        ColumnType::Float64 => read!(Float64Array, AttrValue::F64),
+        ColumnType::Bool => read!(BooleanArray, AttrValue::Bool),
+        ColumnType::String => read!(StringArray, |v: &str| AttrValue::Str(v.to_string())),
+        ColumnType::Timestamp => {
+            read!(TimestampNanosecondArray, |v: i64| AttrValue::Str(typed::format_timestamp(v)))
+        }
+    }
 }
 
 /// Sort order applied before writing: clusters templates for zstd/dictionary
@@ -100,6 +156,15 @@ pub fn from_record_batch(batch: &RecordBatch) -> Vec<LogRecord> {
     let severity_text = strings("severity_text");
     let attributes = strings("attributes");
     let template_id = column("template_id").and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
+    let schema = batch.schema();
+    let typed_columns: Vec<(String, TypedReader<'_>)> =
+        typed_columns_of(&schema)
+            .into_iter()
+            .filter_map(|c| {
+                let reader = typed_reader(batch.column_by_name(&c.column)?, c.ty)?;
+                Some((c.key, reader))
+            })
+            .collect();
 
     (0..batch.num_rows())
         .map(|row| {
@@ -127,18 +192,82 @@ pub fn from_record_batch(batch: &RecordBatch) -> Vec<LogRecord> {
             record.severity_text =
                 severity_text.filter(|a| !a.is_null(row)).map(|a| a.value(row).to_string());
             record.template_id = template_id.filter(|a| !a.is_null(row)).map(|a| a.value(row));
-            record.attributes = attributes
+            // Typed values first, then the JSON remainder. Attribute order is
+            // not preserved across promotion; keys and values are.
+            let mut attrs: Vec<Attr> = typed_columns
+                .iter()
+                .filter_map(|(key, read)| read(row).map(|value| Attr { key: key.clone(), value }))
+                .collect();
+            if let Some(rest) = attributes
                 .filter(|a| !a.is_null(row))
                 .map(|a| a.value(row))
-                .and_then(|json| serde_json::from_str(json).ok())
-                .unwrap_or_default();
+                .and_then(|json| serde_json::from_str::<Vec<Attr>>(json).ok())
+            {
+                attrs.extend(rest);
+            }
+            record.attributes = attrs;
             record
         })
         .collect()
 }
 
-pub fn to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, arrow::error::ArrowError> {
+/// Values bound for one typed column: (row, value), in row order. Sparse,
+/// because most keys are absent from most rows of a mixed-service file.
+type Sparse<'a> = Vec<(usize, Cell<'a>)>;
+
+fn build_typed(ty: ColumnType, n: usize, cells: &Sparse<'_>) -> ArrayRef {
+    macro_rules! build {
+        ($builder:expr, $pat:pat => $v:expr) => {{
+            let mut b = $builder;
+            let mut next = 0;
+            for (row, cell) in cells {
+                b.append_nulls(row - next);
+                match *cell {
+                    $pat => b.append_value($v),
+                    _ => b.append_null(),
+                }
+                next = row + 1;
+            }
+            b.append_nulls(n - next);
+            Arc::new(b.finish()) as ArrayRef
+        }};
+    }
+    match ty {
+        ColumnType::Int64 => build!(Int64Builder::with_capacity(n), Cell::Int(v) => v),
+        ColumnType::Float64 => build!(Float64Builder::with_capacity(n), Cell::Float(v) => v),
+        ColumnType::Bool => build!(BooleanBuilder::with_capacity(n), Cell::Bool(v) => v),
+        ColumnType::String => build!(StringBuilder::with_capacity(n, 0), Cell::Str(v) => v),
+        ColumnType::Timestamp => {
+            let mut b = TimestampNanosecondBuilder::with_capacity(n).with_timezone("UTC");
+            let mut next = 0;
+            for (row, cell) in cells {
+                b.append_nulls(row - next);
+                match *cell {
+                    Cell::Timestamp(v) => b.append_value(v),
+                    _ => b.append_null(),
+                }
+                next = row + 1;
+            }
+            b.append_nulls(n - next);
+            Arc::new(b.finish())
+        }
+    }
+}
+
+/// `LogRecord`s → one batch: the base columns, then a typed column for every
+/// key in `layout` that has at least one conforming value in `records`.
+///
+/// A conforming value is written to its column and left out of the JSON; a
+/// non-conforming one (wrong type, a second occurrence of the key on the same
+/// record) stays in the JSON, so the batch always holds every attribute.
+pub fn to_record_batch(
+    records: &[LogRecord],
+    layout: &TypedLayout,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
     let n = records.len();
+    let mut typed_cells: Vec<Sparse<'_>> = vec![Vec::new(); layout.len()];
+    let mut used: Vec<usize> = Vec::new();
+    let mut rest: Vec<&Attr> = Vec::new();
 
     let mut event_id = FixedSizeBinaryBuilder::with_capacity(n, 16);
     let mut trace_id = FixedSizeBinaryBuilder::with_capacity(n, 16);
@@ -149,7 +278,7 @@ pub fn to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, arrow::erro
     let mut template_id = UInt64Builder::with_capacity(n);
     let mut attributes = StringBuilder::new();
 
-    for r in records {
+    for (row, r) in records.iter().enumerate() {
         event_id.append_value(r.event_id.as_bytes())?;
         match &r.trace_id {
             Some(t) => trace_id.append_value(t)?,
@@ -172,14 +301,28 @@ pub fn to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, arrow::erro
             Some(t) => template_id.append_value(t),
             None => template_id.append_null(),
         }
-        if r.attributes.is_empty() {
+        used.clear();
+        rest.clear();
+        for attr in &r.attributes {
+            let cell = layout.index_of(&attr.key).filter(|i| !used.contains(i)).and_then(|i| {
+                typed::conform(&attr.value, layout.columns()[i].ty).map(|cell| (i, cell))
+            });
+            match cell {
+                Some((i, cell)) => {
+                    used.push(i);
+                    typed_cells[i].push((row, cell));
+                }
+                None => rest.push(attr),
+            }
+        }
+        if rest.is_empty() {
             attributes.append_null();
         } else {
-            attributes.append_value(serde_json::to_string(&r.attributes).unwrap_or_default());
+            attributes.append_value(serde_json::to_string(&rest).unwrap_or_default());
         }
     }
 
-    let columns: Vec<ArrayRef> = vec![
+    let mut columns: Vec<ArrayRef> = vec![
         Arc::new(event_id.finish()),
         Arc::new(
             TimestampNanosecondArray::from_iter_values(
@@ -205,7 +348,16 @@ pub fn to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, arrow::erro
         Arc::new(attributes.finish()),
     ];
 
-    RecordBatch::try_new(schema(), columns)
+    let mut fields: Vec<Field> = schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+    for (column, cells) in layout.columns().iter().zip(&typed_cells) {
+        if cells.is_empty() {
+            continue;
+        }
+        fields.push(typed_field(column));
+        columns.push(build_typed(column.ty, n, cells));
+    }
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
 #[cfg(test)]
@@ -256,7 +408,7 @@ mod tests {
         }];
         let records = vec![rec(None, None, 5), with_attrs];
 
-        let batch = to_record_batch(&records).unwrap();
+        let batch = to_record_batch(&records, &TypedLayout::default()).unwrap();
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.schema().fields().len(), 11);
 
@@ -293,16 +445,122 @@ mod tests {
             );
         }
 
-        let batch = to_record_batch(&[rec(None, None, 1_000)]).unwrap();
+        let batch = to_record_batch(&[rec(None, None, 1_000)], &TypedLayout::default()).unwrap();
         assert_eq!(
             batch.column_by_name("observed").unwrap().data_type(),
             &DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
         );
     }
 
+    fn layout(cols: &[(&str, ColumnType)]) -> TypedLayout {
+        TypedLayout::new(
+            cols.iter()
+                .map(|(k, t)| TypedColumn {
+                    column: typed::column_name(k).unwrap(),
+                    key: k.to_string(),
+                    ty: *t,
+                    service: "svc".into(),
+                    promoted_at: 0,
+                })
+                .collect(),
+        )
+    }
+
+    fn attrs(pairs: Vec<(&str, AttrValue)>) -> Vec<Attr> {
+        pairs.into_iter().map(|(k, v)| Attr { key: k.into(), value: v }).collect()
+    }
+
+    #[test]
+    fn typed_columns_carry_conforming_values_and_the_json_keeps_the_rest() {
+        let layout = layout(&[
+            ("latency_ms", ColumnType::Int64),
+            ("ok", ColumnType::Bool),
+            ("at", ColumnType::Timestamp),
+            ("never_seen", ColumnType::String),
+        ]);
+        let mut a = rec(Some("svc"), None, 1);
+        a.attributes = attrs(vec![
+            ("latency_ms", AttrValue::I64(812)),
+            ("ok", AttrValue::Bool(true)),
+            ("at", AttrValue::Str("2024-05-01T10:00:00.250Z".into())),
+            ("other", AttrValue::Str("kept".into())),
+        ]);
+        let mut b = rec(Some("svc"), None, 2);
+        b.attributes = attrs(vec![
+            // wrong type for the column: stays in the JSON, column is NULL
+            ("latency_ms", AttrValue::Str("slow".into())),
+            // not canonical: stays in the JSON verbatim
+            ("at", AttrValue::Str("2024-05-01T10:00:00+01:00".into())),
+        ]);
+        let c = rec(None, None, 3);
+
+        let batch = to_record_batch(&[a.clone(), b.clone(), c.clone()], &layout).unwrap();
+        let schema = batch.schema();
+        let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(&names[..11], &schema_names()[..]);
+        assert_eq!(&names[11..], &["attr_at", "attr_latency_ms", "attr_ok"], "absent keys get no column");
+
+        let lat = batch.column_by_name("attr_latency_ms").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(lat.value(0), 812);
+        assert!(lat.is_null(1) && lat.is_null(2));
+        let at = batch
+            .column_by_name("attr_at")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .unwrap();
+        assert_eq!(at.value(0), 1_714_557_600_250_000_000);
+        assert_eq!(schema.field_with_name("attr_at").unwrap().data_type(), &ColumnType::Timestamp.arrow_type());
+        assert_eq!(
+            schema.field_with_name("attr_latency_ms").unwrap().metadata().get(typed::FIELD_META_KEY).unwrap(),
+            "latency_ms"
+        );
+
+        let json = batch.column_by_name("attributes").unwrap().as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(json.value(0).contains("other") && !json.value(0).contains("latency_ms"));
+        assert!(json.value(1).contains("slow") && json.value(1).contains("+01:00"));
+        assert!(json.is_null(2));
+
+        // Replay gets every attribute back, typed first then JSON.
+        let back = from_record_batch(&batch);
+        let sorted = |mut v: Vec<Attr>| {
+            v.sort_by(|x, y| x.key.cmp(&y.key));
+            v
+        };
+        assert_eq!(sorted(back[0].attributes.clone()), sorted(a.attributes));
+        assert_eq!(sorted(back[1].attributes.clone()), sorted(b.attributes));
+        assert!(back[2].attributes.is_empty());
+    }
+
+    #[test]
+    fn a_repeated_key_on_one_record_keeps_its_second_value_in_the_json() {
+        let layout = layout(&[("n", ColumnType::Int64)]);
+        let mut r = rec(Some("svc"), None, 1);
+        r.attributes = attrs(vec![("n", AttrValue::I64(1)), ("n", AttrValue::I64(2))]);
+        let batch = to_record_batch(std::slice::from_ref(&r), &layout).unwrap();
+        let back = from_record_batch(&batch);
+        assert_eq!(back[0].attributes, r.attributes);
+    }
+
+    #[test]
+    fn integers_in_a_float_column_replay_as_floats() {
+        let layout = layout(&[("ratio", ColumnType::Float64)]);
+        let mut r = rec(Some("svc"), None, 1);
+        r.attributes = attrs(vec![("ratio", AttrValue::I64(2))]);
+        let back = from_record_batch(&to_record_batch(&[r], &layout).unwrap());
+        assert_eq!(back[0].attributes, attrs(vec![("ratio", AttrValue::F64(2.0))]));
+    }
+
+    fn schema_names() -> Vec<&'static str> {
+        vec![
+            "event_id", "timestamp", "observed", "severity", "severity_text", "body", "service",
+            "trace_id", "span_id", "template_id", "attributes",
+        ]
+    }
+
     #[test]
     fn empty_input_is_a_valid_empty_batch() {
-        let batch = to_record_batch(&[]).unwrap();
+        let batch = to_record_batch(&[], &TypedLayout::default()).unwrap();
         assert_eq!(batch.num_rows(), 0);
     }
 }

@@ -18,6 +18,7 @@ use parquet::file::statistics::Statistics;
 
 use crate::model::LogRecord;
 use crate::schema;
+use crate::typed::{self, TypedColumn, TypedLayout};
 
 /// Rows per row group. Small enough that statistics prune usefully on a
 /// time-bounded query, large enough that dictionary encoding still pays.
@@ -61,10 +62,21 @@ pub fn file_name_for_segment(segment_id: u64, segment_uuid: uuid::Uuid) -> Strin
     format!("s{segment_id:012}-{short}.parquet")
 }
 
-/// Write `records` as one Parquet file at `path`, replacing anything already
-/// there. Caller supplies records already sorted; sorting here would hide the
-/// cost from the merge loop that owns it.
+/// [`write_partition_file_with`] and no typed columns: every attribute in the
+/// JSON. What tests and one-off measurements use.
 pub fn write_partition_file(path: &Path, records: &[LogRecord]) -> Result<FileStats, StoreError> {
+    write_partition_file_with(path, records, &TypedLayout::default())
+}
+
+/// Write `records` as one Parquet file at `path`, replacing anything already
+/// there, with a typed column for every key in `layout` that has a value in
+/// `records`. Caller supplies records already sorted; sorting here would hide
+/// the cost from the merge loop that owns it.
+pub fn write_partition_file_with(
+    path: &Path,
+    records: &[LogRecord],
+    layout: &TypedLayout,
+) -> Result<FileStats, StoreError> {
     let io = |p: &Path| {
         let p = p.to_path_buf();
         move |source| StoreError::Io { path: p.clone(), source }
@@ -75,6 +87,27 @@ pub fn write_partition_file(path: &Path, records: &[LogRecord]) -> Result<FileSt
     }
     let tmp = path.with_extension("parquet.tmp");
 
+    let batch = schema::to_record_batch(records, layout)?;
+    let file_typed: Vec<TypedColumn> = layout
+        .columns()
+        .iter()
+        .filter(|c| batch.schema().column_with_name(&c.column).is_some())
+        .cloned()
+        .collect();
+
+    let mut kv = vec![KeyValue::new(
+        "logless.schema_version".to_string(),
+        schema::SCHEMA_VERSION.to_string(),
+    )];
+    if !file_typed.is_empty() {
+        // For readers that never look at the embedded Arrow schema: the
+        // column → key → type map, plus the service charged for it.
+        kv.push(KeyValue::new(
+            typed::FILE_META_KEY.to_string(),
+            serde_json::to_string(&file_typed).unwrap_or_default(),
+        ));
+    }
+
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
@@ -82,10 +115,7 @@ pub fn write_partition_file(path: &Path, records: &[LogRecord]) -> Result<FileSt
         .set_dictionary_enabled(true)
         .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
-        .set_key_value_metadata(Some(vec![KeyValue::new(
-            "logless.schema_version".to_string(),
-            schema::SCHEMA_VERSION.to_string(),
-        )]));
+        .set_key_value_metadata(Some(kv));
 
     // Timestamps are near-monotonic 64-bit integers, which is the case
     // DELTA_BINARY_PACKED exists for: it stores differences, and consecutive
@@ -105,10 +135,9 @@ pub fn write_partition_file(path: &Path, records: &[LogRecord]) -> Result<FileSt
     }
     let props = builder.build();
 
-    let batch = schema::to_record_batch(records)?;
     {
         let file = File::create(&tmp).map_err(io(&tmp))?;
-        let mut writer = ArrowWriter::try_new(file, schema::schema(), Some(props)).map_err(|e| {
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).map_err(|e| {
             StoreError::Parquet { path: tmp.clone(), source: e }
         })?;
         if batch.num_rows() > 0 {
@@ -189,7 +218,29 @@ pub fn read_file_stats(path: &Path) -> Result<FileStats, StoreError> {
     })
 }
 
-/// Every `*.parquet` under `store_dir`, recursively. Skips `.tmp` leftovers.
+/// The typed columns a file declares in its footer (`logless.typed_columns`).
+/// How the catalog's registry is rebuilt, like every other catalog row.
+pub fn read_typed_columns(path: &Path) -> Result<Vec<TypedColumn>, StoreError> {
+    let file = File::open(path).map_err(|source| StoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).map_err(|source| StoreError::Parquet {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let declared = builder
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .and_then(|kv| kv.iter().find(|e| e.key == typed::FILE_META_KEY))
+        .and_then(|e| e.value.as_deref())
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default();
+    Ok(declared)
+}
+
 /// Compressed bytes per column, from the Parquet footer.
 ///
 /// Answers "where is the space actually going" without decoding anything —
@@ -217,6 +268,7 @@ pub fn column_sizes(path: &Path) -> Result<Vec<(String, u64)>, StoreError> {
     Ok(out)
 }
 
+/// Every `*.parquet` under `store_dir`, recursively. Skips `.tmp` leftovers.
 pub fn list_parquet_files(store_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     collect(store_dir, &mut out);
@@ -361,6 +413,41 @@ mod tests {
             "expected >4x on repetitive logs, got {} vs {raw}",
             stats.bytes
         );
+    }
+
+    #[test]
+    fn typed_columns_are_declared_in_the_footer_and_survive_a_read() {
+        use crate::model::{Attr, AttrValue};
+        use crate::typed::{ColumnType, TypedColumn};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("p/s000000000001.parquet");
+        let mut recs = records(100, 0);
+        for (i, r) in recs.iter_mut().enumerate() {
+            r.attributes = vec![Attr { key: "latency_ms".into(), value: AttrValue::I64(i as i64) }];
+        }
+        let col = |key: &str| TypedColumn {
+            column: crate::typed::column_name(key).unwrap(),
+            key: key.into(),
+            ty: ColumnType::Int64,
+            service: "api".into(),
+            promoted_at: 9,
+        };
+        let layout = TypedLayout::new(vec![col("latency_ms"), col("absent")]);
+        write_partition_file_with(&path, &recs, &layout).unwrap();
+
+        assert_eq!(read_typed_columns(&path).unwrap(), vec![col("latency_ms")], "only columns with values");
+        let sizes = column_sizes(&path).unwrap();
+        assert!(sizes.iter().any(|(c, _)| c == "attr_latency_ms"));
+
+        let file = File::open(&path).unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().build().unwrap();
+        let back: Vec<_> = reader.flat_map(|b| schema::from_record_batch(&b.unwrap())).collect();
+        assert_eq!(back.len(), 100);
+        assert_eq!(back[42].attributes, recs[42].attributes);
+
+        // Without a layout nothing is declared.
+        write_partition_file(&path, &recs).unwrap();
+        assert!(read_typed_columns(&path).unwrap().is_empty());
     }
 
     #[test]

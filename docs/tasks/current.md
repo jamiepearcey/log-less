@@ -228,6 +228,13 @@ At 0.4 we were **over-merging badly on every real dataset** — collapsing disti
 
 Two datasets still over-split (Proxifier 3.25×, Apache 2.00×); both are dominated by lines whose only variable part is a path or a duration, which our masker splits more finely than LogHub's ground truth does.
 
+## Typed attribute columns (2026-10-05)
+- [x] Stable, frequent attribute keys promoted to `attr_<key>` columns (int64 / float64 / bool / string / UTC timestamp) in merge and compaction; bounded per service (16) and in total (128); non-conforming values stay in the JSON. Contract: `docs/typed-columns.md`.
+- [x] Registry in the catalog, type never changes, rebuilt from footers (`logless.typed_columns`); `GET /admin/v1/typed-columns`.
+- [x] **Measured** (`typed-columns` bin, 500k synthetic records): predicate bytes 0.035x, predicate time 1.3 ms vs 319 ms, encode 0.75x, file 0.86x; row-group pruning 0/8. The 64-sparse-column shape meant to lose still won.
+- [ ] Row-group pruning on attributes needs clustering by the column or page indexes; not built, not measured.
+- [ ] Parameter columns from unstructured bodies (template parameters) are still not extracted.
+
 ## Known gaps worth stating plainly
 - **The template dictionary is not rebuildable from Parquet.** `catalog --rebuild` restores `files` only; the per-service sightings behind `_meta/templates.pq` (like the templates themselves) live only in the catalog. A lost catalog restarts template ids under a new `agent` id, and rows written before the loss keep ids the new dictionary does not describe.
 - **Rows carry no agent column.** `_meta/templates.pq` names its id space, but a store that mixes files from several agents under one prefix cannot tell their `template_id`s apart; join such stores on `global_id` via each agent's own dictionary, or keep one prefix per agent.

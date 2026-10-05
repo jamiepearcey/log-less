@@ -130,6 +130,8 @@ Note the debug build manages only ~39k lines/s — the target holds only when op
 
 The compression row is the important one and it confirms the reasoning above rather than contradicting it: `template_id` is assigned but `body` is still stored in full, so nothing shrinks yet. Ratio gains need the follow-up step (store template id + parameter columns *instead of* the body text). Templating earns its place today through **structure** — stable ids for novelty detection, rate baselines and Sentry fingerprints.
 
+**Typed predicate pushdown arrived without template parameters** (2026-10-05). The pushdown argument above does not need template parameters: structured sources (OTLP, HEC fields, Sentry tags) already deliver typed attributes. Keys that a service sets on most records with one type are promoted from the `attributes` JSON to `attr_<key>` columns with a type fixed for the life of the store (`docs/typed-columns.md`). Measured on synthetic data: a predicate reads 0.035x the bytes, encoding is 0.75x the cost because less goes through JSON, and min/max row-group pruning is nil under the `(service, trace_id, observed)` sort. Parameter columns extracted from unstructured bodies are still not built.
+
 - **Hard rule**: the architecture must not *depend* on templating. If throughput or stability misses target, fall back to sorted + zstd and lose only the anomaly features.
 
 ## 4. Smart pushdown

@@ -63,13 +63,15 @@ SET s3_access_key_id='YOUR_ACCESS_KEY';
 SET s3_secret_access_key='YOUR_SECRET_KEY';
 
 SELECT *
-FROM read_parquet('s3://logs/**/*.parquet', hive_partitioning=true)
+FROM read_parquet('s3://logs/**/*.parquet', hive_partitioning=true, union_by_name=true)
 WHERE hour = '2026-10-03T14'
 LIMIT 100;
 ```
 
 Filter on `hour` (and `level`) so DuckDB prunes partitions rather than listing
-and opening every file. No performance figures are claimed here.
+and opening every file. `union_by_name=true` is needed because files differ in
+which typed `attr_*` columns they hold (`docs/typed-columns.md`); without it
+DuckDB takes the first file's schema. No performance figures are claimed here.
 
 ## Template dictionary (`_meta/templates.pq`)
 
@@ -108,7 +110,7 @@ CREATE VIEW log_templates AS
   SELECT * FROM read_parquet('s3://logs/_meta/templates.pq');
 
 SELECT t.text, count(*)
-FROM read_parquet('s3://logs/**/*.parquet', hive_partitioning=true) l
+FROM read_parquet('s3://logs/**/*.parquet', hive_partitioning=true, union_by_name=true) l
 JOIN log_templates t
   ON l.template_id = t.template_id AND l.service IS NOT DISTINCT FROM t.service
 WHERE l.hour = '2026-10-03T14'

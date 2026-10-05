@@ -177,7 +177,7 @@ fn write_with(path: &Path, records: &[LogRecord], dictionary: bool, page_bytes: 
         .set_data_page_size_limit(page_bytes)
         .set_max_row_group_row_count(Some(1 << 20))
         .build();
-    let batch = schema::to_record_batch(records).unwrap();
+    let batch = schema::to_record_batch(records, &Default::default()).unwrap();
     let file = std::fs::File::create(path).unwrap();
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
     writer.write(&batch).unwrap();

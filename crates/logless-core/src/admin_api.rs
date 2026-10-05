@@ -302,6 +302,34 @@ impl AdminService {
 
     // --- reads ----------------------------------------------------------
 
+    /// The registered typed attribute columns (`docs/typed-columns.md`), so a
+    /// console can offer typed predicates without reading Parquet footers.
+    pub fn typed_columns(&self) -> Resp {
+        let catalog = match self.catalog() {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+        match catalog.typed_layout() {
+            Ok(layout) => (
+                200,
+                json!({
+                    "columns": layout
+                        .columns()
+                        .iter()
+                        .map(|c| json!({
+                            "column": c.column,
+                            "key": c.key,
+                            "type": c.ty.as_str(),
+                            "service": c.service,
+                            "promoted_at": c.promoted_at,
+                        }))
+                        .collect::<Vec<_>>(),
+                }),
+            ),
+            Err(e) => err(500, "catalog_unavailable", e.to_string()),
+        }
+    }
+
     pub fn info(&self) -> Resp {
         let catalog = match self.catalog() {
             Ok(c) => c,
@@ -723,6 +751,7 @@ impl Handler for Api {
         let if_match = req.header("if-match");
         match (req.method, req.path) {
             (Method::Get, "/admin/v1/info") => reply(s.info()),
+            (Method::Get, "/admin/v1/typed-columns") => reply(s.typed_columns()),
             (Method::Get, "/admin/v1/policies") => etag(s.get_policies()),
             (Method::Put, "/admin/v1/policies") => etag(s.put(if_match, &req.body)),
             (Method::Post, "/admin/v1/policies/preview") => reply(s.preview(&req.body)),
@@ -734,6 +763,7 @@ impl Handler for Api {
             (
                 _,
                 "/admin/v1/info"
+                | "/admin/v1/typed-columns"
                 | "/admin/v1/policies"
                 | "/admin/v1/policies/preview"
                 | "/admin/v1/policies/restore"
@@ -1082,6 +1112,30 @@ mod tests {
     }
 
     // --- reads ----------------------------------------------------------
+
+    #[test]
+    fn typed_columns_lists_the_registry() {
+        let r = rig();
+        let (status, v) = r.call("GET", "/admin/v1/typed-columns", &[], None);
+        assert_eq!(status, 200);
+        assert_eq!(v, json!({"columns": []}));
+
+        let mut cat = Catalog::open(&r.config.catalog_path()).unwrap();
+        cat.register_typed_columns(&[crate::typed::TypedColumn {
+            column: "attr_latency_ms".into(),
+            key: "latency_ms".into(),
+            ty: crate::typed::ColumnType::Int64,
+            service: "api".into(),
+            promoted_at: 7,
+        }])
+        .unwrap();
+        let (_, v) = r.call("GET", "/admin/v1/typed-columns", &[], None);
+        assert_eq!(
+            v["columns"],
+            json!([{"column": "attr_latency_ms", "key": "latency_ms", "type": "int64", "service": "api", "promoted_at": 7}])
+        );
+        assert_eq!(r.call("POST", "/admin/v1/typed-columns", &[], Some(json!({}))).0, 405);
+    }
 
     #[test]
     fn info_reports_the_contract_shape() {
