@@ -20,9 +20,10 @@ use logless_core::drain::{Drain, DrainConfig};
 use logless_core::config::{Config, IngestConfig, LevelBuckets, PushdownConfig, StorageConfig};
 use logless_core::model::{LevelClass, LogRecord, Severity};
 use logless_core::policy::PolicyHandle;
-use logless_core::forward::{Dispatch, ForwardStats, Forwarder, HttpTransport, Outbound};
+use logless_core::forward::{Destination, Dispatch, ForwardStats, Forwarder, HttpTransport, Outbound};
 use logless_core::ring::{Capture, ContextLine, ContextWindow, KeyTier, Ring, RingConfig, Suppressed};
 use logless_core::hec::{self, Admitted};
+use logless_core::sync;
 use logless_core::s3_serve;
 use logless_core::sentry;
 use logless_core::otlp::{self, Accepted};
@@ -55,6 +56,8 @@ const HEC_BATCHES_PER_PASS: usize = 32;
 /// path. Each batch is one envelope's worth of items, so this is deeper in
 /// events than it looks.
 const SENTRY_PENDING_BATCHES: usize = 256;
+const PEER_PENDING_BATCHES: usize = 256;
+const PEER_BATCHES_PER_PASS: usize = 32;
 const SENTRY_BATCHES_PER_PASS: usize = 32;
 
 /// Forwarder results, published back to the main thread at shutdown.
@@ -126,6 +129,12 @@ enum Command {
         /// Listen address for the S3 endpoint, overriding `serve_s3.addr`.
         #[arg(long)]
         serve_s3_addr: Option<String>,
+        /// Accept records from other log-less instances, overriding `peer.enabled`.
+        #[arg(long)]
+        peer: bool,
+        /// Listen address for the peer endpoint, overriding `peer.addr`.
+        #[arg(long)]
+        peer_addr: Option<String>,
         /// Act as a Sentry ingest proxy, overriding `sentry.enabled`.
         #[arg(long)]
         sentry: bool,
@@ -290,6 +299,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 serve_s3: s3_serve::S3ServeConfig::default(),
                 admin: admin_api::AdminConfig::default(),
                 sentry: sentry::SentryConfig::default(),
+                peer: logless_core::peer::PeerConfig::default(),
                 tail: Vec::new(),
                 destinations: Vec::new(),
             };
@@ -310,6 +320,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             hec_addr,
             serve_s3,
             serve_s3_addr,
+            peer,
+            peer_addr,
             sentry: sentry_proxy,
             sentry_addr,
             pushdown_out,
@@ -336,6 +348,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(addr) = hec_addr {
                 config.hec.enabled = true;
                 config.hec.addr = addr;
+            }
+            if peer {
+                config.peer.enabled = true;
+            }
+            if let Some(addr) = peer_addr {
+                config.peer.enabled = true;
+                config.peer.addr = addr;
             }
             if serve_s3 {
                 config.serve_s3.enabled = true;
@@ -746,6 +765,21 @@ fn serve(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Where peer sync starts: the admin API's saved settings if there are any, otherwise the first
+/// `[[destinations]]` of `type = "logless"`.
+fn initial_sync_target(config: &Config, store: &sync::SyncStore) -> Option<sync::SyncTarget> {
+    if let Some((settings, token)) = store.load() {
+        return (settings.enabled && !settings.url.is_empty())
+            .then(|| sync::SyncTarget { url: settings.url, token, min_severity: settings.min_severity });
+    }
+    config.destinations.iter().find_map(|d| match d {
+        Destination::Logless { url, token, min_severity } => {
+            Some(sync::SyncTarget { url: url.clone(), token: token.clone(), min_severity: *min_severity })
+        }
+        _ => None,
+    })
+}
+
 fn run(
     config: &Config,
     max_records: u64,
@@ -792,10 +826,13 @@ fn run(
     // and count it, exactly as the ingest queue sheds.
     let (outbound_tx, outbound_rx) = crossbeam_channel::bounded::<Outbound>(4096);
     let dispatch_stats = Arc::new(Mutex::new(ForwardSummary::default()));
-    let forwarder_thread = if config.destinations.is_empty() {
+    // A log-less peer is fed by the streaming sender above, not by the curated forwarders.
+    let curated_destinations: Vec<Destination> =
+        config.destinations.iter().filter(|d| !matches!(d, Destination::Logless { .. })).cloned().collect();
+    let forwarder_thread = if curated_destinations.is_empty() {
         None
     } else {
-        let destinations = config.destinations.clone();
+        let destinations = curated_destinations.clone();
         let summary = Arc::clone(&dispatch_stats);
         // Curated events are spooled before they are dispatched, so a restart
         // resumes where delivery stopped instead of re-sending everything or
@@ -903,6 +940,15 @@ fn run(
     // another thread while the record path owns the plain counter.
     let refused_debug_pressure = Arc::new(AtomicU64::new(0));
 
+    // Peer sync. The tap sits behind the WAL writer, so it sees exactly what the agent accepted and
+    // costs one atomic load per batch while no peer is configured.
+    let instance_id = logless_core::peer::instance_id(&config.storage.data_dir);
+    let sync_store = sync::SyncStore::new(config.storage.data_dir.clone());
+    let sync_control = sync::SyncControl::new(instance_id.clone(), sync_store.clone(), initial_sync_target(config, &sync_store));
+    let (sync_tap, sync_rx) = sync::channel(Arc::clone(&sync_control));
+    let writer_tap = sync_tap.clone();
+    drop(sync_tap);
+
     let writer = {
         let stop = Arc::clone(&stop);
         let active = Arc::clone(&active_segment);
@@ -927,6 +973,7 @@ fn run(
                     );
                     if !batch.is_empty() {
                         w.append(&batch)?;
+                        writer_tap.offer(&batch);
                         active.store(w.current_segment_id(), Ordering::Relaxed);
                     }
                     // Publish only after a sync actually happened: this is the
@@ -939,6 +986,7 @@ fn run(
                         let tail = consumer.drain();
                         if !tail.is_empty() {
                             w.append(&tail)?;
+                            writer_tap.offer(&tail);
                         }
                         w.sync()?;
                         synced.store(w.records_written, Ordering::Release);
@@ -946,6 +994,14 @@ fn run(
                     }
                 }
             })?
+    };
+
+    // Ends when the writer (the only holder of the tap) is gone and the tap is empty.
+    let sync_thread = {
+        let control = Arc::clone(&sync_control);
+        let spool_dir = config.storage.data_dir.join(sync::SPOOL_DIR);
+        let never = Arc::new(AtomicBool::new(false));
+        std::thread::Builder::new().name("logless-sync".into()).spawn(move || sync::run(control, sync_rx, &spool_dir, &never))?
     };
 
     // One variable with one meaning, not two flags: the maintainer must both
@@ -1077,6 +1133,9 @@ fn run(
         if config.sentry.enabled {
             listen("sentry", &config.sentry.addr);
         }
+        if config.peer.enabled {
+            listen("peer", &config.peer.addr);
+        }
         let service = AdminService::new(
             config,
             startup,
@@ -1088,12 +1147,45 @@ fn run(
             },
             listeners,
         );
+        service.set_sync(Arc::clone(&sync_control));
         let server = AdminServer::start(&config.admin, service)?;
         tracing::info!(addr = %server.local_addr(), "admin api listening");
         Some(server)
     } else {
         None
     };
+
+    // Records from other log-less instances take the same road as the other receivers: a bounded
+    // channel into the main loop (a full one is a 503 and the sender retries), then templating and the
+    // queue. They keep the sender's observed time and event id, so partitions and dedupe stay right.
+    let (peer_tx, peer_rx) = if config.peer.enabled {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<LogRecord>>(PEER_PENDING_BATCHES);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let mut peer_receiver = match (&peer_tx, config.peer.enabled) {
+        (Some(tx), true) => {
+            let tx = tx.clone();
+            let queue_capacity = config.ingest.queue_capacity;
+            let queue_for_room = Arc::clone(&queue);
+            let mut peer_config = config.peer.clone();
+            peer_config.advertise_s3 = config.serve_s3.enabled;
+            Some(logless_core::peer::Receiver::start(&peer_config, instance_id.clone(), move |records| {
+                // Refuse rather than shed: the sender holds the batch and retries, which is the right answer
+                // to a peer that is outrunning us, and a shed record would be one the peer already forgot.
+                if queue_capacity.saturating_sub(queue_for_room.len()) < records.len() {
+                    return logless_core::peer::Admitted::Busy;
+                }
+                match tx.try_send(records) {
+                    Ok(()) => logless_core::peer::Admitted::Accepted,
+                    Err(_) => logless_core::peer::Admitted::Busy,
+                }
+            })?)
+        }
+        _ => None,
+    };
+    drop(peer_tx);
 
     // The Sentry proxy has its own channel: unlike the log receivers it carries
     // whole envelopes, and the records it produces are a *copy* for the local
@@ -1257,7 +1349,7 @@ fn run(
         !(max_records > 0 && *count >= max_records)
     };
 
-    if tail_paths.is_empty() && config.tail.is_empty() && otlp_rx.is_none() && hec_rx.is_none() && sentry_rx.is_none() {
+    if tail_paths.is_empty() && config.tail.is_empty() && otlp_rx.is_none() && hec_rx.is_none() && sentry_rx.is_none() && peer_rx.is_none() {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             if stop.load(Ordering::Relaxed) {
@@ -1338,6 +1430,10 @@ fn run(
             wired = true;
         }
         if let Some(rx) = &sentry_rx {
+            selector.recv(rx);
+            wired = true;
+        }
+        if let Some(rx) = &peer_rx {
             selector.recv(rx);
             wired = true;
         }
@@ -1470,6 +1566,34 @@ fn run(
                 }
             }
 
+            if let Some(rx) = &peer_rx {
+                for _ in 0..PEER_BATCHES_PER_PASS {
+                    let Ok(records) = rx.try_recv() else { break };
+                    idle = false;
+                    for record in records {
+                        let raw_len = record.body.len() as u64 + 1;
+                        if !process(
+                            record,
+                            raw_len,
+                            &mut raw_bytes_seen,
+                            &mut count,
+                            &mut refused_debug,
+                            &mut windows,
+                            &mut errors_forwarded,
+                            &mut outbound_dropped,
+                            &mut ring,
+                            &mut pushdown_sink,
+                        ) {
+                            done = true;
+                            break;
+                        }
+                    }
+                    if done {
+                        break;
+                    }
+                }
+            }
+
             // Check for shutdown every pass, not only when idle: a busy source
             // would otherwise keep the agent alive indefinitely through a
             // SIGTERM, and systemd would escalate to SIGKILL.
@@ -1498,6 +1622,20 @@ fn run(
 
     // Stop accepting before the WAL writer is told to finish, so nothing is
     // admitted after the queue is closed. In-flight requests complete first.
+    if let Some(r) = peer_receiver.take() {
+        let s = r.shutdown();
+        tracing::info!(
+            requests = s.requests,
+            records = s.records,
+            accepted = s.accepted,
+            duplicates = s.duplicates,
+            loops = s.loops,
+            busy_503 = s.busy,
+            unauthorized = s.unauthorized,
+            bad_request = s.bad_request,
+            "peer receiver stopped"
+        );
+    }
     if let Some(r) = sentry_receiver.take() {
         let upstream = r.upstream_stats();
         let s = r.shutdown();
@@ -1568,6 +1706,19 @@ fn run(
     stop.store(true, Ordering::Relaxed);
     drop(queue);
     let written = writer.join().map_err(|_| "wal writer panicked")??;
+    // The writer held the only tap, so the sender now drains what is left and ends.
+    let _ = sync_thread.join();
+    let sync_status = sync_control.status();
+    if sync_status.state != "off" {
+        tracing::info!(
+            peer = sync_status.peer.as_deref().unwrap_or(""),
+            sent = sync_status.sent_records,
+            duplicates = sync_status.duplicates,
+            dropped = sync_status.dropped_records,
+            backlog_bytes = sync_status.backlog_bytes,
+            "peer sync stopped"
+        );
+    }
     // Only now is the last segment safe to merge. Release pairs with the
     // maintainer's Acquire so it cannot see the phase change without also
     // seeing everything the writer did.

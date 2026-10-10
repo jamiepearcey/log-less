@@ -46,6 +46,10 @@ pub struct Config {
     /// Sentry ingest proxy: your SDK keeps its DSN, only the host changes.
     #[serde(default)]
     pub sentry: crate::sentry::SentryConfig,
+    /// The listener other log-less instances send to (`GET /.well-known/logless`, `POST /v1/ingest`).
+    /// Off by default. To send TO another instance, add a `[[destinations]]` of `type = "logless"`.
+    #[serde(default)]
+    pub peer: crate::peer::PeerConfig,
     /// File tailing sources (`[[tail]]`). Combined with any `--tail` flags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail: Vec<crate::tail::TailSource>,
@@ -421,6 +425,7 @@ mod tests {
             serve_s3: crate::s3_serve::S3ServeConfig::default(),
             admin: crate::admin_api::AdminConfig::default(),
             sentry: crate::sentry::SentryConfig::default(),
+            peer: crate::peer::PeerConfig::default(),
             tail: Vec::new(),
             destinations: Vec::new(),
         })

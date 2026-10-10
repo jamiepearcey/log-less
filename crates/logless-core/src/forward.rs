@@ -174,6 +174,21 @@ pub enum Destination {
         #[serde(default = "default_aggregate")]
         aggregate: bool,
     },
+    /// Another log-less instance, addressed by one URL. The peer is both collector and forwarder, so
+    /// this one destination stands for everything that instance accepts: records stream to its native
+    /// ingest endpoint (`peer.rs`), and what it can also do (serve the store, answer a scan) it
+    /// advertises at `/.well-known/logless`. Delivery is the streaming sender in `sync.rs`, not this
+    /// module's curated-window forwarders, so [`Forwarder`] has nothing to do for it.
+    Logless {
+        /// The peer's base URL, e.g. `https://central.example.com:9300`.
+        url: String,
+        /// Bearer token the peer's `[peer] tokens` accepts. Absent for a loopback peer without tokens.
+        #[serde(default)]
+        token: Option<String>,
+        /// Only records at or above this OTel severity are sent (`0` sends everything).
+        #[serde(default)]
+        min_severity: u8,
+    },
 }
 
 fn default_aggregate() -> bool {
@@ -192,6 +207,7 @@ impl Destination {
         match self {
             Destination::Sentry { .. } => "sentry",
             Destination::SplunkHec { .. } => "splunk",
+            Destination::Logless { .. } => "logless",
         }
     }
 
@@ -224,6 +240,10 @@ impl Destination {
                     ("Content-Type".into(), "application/json".into()),
                 ],
             )),
+            Destination::Logless { .. } => Err(ForwardError::Transport {
+                destination: "logless".into(),
+                message: "a log-less peer is fed by the streaming sender, not the curated forwarders".into(),
+            }),
         }
     }
 }
@@ -353,6 +373,8 @@ impl Forwarder {
         let body = match &self.destination {
             Destination::Sentry { .. } => sentry_envelope(window),
             Destination::SplunkHec { .. } => splunk_event(window),
+            // Streamed by `sync.rs` with everything else; nothing curated to add here.
+            Destination::Logless { .. } => return Ok(()),
         };
         self.post(body.as_bytes())?;
         self.stats.events_sent += 1;
@@ -372,6 +394,7 @@ impl Forwarder {
         let body = match &self.destination {
             Destination::Sentry { .. } => sentry_envelope(&stripped),
             Destination::SplunkHec { .. } => splunk_event(&stripped),
+            Destination::Logless { .. } => return Ok(()),
         };
         let _ = reason;
         self.post(body.as_bytes())?;
@@ -380,6 +403,9 @@ impl Forwarder {
     }
 
     pub fn send_aggregate(&mut self, rollup: &Rollup) -> Result<(), ForwardError> {
+        if matches!(self.destination, Destination::Logless { .. }) {
+            return Ok(());
+        }
         let body = splunk_aggregate(rollup);
         self.post(body.as_bytes())?;
         self.stats.aggregates_sent += 1;

@@ -9,7 +9,7 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -149,6 +149,8 @@ pub struct AdminService {
     /// state mutex is never held across a scan, so reads stay instant.
     /// Previews that find it taken get 429; writers queue behind it.
     scan_gate: Mutex<()>,
+    /// Peer sync, set once the sender exists (`set_sync`). Absent in a process that has none.
+    sync: OnceLock<Arc<crate::sync::SyncControl>>,
 }
 
 type Resp = (u16, Value);
@@ -163,6 +165,30 @@ fn problems_resp(problems: Vec<Problem>) -> Resp {
 
 fn now_ms() -> u64 {
     crate::now_unix_nanos() / 1_000_000
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncBody {
+    enabled: bool,
+    #[serde(default)]
+    url: String,
+    /// Write-only. Absent keeps the stored one.
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    clear_token: bool,
+    #[serde(default)]
+    min_severity: Option<u8>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct SyncTestBody {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -278,7 +304,132 @@ impl AdminService {
                 effective: start.effective,
             }),
             scan_gate: Mutex::new(()),
+            sync: OnceLock::new(),
         })
+    }
+
+    /// Hands the service the peer sync controls, which `/admin/v1/sync` reads and edits.
+    pub fn set_sync(&self, control: Arc<crate::sync::SyncControl>) {
+        let _ = self.sync.set(control);
+    }
+
+    fn sync_control(&self) -> Result<&Arc<crate::sync::SyncControl>, Resp> {
+        self.sync.get().ok_or_else(|| err(404, "sync_unavailable", "peer sync is not running in this process"))
+    }
+
+    /// `GET /admin/v1/sync`: where records go, and how it is going. The token is never returned.
+    pub fn sync_get(&self) -> Resp {
+        let control = match self.sync_control() {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+        let source = if control.store().load().is_some() {
+            "admin"
+        } else if control.target().is_some() {
+            "config"
+        } else {
+            "none"
+        };
+        (200, json!({ "source": source, "instance_id": control.instance(), "status": control.status() }))
+    }
+
+    /// `PUT /admin/v1/sync`: set the peer. Applies to the running sender at once and is kept in the data
+    /// dir, where it outranks the config file's destination.
+    pub fn sync_put(&self, body: &[u8]) -> Resp {
+        let control = match self.sync_control() {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+        let req: SyncBody = match serde_json::from_slice(body) {
+            Ok(b) => b,
+            Err(e) => return err(400, "bad_request", format!("the body is not a sync request: {e}")),
+        };
+        let invalid = |m: String| (422, json!({"error": "validation_failed", "message": m}));
+        let url = req.url.trim();
+        let clean_url = if url.is_empty() {
+            if req.enabled {
+                return invalid("Enter the peer's URL to turn sync on.".into());
+            }
+            String::new()
+        } else {
+            match crate::sync::check_url(url) {
+                Ok(u) => u,
+                Err(m) => return invalid(m),
+            }
+        };
+        let min_severity = req.min_severity.unwrap_or(0);
+        if min_severity > 24 {
+            return invalid("min_severity is an OpenTelemetry severity number, 0 to 24.".into());
+        }
+        let stored = control.store().load().and_then(|(_, t)| t);
+        let current = control.target().and_then(|t| t.token);
+        let (change, token) = if req.clear_token {
+            (crate::sync::TokenChange::Clear, None)
+        } else if let Some(t) = req.token.as_deref().filter(|t| !t.is_empty()) {
+            if t.chars().count() > 4096 || t.chars().any(char::is_control) {
+                return invalid("A token is at most 4096 characters, without control characters.".into());
+            }
+            (crate::sync::TokenChange::Set(t.to_string()), Some(t.to_string()))
+        } else {
+            // Kept: the token saved by the admin API, else the one the config file supplied (which is then
+            // adopted into the admin copy so the two cannot disagree later).
+            let keep = stored.or(current);
+            let change = keep.clone().map_or(crate::sync::TokenChange::Keep, crate::sync::TokenChange::Set);
+            (change, keep)
+        };
+        let settings = crate::sync::SyncSettings {
+            enabled: req.enabled && !clean_url.is_empty(),
+            url: clean_url.clone(),
+            min_severity,
+            updated_at_ms: now_ms(),
+        };
+        if let Err(e) = control.store().save(&settings, change) {
+            return err(500, "persist_failed", format!("could not save the sync settings: {e}"));
+        }
+        control.set_target(
+            settings
+                .enabled
+                .then(|| crate::sync::SyncTarget { url: clean_url, token, min_severity }),
+        );
+        self.sync_get()
+    }
+
+    /// `POST /admin/v1/sync/test`: asks a peer (the one given, or the current one) what it is.
+    pub fn sync_test(&self, body: &[u8]) -> Resp {
+        let control = match self.sync_control() {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+        let req: SyncTestBody = if body.iter().all(u8::is_ascii_whitespace) {
+            SyncTestBody::default()
+        } else {
+            match serde_json::from_slice(body) {
+                Ok(b) => b,
+                Err(e) => return err(400, "bad_request", format!("the body is not a sync test request: {e}")),
+            }
+        };
+        let current = control.target();
+        let url = match (req.url.as_deref().map(str::trim).filter(|u| !u.is_empty()), &current) {
+            (Some(u), _) => u.to_string(),
+            (None, Some(c)) => c.url.clone(),
+            (None, None) => return (422, json!({"error": "validation_failed", "message": "Enter a URL to test."})),
+        };
+        // The saved token goes only to the URL it was saved for: testing a new address must not send it there.
+        let same_as_current = current.as_ref().is_some_and(|c| crate::sync::check_url(&url).ok().as_deref() == Some(c.url.as_str()));
+        let token = match req.token.as_deref().filter(|t| !t.is_empty()) {
+            Some(t) => Some(t.to_string()),
+            None if same_as_current => current.as_ref().and_then(|c| c.token.clone()),
+            None => None,
+        };
+        match crate::sync::probe(&url, token.as_deref()) {
+            Ok(outcome) => {
+                if same_as_current {
+                    control.record_probe(outcome.capabilities.clone());
+                }
+                (200, json!({ "ok": true, "result": outcome }))
+            }
+            Err(message) => (200, json!({ "ok": false, "error": message })),
+        }
     }
 
     pub fn add_listener(&self, kind: &str, addr: String) {
@@ -756,6 +907,9 @@ impl Handler for Api {
             (Method::Put, "/admin/v1/policies") => etag(s.put(if_match, &req.body)),
             (Method::Post, "/admin/v1/policies/preview") => reply(s.preview(&req.body)),
             (Method::Post, "/admin/v1/policies/restore") => etag(s.restore(if_match, &req.body)),
+            (Method::Get, "/admin/v1/sync") => reply(s.sync_get()),
+            (Method::Put, "/admin/v1/sync") => reply(s.sync_put(&req.body)),
+            (Method::Post, "/admin/v1/sync/test") => reply(s.sync_test(&req.body)),
             (Method::Get, "/admin/v1/policies/history") => match query_limit(req.query) {
                 Ok(n) => reply(s.history(n)),
                 Err(r) => reply(r),
@@ -767,7 +921,9 @@ impl Handler for Api {
                 | "/admin/v1/policies"
                 | "/admin/v1/policies/preview"
                 | "/admin/v1/policies/restore"
-                | "/admin/v1/policies/history",
+                | "/admin/v1/policies/history"
+                | "/admin/v1/sync"
+                | "/admin/v1/sync/test",
             ) => reply(err(405, "method_not_allowed", "wrong method for this path")),
             _ => reply(err(404, "not_found", "no such admin endpoint")),
         }
@@ -1741,5 +1897,109 @@ mod tests {
         let (_, v) = r.put(0, &doc, false);
         assert_eq!(v["effective"]["ingest"]["queue_capacity"], 2048);
         assert_eq!(v["running"]["ingest.queue_capacity"], 65_536);
+    }
+
+    // ---- peer sync ----------------------------------------------------------------------
+
+    fn rig_with_sync() -> Rig {
+        let r = rig();
+        let control = crate::sync::SyncControl::new("edge".into(), crate::sync::SyncStore::new(r.tmp.path()), None);
+        r.service.set_sync(control);
+        r
+    }
+
+    fn start_peer(tokens: Vec<String>) -> crate::peer::Receiver {
+        crate::peer::Receiver::start(
+            &crate::peer::PeerConfig { enabled: true, addr: "127.0.0.1:0".into(), tokens, ..Default::default() },
+            "central".into(),
+            |_| crate::peer::Admitted::Accepted,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sync_is_off_until_a_peer_is_set_and_without_the_controls_it_is_404() {
+        assert_eq!(404, rig().call("GET", "/admin/v1/sync", &[], None).0);
+        let r = rig_with_sync();
+        let (status, v) = r.call("GET", "/admin/v1/sync", &[], None);
+        assert_eq!(200, status);
+        assert_eq!(("none", "off"), (v["source"].as_str().unwrap(), v["status"]["state"].as_str().unwrap()));
+        assert_eq!("edge", v["instance_id"]);
+    }
+
+    #[test]
+    fn setting_a_peer_applies_at_once_is_kept_and_never_returns_the_token() {
+        let r = rig_with_sync();
+        let (status, v) = r.call(
+            "PUT",
+            "/admin/v1/sync",
+            &[],
+            Some(json!({"enabled": true, "url": "https://central.example.com:9300/ignored/path", "token": "SENTINEL-TOKEN", "min_severity": 13})),
+        );
+        assert_eq!(200, status, "{v}");
+        assert!(!v.to_string().contains("SENTINEL-TOKEN") && !v.to_string().contains("ignored"), "{v}");
+        assert_eq!("admin", v["source"]);
+        assert_eq!("https://central.example.com:9300", v["status"]["peer"]);
+        assert_eq!((true, 13), (v["status"]["has_token"].as_bool().unwrap(), v["status"]["min_severity"].as_u64().unwrap()));
+        let saved = r.service.sync.get().unwrap().store().load().unwrap();
+        assert_eq!(("https://central.example.com:9300/ignored/path".to_string(), Some("SENTINEL-TOKEN".to_string())), (saved.0.url, saved.1));
+        // Saving again without a token keeps the stored one.
+        let (_, v) = r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": true, "url": "https://central.example.com:9300"})));
+        assert!(v["status"]["has_token"].as_bool().unwrap());
+        // Turning it off keeps the settings but stops sending.
+        let (_, v) = r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": false, "url": "https://central.example.com:9300"})));
+        assert_eq!("off", v["status"]["state"]);
+    }
+
+    #[test]
+    fn a_bad_peer_url_or_severity_is_a_422_that_says_why() {
+        let r = rig_with_sync();
+        for body in [
+            json!({"enabled": true, "url": ""}),
+            json!({"enabled": true, "url": "ftp://x"}),
+            json!({"enabled": true, "url": "https://u:p@x"}),
+            json!({"enabled": true, "url": "https://x", "min_severity": 99}),
+        ] {
+            let (status, v) = r.call("PUT", "/admin/v1/sync", &[], Some(body.clone()));
+            assert_eq!(422, status, "{body}: {v}");
+            assert!(v["message"].is_string(), "{v}");
+        }
+        assert_eq!(400, r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": true, "bogus": 1}))).0);
+    }
+
+    #[test]
+    fn the_test_endpoint_reads_a_real_peer_and_explains_a_wrong_token() {
+        let r = rig_with_sync();
+        let peer = start_peer(vec!["good".into()]);
+        let url = format!("http://{}", peer.local_addr());
+        let (status, v) = r.call("POST", "/admin/v1/sync/test", &[], Some(json!({"url": url, "token": "good"})));
+        assert_eq!(200, status);
+        assert_eq!(true, v["ok"], "{v}");
+        assert_eq!("central", v["result"]["capabilities"]["instance_id"]);
+        assert_eq!(true, v["result"]["accepts_native"]);
+        let (_, v) = r.call("POST", "/admin/v1/sync/test", &[], Some(json!({"url": url, "token": "bad"})));
+        assert_eq!(false, v["ok"]);
+        assert!(v["error"].as_str().unwrap().contains("refused"), "{v}");
+        let (_, v) = r.call("POST", "/admin/v1/sync/test", &[], Some(json!({"url": "http://127.0.0.1:1"})));
+        assert_eq!(false, v["ok"]);
+        assert_eq!(422, r.call("POST", "/admin/v1/sync/test", &[], None).0, "no URL and no current peer");
+        peer.shutdown();
+    }
+
+    #[test]
+    fn a_saved_token_is_never_sent_to_a_different_address() {
+        let r = rig_with_sync();
+        let good = start_peer(vec!["tok".into()]);
+        let good_url = format!("http://{}", good.local_addr());
+        r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": true, "url": good_url, "token": "tok"})));
+        // The current URL, no token given: the saved one is used and the peer accepts it.
+        assert_eq!(true, r.call("POST", "/admin/v1/sync/test", &[], Some(json!({}))).1["ok"]);
+        // A different address: the saved token must not go with it, so the peer (which wants one) says so.
+        let other = start_peer(vec!["tok".into()]);
+        let (_, v) = r.call("POST", "/admin/v1/sync/test", &[], Some(json!({"url": format!("http://{}", other.local_addr())})));
+        assert_eq!(false, v["ok"]);
+        assert!(v["error"].as_str().unwrap().contains("wants a token"), "{v}");
+        good.shutdown();
+        other.shutdown();
     }
 }
