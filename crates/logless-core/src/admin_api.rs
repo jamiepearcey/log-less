@@ -171,8 +171,10 @@ fn now_ms() -> u64 {
 #[serde(deny_unknown_fields)]
 struct SyncBody {
     enabled: bool,
+    /// Absent keeps the saved peer's URL (the API never returns it, so a client cannot send it back); an
+    /// empty string clears it.
     #[serde(default)]
-    url: String,
+    url: Option<String>,
     /// Write-only. Absent keeps the stored one.
     #[serde(default)]
     token: Option<String>,
@@ -345,7 +347,14 @@ impl AdminService {
             Err(e) => return err(400, "bad_request", format!("the body is not a sync request: {e}")),
         };
         let invalid = |m: String| (422, json!({"error": "validation_failed", "message": m}));
-        let url = req.url.trim();
+        let saved_url = control
+            .store()
+            .load()
+            .map(|(settings, _)| settings.url)
+            .filter(|u| !u.is_empty())
+            .or_else(|| control.target().map(|t| t.url))
+            .unwrap_or_default();
+        let url = req.url.as_deref().map_or(saved_url.as_str(), str::trim);
         let clean_url = if url.is_empty() {
             if req.enabled {
                 return invalid("Enter the peer's URL to turn sync on.".into());
@@ -1949,6 +1958,14 @@ mod tests {
         // Turning it off keeps the settings but stops sending.
         let (_, v) = r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": false, "url": "https://central.example.com:9300"})));
         assert_eq!("off", v["status"]["state"]);
+        // No URL in the body keeps the saved one: the API never returns it, so a client cannot resend it.
+        let (status, v) = r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": true, "min_severity": 17})));
+        assert_eq!(200, status, "{v}");
+        assert_eq!(("https://central.example.com:9300", 17), (v["status"]["peer"].as_str().unwrap(), v["status"]["min_severity"].as_u64().unwrap()));
+        assert_eq!("https://central.example.com:9300", r.service.sync.get().unwrap().store().load().unwrap().0.url);
+        // An empty URL clears it.
+        let (_, v) = r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": false, "url": ""})));
+        assert!(v["status"]["peer"].is_null());
     }
 
     #[test]

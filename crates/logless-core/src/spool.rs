@@ -214,6 +214,12 @@ impl Spool {
         Ok(total)
     }
 
+    /// Bytes not yet delivered: what is on disk after the committed cursor. Whole segments behind the
+    /// cursor are already gone, so this is the total less the consumed part of the first one.
+    pub fn pending_bytes(&self) -> Result<u64, SpoolError> {
+        Ok(self.total_bytes()?.saturating_sub(self.cursor.offset))
+    }
+
     pub fn is_empty(&self) -> Result<bool, SpoolError> {
         Ok(self.peek(1)?.is_empty())
     }

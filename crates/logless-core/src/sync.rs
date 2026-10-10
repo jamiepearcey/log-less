@@ -483,7 +483,7 @@ pub fn run(control: Arc<SyncControl>, rx: Receiver<Arc<Vec<LogRecord>>>, spool_d
             }
         }
         control.update(|s| {
-            s.backlog_bytes = spool.total_bytes().unwrap_or(0);
+            s.backlog_bytes = spool.pending_bytes().unwrap_or(0);
             s.queued_batches = rx.len();
         });
         if (stopping || disconnected) && rx.is_empty() {
@@ -660,6 +660,7 @@ mod tests {
         let status = run.control.status();
         assert_eq!("ok", status.state);
         wait_for("counted", || run.control.status().sent_records == 1);
+        wait_for("an empty backlog", || run.control.status().backlog_bytes == 0);
         run.finish();
         p.receiver.shutdown();
     }
