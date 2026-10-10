@@ -770,12 +770,22 @@ fn serve(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 fn initial_sync_target(config: &Config, store: &sync::SyncStore) -> Option<sync::SyncTarget> {
     if let Some((settings, token)) = store.load() {
         return (settings.enabled && !settings.url.is_empty())
-            .then(|| sync::SyncTarget { url: settings.url, token, min_severity: settings.min_severity });
+            .then(|| sync::SyncTarget {
+                url: settings.url,
+                token,
+                min_severity: settings.min_severity,
+                fidelity: settings.fidelity.clamp(1, 100),
+                anomaly_boost: settings.anomaly_boost,
+            });
     }
     config.destinations.iter().find_map(|d| match d {
-        Destination::Logless { url, token, min_severity } => {
-            Some(sync::SyncTarget { url: url.clone(), token: token.clone(), min_severity: *min_severity })
-        }
+        Destination::Logless { url, token, min_severity, fidelity, anomaly_boost } => Some(sync::SyncTarget {
+            url: url.clone(),
+            token: token.clone(),
+            min_severity: *min_severity,
+            fidelity: (*fidelity).clamp(1, 100),
+            anomaly_boost: *anomaly_boost,
+        }),
         _ => None,
     })
 }
@@ -945,6 +955,7 @@ fn run(
     let instance_id = logless_core::peer::instance_id(&config.storage.data_dir);
     let sync_store = sync::SyncStore::new(config.storage.data_dir.clone());
     let sync_control = sync::SyncControl::new(instance_id.clone(), sync_store.clone(), initial_sync_target(config, &sync_store));
+    sync_control.set_store_dir(config.store_dir());
     let (sync_tap, sync_rx) = sync::channel(Arc::clone(&sync_control));
     let writer_tap = sync_tap.clone();
     drop(sync_tap);
@@ -1001,7 +1012,12 @@ fn run(
         let control = Arc::clone(&sync_control);
         let spool_dir = config.storage.data_dir.join(sync::SPOOL_DIR);
         let never = Arc::new(AtomicBool::new(false));
-        std::thread::Builder::new().name("logless-sync".into()).spawn(move || sync::run(control, sync_rx, &spool_dir, &never))?
+        // Templates the catalog already knows are not novel to the anomaly logic after a restart.
+        let known: Vec<u64> = Catalog::open(&catalog_path(config))
+            .and_then(|c| c.load_templates())
+            .map(|t| t.into_iter().map(|t| t.id).collect())
+            .unwrap_or_default();
+        std::thread::Builder::new().name("logless-sync".into()).spawn(move || sync::run(control, sync_rx, &spool_dir, &never, known))?
     };
 
     // One variable with one meaning, not two flags: the maintainer must both

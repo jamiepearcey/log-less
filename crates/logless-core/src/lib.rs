@@ -30,6 +30,7 @@ pub mod schema;
 pub mod counters;
 pub mod spool;
 pub mod sync;
+pub mod sync_policy;
 pub mod sentry;
 pub mod store;
 pub mod tail;

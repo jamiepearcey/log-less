@@ -188,7 +188,18 @@ pub enum Destination {
         /// Only records at or above this OTel severity are sent (`0` sends everything).
         #[serde(default)]
         min_severity: u8,
+        /// 1 to 100: the percentage of records below errors that are sent in full. Errors and fatals always
+        /// are, and what is left out is counted exactly (`sync_policy.rs`).
+        #[serde(default = "default_fidelity")]
+        fidelity: u8,
+        /// Send extra detail by itself on an anomaly (a log shape never seen, a rate spike).
+        #[serde(default = "default_aggregate")]
+        anomaly_boost: bool,
     },
+}
+
+fn default_fidelity() -> u8 {
+    100
 }
 
 fn default_aggregate() -> bool {

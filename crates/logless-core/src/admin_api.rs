@@ -182,6 +182,19 @@ struct SyncBody {
     clear_token: bool,
     #[serde(default)]
     min_severity: Option<u8>,
+    /// 1 to 100. Absent keeps the current dial (100 when none was set).
+    #[serde(default)]
+    fidelity: Option<u8>,
+    /// Absent keeps the current setting (on when none was set).
+    #[serde(default)]
+    anomaly_boost: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackfillBody {
+    from_ms: u64,
+    to_ms: u64,
 }
 
 #[derive(Deserialize, Default)]
@@ -370,6 +383,21 @@ impl AdminService {
         if min_severity > 24 {
             return invalid("min_severity is an OpenTelemetry severity number, 0 to 24.".into());
         }
+        let saved = control.store().load().map(|(settings, _)| settings);
+        let current_target = control.target();
+        let fidelity = req
+            .fidelity
+            .or_else(|| saved.as_ref().map(|s| s.fidelity))
+            .or_else(|| current_target.as_ref().map(|t| t.fidelity))
+            .unwrap_or(100);
+        if !(1..=100).contains(&fidelity) {
+            return invalid("fidelity is a percentage, 1 to 100.".into());
+        }
+        let anomaly_boost = req
+            .anomaly_boost
+            .or_else(|| saved.as_ref().map(|s| s.anomaly_boost))
+            .or_else(|| current_target.as_ref().map(|t| t.anomaly_boost))
+            .unwrap_or(true);
         let stored = control.store().load().and_then(|(_, t)| t);
         let current = control.target().and_then(|t| t.token);
         let (change, token) = if req.clear_token {
@@ -390,6 +418,8 @@ impl AdminService {
             enabled: req.enabled && !clean_url.is_empty(),
             url: clean_url.clone(),
             min_severity,
+            fidelity,
+            anomaly_boost,
             updated_at_ms: now_ms(),
         };
         if let Err(e) = control.store().save(&settings, change) {
@@ -398,9 +428,37 @@ impl AdminService {
         control.set_target(
             settings
                 .enabled
-                .then(|| crate::sync::SyncTarget { url: clean_url, token, min_severity }),
+                .then(|| crate::sync::SyncTarget { url: clean_url, token, min_severity, fidelity, anomaly_boost }),
         );
         self.sync_get()
+    }
+
+    /// `POST /admin/v1/sync/backfill`: send every record in a time range at full detail, now, in the
+    /// background. Returns the sync document, whose `backfill` field shows progress.
+    pub fn sync_backfill(&self, body: &[u8]) -> Resp {
+        let control = match self.sync_control() {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+        let req: BackfillBody = match serde_json::from_slice(body) {
+            Ok(b) => b,
+            Err(e) => return err(400, "bad_request", format!("the body is not a range ({{\"from_ms\", \"to_ms\"}}): {e}")),
+        };
+        match control.start_backfill(req.from_ms, req.to_ms) {
+            Ok(()) => self.sync_get(),
+            Err(m) => (409, json!({"error": "backfill_refused", "message": m})),
+        }
+    }
+
+    /// `POST /admin/v1/sync/backfill/cancel`.
+    pub fn sync_backfill_cancel(&self) -> Resp {
+        match self.sync_control() {
+            Ok(c) => {
+                c.cancel_backfill();
+                self.sync_get()
+            }
+            Err(r) => r,
+        }
     }
 
     /// `POST /admin/v1/sync/test`: asks a peer (the one given, or the current one) what it is.
@@ -919,6 +977,8 @@ impl Handler for Api {
             (Method::Get, "/admin/v1/sync") => reply(s.sync_get()),
             (Method::Put, "/admin/v1/sync") => reply(s.sync_put(&req.body)),
             (Method::Post, "/admin/v1/sync/test") => reply(s.sync_test(&req.body)),
+            (Method::Post, "/admin/v1/sync/backfill") => reply(s.sync_backfill(&req.body)),
+            (Method::Post, "/admin/v1/sync/backfill/cancel") => reply(s.sync_backfill_cancel()),
             (Method::Get, "/admin/v1/policies/history") => match query_limit(req.query) {
                 Ok(n) => reply(s.history(n)),
                 Err(r) => reply(r),
@@ -932,7 +992,9 @@ impl Handler for Api {
                 | "/admin/v1/policies/restore"
                 | "/admin/v1/policies/history"
                 | "/admin/v1/sync"
-                | "/admin/v1/sync/test",
+                | "/admin/v1/sync/test"
+                | "/admin/v1/sync/backfill"
+                | "/admin/v1/sync/backfill/cancel",
             ) => reply(err(405, "method_not_allowed", "wrong method for this path")),
             _ => reply(err(404, "not_found", "no such admin endpoint")),
         }
@@ -2018,5 +2080,37 @@ mod tests {
         assert!(v["error"].as_str().unwrap().contains("wants a token"), "{v}");
         good.shutdown();
         other.shutdown();
+    }
+
+    #[test]
+    fn the_detail_dial_and_anomaly_boost_are_validated_kept_and_reported() {
+        let r = rig_with_sync();
+        let (status, v) = r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": true, "url": "https://central.example.com:9300", "fidelity": 5, "anomaly_boost": false})));
+        assert_eq!(200, status, "{v}");
+        assert_eq!((5, false), (v["status"]["fidelity"].as_u64().unwrap(), v["status"]["anomaly_boost"].as_bool().unwrap()));
+        // Left out of a later save, both are kept.
+        let (_, v) = r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": true, "min_severity": 9})));
+        assert_eq!((5, false), (v["status"]["fidelity"].as_u64().unwrap(), v["status"]["anomaly_boost"].as_bool().unwrap()));
+        let saved = r.service.sync.get().unwrap().store().load().unwrap().0;
+        assert_eq!((5, false), (saved.fidelity, saved.anomaly_boost));
+        for bad in [0, 101, 255] {
+            let (status, v) = r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": true, "fidelity": bad})));
+            assert_eq!(422, status, "{bad}: {v}");
+            assert!(v["message"].as_str().unwrap().contains("1 to 100"));
+        }
+    }
+
+    #[test]
+    fn a_fetch_needs_a_peer_a_valid_range_and_can_be_cancelled() {
+        let r = rig_with_sync();
+        let (status, v) = r.call("POST", "/admin/v1/sync/backfill", &[], Some(json!({"from_ms": 0, "to_ms": 10})));
+        assert_eq!(409, status);
+        assert!(v["message"].as_str().unwrap().contains("Set a peer"), "{v}");
+        r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": true, "url": "https://central.example.com:9300"})));
+        let (status, v) = r.call("POST", "/admin/v1/sync/backfill", &[], Some(json!({"from_ms": 10, "to_ms": 10})));
+        assert_eq!(409, status, "{v}");
+        assert_eq!(400, r.call("POST", "/admin/v1/sync/backfill", &[], Some(json!({"from_ms": 1}))).0);
+        assert_eq!(200, r.call("POST", "/admin/v1/sync/backfill/cancel", &[], None).0);
+        assert_eq!(405, r.call("GET", "/admin/v1/sync/backfill", &[], None).0);
     }
 }

@@ -18,7 +18,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::model::LogRecord;
 use crate::peer::{self, Capabilities, CAPABILITY_PATH, INGEST_PATH, WIRE_FORMAT};
 use crate::spool::{Spool, SpoolConfig};
+use crate::sync_policy::{Anomaly, Planner, PlannerConfig, ATTR_SUPPLEMENT};
 
 /// Raw bytes of ndjson in one spool frame, and so in one request. Well under any receiver's body limit.
 const FRAME_BYTES: usize = 1024 * 1024;
@@ -48,8 +49,19 @@ pub const SPOOL_DIR: &str = "sync-spool";
 pub struct SyncTarget {
     pub url: String,
     pub token: Option<String>,
-    /// Only records at or above this OTel severity are sent. `0` sends everything.
+    /// Only records at or above this OTel severity are sent or counted. `0` takes everything.
     pub min_severity: u8,
+    /// 1 to 100: the percentage of records below errors that are sent in full (`sync_policy`). Errors and
+    /// fatals always are. What is left out is counted exactly in per-minute rollups.
+    pub fidelity: u8,
+    /// Send extra detail by itself when something unusual happens (`sync_policy`).
+    pub anomaly_boost: bool,
+}
+
+impl SyncTarget {
+    pub fn planner_config(&self) -> PlannerConfig {
+        PlannerConfig { fidelity: self.fidelity.clamp(1, 100), min_severity: self.min_severity, anomaly_boost: self.anomaly_boost }
+    }
 }
 
 /// The non-secret part, kept in `sync.json`.
@@ -60,7 +72,18 @@ pub struct SyncSettings {
     pub url: String,
     #[serde(default)]
     pub min_severity: u8,
+    #[serde(default = "full_fidelity")]
+    pub fidelity: u8,
+    #[serde(default = "yes")]
+    pub anomaly_boost: bool,
     pub updated_at_ms: u64,
+}
+
+fn full_fidelity() -> u8 {
+    100
+}
+fn yes() -> bool {
+    true
 }
 
 /// What a settings change does to the stored token.
@@ -140,6 +163,8 @@ pub struct SyncStatus {
     /// `scheme://host[:port]` of the peer: enough to recognise it, never the path or token.
     pub peer: Option<String>,
     pub min_severity: u8,
+    pub fidelity: u8,
+    pub anomaly_boost: bool,
     pub has_token: bool,
     pub last_ok_ms: Option<u64>,
     pub last_error: Option<String>,
@@ -158,6 +183,30 @@ pub struct SyncStatus {
     pub queued_batches: usize,
     pub capabilities: Option<Capabilities>,
     pub probed_ms: Option<u64>,
+    /// Records counted into rollups instead of being sent, and the rollups sent for them.
+    pub sampled_out: u64,
+    pub rollups_sent: u64,
+    /// Left-out records sent afterwards as an anomaly's lead-up.
+    pub lookback_sent: u64,
+    /// Services at full detail right now because of an anomaly.
+    pub boosted_services: Vec<String>,
+    /// The most recent anomalies, newest first.
+    pub anomalies: Vec<Anomaly>,
+    pub backfill: Option<BackfillStatus>,
+}
+
+/// A manual fetch of a range: everything in it, sent at full detail.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BackfillStatus {
+    /// `running`, `done`, `cancelled` or `error`.
+    pub state: String,
+    pub from_ms: u64,
+    pub to_ms: u64,
+    pub scanned: u64,
+    pub queued: u64,
+    pub started_ms: u64,
+    pub finished_ms: Option<u64>,
+    pub error: Option<String>,
 }
 
 /// Shared between the sender thread, the WAL tap and the admin API.
@@ -171,6 +220,19 @@ pub struct SyncControl {
     /// Bumped by every settings change, so the sender retries at once instead of waiting out a backoff
     /// that the old settings earned.
     epoch: AtomicU64,
+    /// Where the committed Parquet store is, for a manual fetch of a range.
+    store_dir: OnceLock<PathBuf>,
+    /// The sender's intake, so a fetch can feed it (set by `channel`).
+    intake: OnceLock<Sender<Item>>,
+    backfill_cancel: AtomicBool,
+}
+
+/// What the tap hands the sender.
+pub enum Item {
+    /// A batch the WAL accepted: subject to the dial and the anomaly logic.
+    Live(Arc<Vec<LogRecord>>),
+    /// Records read back for a manual fetch: sent whole, flagged where the dial had left them out.
+    Backfill(Vec<LogRecord>),
 }
 
 impl SyncControl {
@@ -183,6 +245,9 @@ impl SyncControl {
             active: AtomicBool::new(false),
             tap_dropped: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
+            store_dir: OnceLock::new(),
+            intake: OnceLock::new(),
+            backfill_cancel: AtomicBool::new(false),
         });
         control.set_target(initial);
         control
@@ -207,6 +272,8 @@ impl SyncControl {
             let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
             status.peer = target.as_ref().and_then(|t| display_target(&t.url));
             status.min_severity = target.as_ref().map_or(0, |t| t.min_severity);
+            status.fidelity = target.as_ref().map_or(100, |t| t.fidelity);
+            status.anomaly_boost = target.as_ref().is_some_and(|t| t.anomaly_boost);
             status.has_token = target.as_ref().is_some_and(|t| t.token.is_some());
             if target.is_none() {
                 status.last_error = None;
@@ -278,7 +345,7 @@ pub fn check_url(raw: &str) -> Result<String, String> {
 /// The write path's handle: offers each batch the WAL accepted.
 #[derive(Clone)]
 pub struct SyncTap {
-    tx: Sender<Arc<Vec<LogRecord>>>,
+    tx: Sender<Item>,
     control: Arc<SyncControl>,
 }
 
@@ -289,15 +356,109 @@ impl SyncTap {
         if batch.is_empty() || !self.control.is_active() {
             return;
         }
-        if self.tx.try_send(Arc::new(batch.to_vec())).is_err() {
+        if self.tx.try_send(Item::Live(Arc::new(batch.to_vec()))).is_err() {
             self.control.tap_dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
         }
     }
 }
 
-pub fn channel(control: Arc<SyncControl>) -> (SyncTap, Receiver<Arc<Vec<LogRecord>>>) {
+pub fn channel(control: Arc<SyncControl>) -> (SyncTap, Receiver<Item>) {
     let (tx, rx) = crossbeam_channel::bounded(TAP_CAPACITY);
+    let _ = control.intake.set(tx.clone());
     (SyncTap { tx, control }, rx)
+}
+
+impl SyncControl {
+    /// Tells the control where the committed store is, which a manual fetch reads.
+    pub fn set_store_dir(&self, dir: PathBuf) {
+        let _ = self.store_dir.set(dir);
+    }
+
+    /// Starts sending every record in `[from_ms, to_ms)` at full detail, on a background thread. The peer
+    /// already holding some of them is fine: it recognises their event ids. Reads committed Parquet, so a
+    /// range that ends in the last few minutes may still lack what has not been merged yet.
+    pub fn start_backfill(self: &Arc<Self>, from_ms: u64, to_ms: u64) -> Result<(), String> {
+        if to_ms <= from_ms {
+            return Err("The end of the range must be after its start.".into());
+        }
+        if to_ms - from_ms > 31 * 24 * 3_600_000 {
+            return Err("A fetch covers at most 31 days at a time.".into());
+        }
+        let Some(target) = self.target() else {
+            return Err("Set a peer and turn sync on before fetching a range.".into());
+        };
+        let (Some(dir), Some(intake)) = (self.store_dir.get().cloned(), self.intake.get().cloned()) else {
+            return Err("This process cannot read its store for a fetch.".into());
+        };
+        {
+            let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+            if status.backfill.as_ref().is_some_and(|b| b.state == "running") {
+                return Err("A fetch is already running. Cancel it or wait for it to finish.".into());
+            }
+            status.backfill = Some(BackfillStatus {
+                state: "running".into(),
+                from_ms,
+                to_ms,
+                scanned: 0,
+                queued: 0,
+                started_ms: now_ms(),
+                finished_ms: None,
+                error: None,
+            });
+        }
+        self.backfill_cancel.store(false, Ordering::Release);
+        let control = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("logless-backfill".into())
+            .spawn(move || {
+                let query = crate::scan::Query {
+                    from_unix_nano: Some(from_ms * 1_000_000),
+                    until_unix_nano: Some(to_ms * 1_000_000),
+                    min_severity: (target.min_severity > 0).then_some(crate::model::Severity(target.min_severity)),
+                    limit: usize::MAX,
+                    ..Default::default()
+                };
+                let mut queued = 0u64;
+                let result = crate::scan::scan_each(&dir, &query, 2_000, |chunk| {
+                    if control.backfill_cancel.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    let n = chunk.len() as u64;
+                    // Blocking send: the sender's pace is the pace of the fetch.
+                    if intake.send(Item::Backfill(chunk)).is_err() {
+                        return false;
+                    }
+                    queued += n;
+                    control.update(|s| {
+                        if let Some(b) = s.backfill.as_mut() {
+                            b.queued = queued;
+                        }
+                    });
+                    true
+                });
+                control.update(|s| {
+                    if let Some(b) = s.backfill.as_mut() {
+                        b.finished_ms = Some(now_ms());
+                        match &result {
+                            Ok(stats) => {
+                                b.scanned = stats.rows_scanned;
+                                b.state = if control.backfill_cancel.load(Ordering::Acquire) { "cancelled".into() } else { "done".into() };
+                            }
+                            Err(e) => {
+                                b.state = "error".into();
+                                b.error = Some(format!("The store could not be read: {e}"));
+                            }
+                        }
+                    }
+                });
+            })
+            .map_err(|e| format!("could not start the fetch: {e}"))?;
+        Ok(())
+    }
+
+    pub fn cancel_backfill(&self) {
+        self.backfill_cancel.store(true, Ordering::Release);
+    }
 }
 
 fn now_ms() -> u64 {
@@ -440,8 +601,9 @@ pub fn encode_frames(instance: &str, min_severity: u8, batch: &[LogRecord]) -> (
     (frames, total)
 }
 
-/// Runs the sender until `stop` is set and the tap is empty. Owns the spool.
-pub fn run(control: Arc<SyncControl>, rx: Receiver<Arc<Vec<LogRecord>>>, spool_dir: &Path, stop: &AtomicBool) {
+/// Runs the sender until `stop` is set and the tap is empty. Owns the spool and the planner.
+/// `known_templates` are the template ids the catalog holds, so a restart is not a wave of novel shapes.
+pub fn run(control: Arc<SyncControl>, rx: Receiver<Item>, spool_dir: &Path, stop: &AtomicBool, known_templates: Vec<u64>) {
     let mut spool = match Spool::open(spool_dir, SpoolConfig { max_total_bytes: 256 * 1024 * 1024, ..SpoolConfig::default() }) {
         Ok(s) => s,
         Err(e) => {
@@ -450,6 +612,8 @@ pub fn run(control: Arc<SyncControl>, rx: Receiver<Arc<Vec<LogRecord>>>, spool_d
             return;
         }
     };
+    let first = control.target().map(|t| t.planner_config()).unwrap_or_default();
+    let mut planner = Planner::new(control.instance().to_string(), first, now_ms(), known_templates);
     let mut failures = 0u32;
     let mut next_attempt = Instant::now();
     let mut disconnected = false;
@@ -461,14 +625,22 @@ pub fn run(control: Arc<SyncControl>, rx: Receiver<Arc<Vec<LogRecord>>>, spool_d
             seen_epoch = epoch;
             failures = 0;
             next_attempt = Instant::now();
+            if let Some(target) = control.target() {
+                planner.set_config(target.planner_config());
+            }
         }
         match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(batch) => enqueue(&control, &mut spool, &batch),
+            Ok(item) => enqueue(&control, &mut spool, &mut planner, item),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => disconnected = true,
         }
-        while let Ok(batch) = rx.try_recv() {
-            enqueue(&control, &mut spool, &batch);
+        while let Ok(item) = rx.try_recv() {
+            enqueue(&control, &mut spool, &mut planner, item);
+        }
+        let closing = (stopping || disconnected) && rx.is_empty();
+        if control.is_active() {
+            let extra = planner.tick(now_ms(), closing);
+            push_frames(&control, &mut spool, &extra);
         }
         let _ = spool.sync();
 
@@ -485,8 +657,13 @@ pub fn run(control: Arc<SyncControl>, rx: Receiver<Arc<Vec<LogRecord>>>, spool_d
         control.update(|s| {
             s.backlog_bytes = spool.pending_bytes().unwrap_or(0);
             s.queued_batches = rx.len();
+            s.sampled_out = planner.stats.sampled_out;
+            s.rollups_sent = planner.stats.rollups_emitted;
+            s.lookback_sent = planner.stats.lookback_sent;
+            s.boosted_services = planner.boosted(now_ms());
+            s.anomalies = planner.anomalies();
         });
-        if (stopping || disconnected) && rx.is_empty() {
+        if closing {
             // One last attempt so a clean shutdown flushes what a healthy peer can take now.
             let _ = deliver(&control, &mut spool);
             let _ = spool.sync();
@@ -495,16 +672,46 @@ pub fn run(control: Arc<SyncControl>, rx: Receiver<Arc<Vec<LogRecord>>>, spool_d
     }
 }
 
-fn enqueue(control: &SyncControl, spool: &mut Spool, batch: &[LogRecord]) {
+fn enqueue(control: &SyncControl, spool: &mut Spool, planner: &mut Planner, item: Item) {
     let Some(target) = control.target() else { return };
-    let (frames, _) = encode_frames(control.instance(), target.min_severity, batch);
-    for (payload, records) in frames {
+    match item {
+        Item::Live(batch) => {
+            let send = planner.process(now_ms(), &batch);
+            push_frames(control, spool, &send);
+        }
+        Item::Backfill(records) => {
+            let mut out = Vec::with_capacity(records.len());
+            for mut record in records {
+                if record.severity.0 < target.min_severity {
+                    continue;
+                }
+                // What the dial left out was counted in a rollup; flag it so a total does not count it twice.
+                if !planner.sent_live(&record) {
+                    record.attributes.push(crate::model::Attr {
+                        key: ATTR_SUPPLEMENT.into(),
+                        value: crate::model::AttrValue::Str("backfill".into()),
+                    });
+                }
+                out.push(record);
+            }
+            push_frames(control, spool, &out);
+        }
+    }
+}
+
+fn push_frames(control: &SyncControl, spool: &mut Spool, records: &[LogRecord]) {
+    if records.is_empty() {
+        return;
+    }
+    // The planner has already applied the floor; frames only stamp and split.
+    let (frames, _) = encode_frames(control.instance(), 0, records);
+    for (payload, count) in frames {
         match spool.push(&payload) {
             Ok(true) => {}
-            Ok(false) => control.update(|s| s.dropped_records += records as u64),
+            Ok(false) => control.update(|s| s.dropped_records += count as u64),
             Err(e) => {
                 tracing::warn!(error = %e, "sync spool write failed");
-                control.update(|s| s.dropped_records += records as u64);
+                control.update(|s| s.dropped_records += count as u64);
             }
         }
     }
@@ -610,7 +817,7 @@ mod tests {
     }
 
     fn target_of(p: &Peer, token: Option<&str>, min: u8) -> SyncTarget {
-        SyncTarget { url: format!("http://{}", p.receiver.local_addr()), token: token.map(str::to_string), min_severity: min }
+        SyncTarget { url: format!("http://{}", p.receiver.local_addr()), token: token.map(str::to_string), min_severity: min, fidelity: 100, anomaly_boost: true }
     }
 
     struct Running {
@@ -625,7 +832,7 @@ mod tests {
         let (tap, rx) = channel(Arc::clone(&control));
         let stop = Arc::new(AtomicBool::new(false));
         let (c, s, d) = (Arc::clone(&control), Arc::clone(&stop), dir.join(SPOOL_DIR));
-        let handle = std::thread::spawn(move || run(c, rx, &d, &s));
+        let handle = std::thread::spawn(move || run(c, rx, &d, &s, vec![1, 2, 3]));
         Running { control, tap, stop, handle }
     }
 
@@ -775,7 +982,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SyncStore::new(dir.path());
         assert!(store.load().is_none());
-        let settings = SyncSettings { enabled: true, url: "https://central.example.com:9300".into(), min_severity: 13, updated_at_ms: 1 };
+        let settings = SyncSettings { enabled: true, url: "https://central.example.com:9300".into(), min_severity: 13, fidelity: 40, anomaly_boost: false, updated_at_ms: 1 };
         store.save(&settings, TokenChange::Set("s3cret".into())).unwrap();
         assert_eq!(Some((settings.clone(), Some("s3cret".to_string()))), store.load());
         assert!(!std::fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap().contains("s3cret"));
@@ -798,5 +1005,142 @@ mod tests {
         assert!(check_url("https://").is_err());
         assert_eq!(Some("https://a.example.com:9300".to_string()), display_target("https://a.example.com:9300/v1/x?k=1"));
         assert_eq!(Some("http://h".to_string()), display_target("http://user@h/p"));
+    }
+
+    fn dial(p: &Peer, fidelity: u8) -> SyncTarget {
+        SyncTarget { fidelity, ..target_of(p, None, 0) }
+    }
+
+    fn rec_t(body: &str, severity: Severity, template: u64) -> LogRecord {
+        let mut r = record(body, severity);
+        r.template_id = Some(template);
+        r.observed_unix_nano = crate::now_unix_nanos();
+        r.timestamp_unix_nano = r.observed_unix_nano;
+        r
+    }
+
+    fn has(r: &LogRecord, key: &str) -> bool {
+        r.attributes.iter().any(|a| a.key == key)
+    }
+
+    fn rollup_count(r: &LogRecord) -> u64 {
+        r.attributes.iter().find(|a| a.key == "logless.rollup.count").map_or(0, |a| if let crate::model::AttrValue::I64(n) = a.value { n as u64 } else { 0 })
+    }
+
+    #[test]
+    fn at_one_percent_errors_arrive_in_full_and_the_rest_is_counted_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = peer(vec![]);
+        let run = start_sender(dir.path(), Some(dial(&p, 1)));
+        let mut batch: Vec<LogRecord> = (0..2_000).map(|i| rec_t(&format!("info {i}"), Severity::INFO, 1 + i % 3)).collect();
+        batch.extend((0..20).map(|i| rec_t(&format!("err {i}"), Severity::ERROR, 2)));
+        run.tap.offer(&batch);
+        wait_for("the errors", || p.got.lock().unwrap().iter().filter(|r| r.severity >= Severity::ERROR && !has(r, "logless.rollup")).count() == 20);
+        let control = run.finish();
+        p.receiver.shutdown();
+        let got = p.got.lock().unwrap().clone();
+        let infos = got.iter().filter(|r| r.severity < Severity::ERROR && !has(r, "logless.rollup") && !has(r, "logless.anomaly") && !has(r, ATTR_SUPPLEMENT)).count() as u64;
+        let counted: u64 = got.iter().filter(|r| has(r, "logless.rollup")).map(rollup_count).sum();
+        assert_eq!(2_000, infos + counted, "sent in full plus counted is everything the agent took: {infos} + {counted}");
+        assert!(infos < 200, "about 1% of 2000 was sent in full, got {infos}");
+        let status = control.status();
+        assert_eq!(1, status.fidelity);
+        assert!(status.sampled_out > 1_800 && status.rollups_sent >= 1, "{status:?}");
+    }
+
+    #[test]
+    fn an_anomaly_sends_its_lead_up_and_a_marker_the_peer_can_alert_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = peer(vec![]);
+        let run = start_sender(dir.path(), Some(dial(&p, 1)));
+        run.tap.offer(&(0..300).map(|i| rec_t(&format!("steady {i}"), Severity::INFO, 1)).collect::<Vec<_>>());
+        wait_for("the batch to be taken", || run.control.status().sampled_out >= 280);
+        // A log shape the catalog never held.
+        run.tap.offer(&[rec_t("something new broke", Severity::INFO, 424_242)]);
+        wait_for("the marker", || p.got.lock().unwrap().iter().any(|r| has(r, "logless.anomaly")));
+        let status = run.control.status();
+        assert_eq!("novel", status.anomalies[0].kind);
+        assert_eq!(vec!["api".to_string()], status.boosted_services);
+        let got = p.got.lock().unwrap().clone();
+        let lead_up = got.iter().filter(|r| r.attributes.iter().any(|a| a.key == ATTR_SUPPLEMENT && a.value == crate::model::AttrValue::Str("lookback:novel".into()))).count();
+        assert!(lead_up > 250, "the minute before it went with it: {lead_up}");
+        assert!(got.iter().any(|r| r.body == "something new broke"), "and the record itself");
+        // While boosted, the service is sent whole even at 1%.
+        run.tap.offer(&(0..100).map(|i| rec_t(&format!("during {i}"), Severity::INFO, 1)).collect::<Vec<_>>());
+        wait_for("everything during the boost", || p.got.lock().unwrap().iter().filter(|r| r.body.starts_with("during")).count() == 100);
+        run.finish();
+        p.receiver.shutdown();
+    }
+
+    fn write_store(dir: &Path, records: Vec<LogRecord>) {
+        let buckets = crate::config::LevelBuckets::default();
+        let mut by_partition: std::collections::HashMap<_, Vec<LogRecord>> = std::collections::HashMap::new();
+        for record in records {
+            let key = crate::partition::PartitionKey { epoch_hour: record.observed_unix_nano / 3_600_000_000_000, bucket: buckets.bucket_for(record.severity).name.clone() };
+            by_partition.entry(key).or_default().push(record);
+        }
+        for (key, mut records) in by_partition {
+            crate::schema::sort_records(&mut records);
+            let partition_dir = key.dir(dir);
+            std::fs::create_dir_all(&partition_dir).unwrap();
+            crate::store::write_partition_file(&partition_dir.join(crate::store::file_name_for_segment(1, Uuid::now_v7())), &records).unwrap();
+        }
+    }
+    use uuid::Uuid;
+
+    #[test]
+    fn a_manual_fetch_sends_a_range_in_full_and_flags_what_the_dial_had_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let hour = 3_600_000_000_000u64;
+        let base = 1_000 * hour;
+        let mut all = Vec::new();
+        for i in 0..400u64 {
+            let mut r = record(&format!("line {i}"), if i % 50 == 0 { Severity::ERROR } else { Severity::INFO });
+            r.observed_unix_nano = base + i * 10_000_000_000;
+            r.timestamp_unix_nano = r.observed_unix_nano;
+            all.push(r);
+        }
+        write_store(store.path(), all.clone());
+        let p = peer(vec![]);
+        let run = start_sender(dir.path(), Some(dial(&p, 20)));
+        run.control.set_store_dir(store.path().to_path_buf());
+        // The second hour only: records 360..400 are in [base + 3600 s, ...), plus a few before.
+        let (from_ms, to_ms) = ((base + hour) / 1_000_000, (base + 2 * hour) / 1_000_000);
+        let in_range: Vec<&LogRecord> = all.iter().filter(|r| r.observed_unix_nano >= base + hour).collect();
+        assert!(!in_range.is_empty());
+        run.control.start_backfill(from_ms, to_ms).unwrap();
+        wait_for("the fetch to finish", || run.control.status().backfill.as_ref().is_some_and(|b| b.state == "done"));
+        wait_for("delivery", || p.got.lock().unwrap().len() == in_range.len());
+        let got = p.got.lock().unwrap().clone();
+        let planner_probe = crate::sync_policy::select;
+        for r in &got {
+            let sent_live = r.severity >= Severity::ERROR || planner_probe(&r.event_id, 20);
+            assert_eq!(!sent_live, has(r, ATTR_SUPPLEMENT), "only what the dial left out is flagged: {}", r.body);
+        }
+        let status = run.control.status();
+        assert_eq!(in_range.len() as u64, status.backfill.unwrap().queued);
+        // A second fetch of the same range is recognised by the peer: nothing is stored twice.
+        run.control.start_backfill(from_ms, to_ms).unwrap();
+        wait_for("the second fetch", || run.control.status().duplicates >= in_range.len() as u64);
+        assert_eq!(in_range.len(), p.got.lock().unwrap().len());
+        run.finish();
+        p.receiver.shutdown();
+    }
+
+    #[test]
+    fn a_fetch_is_refused_with_a_reason_when_it_cannot_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = start_sender(dir.path(), None);
+        assert!(none.control.start_backfill(0, 1_000).unwrap_err().contains("Set a peer"));
+        none.finish();
+        let p = peer(vec![]);
+        let dir2 = tempfile::tempdir().unwrap();
+        let run = start_sender(dir2.path(), Some(target_of(&p, None, 0)));
+        assert!(run.control.start_backfill(5, 5).unwrap_err().contains("after its start"));
+        assert!(run.control.start_backfill(0, 40 * 24 * 3_600_000).unwrap_err().contains("31 days"));
+        assert!(run.control.start_backfill(0, 1_000).unwrap_err().contains("cannot read its store"));
+        run.finish();
+        p.receiver.shutdown();
     }
 }

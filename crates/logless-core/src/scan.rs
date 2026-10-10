@@ -99,6 +99,40 @@ pub fn scan(store_dir: &Path, query: &Query) -> Result<ScanResult, StoreError> {
     Ok(ScanResult { records, stats, truncated })
 }
 
+/// Streams every matching record to `sink` in chunks of at most `chunk`, oldest partition first, without a row
+/// limit and without holding more than one file's matches. `sink` returns `false` to stop. For a bulk read
+/// (sending a range to a peer) where [`scan`]'s newest-first, limited result would drop the wrong end.
+pub fn scan_each(
+    store_dir: &Path,
+    query: &Query,
+    chunk: usize,
+    mut sink: impl FnMut(Vec<LogRecord>) -> bool,
+) -> Result<ScanStats, StoreError> {
+    let mut stats = ScanStats::default();
+    let mut files = store::list_parquet_files(store_dir);
+    files.sort();
+    for path in files {
+        stats.files_considered += 1;
+        if !partition_matches(&path, query) {
+            stats.files_pruned_by_partition += 1;
+            continue;
+        }
+        let (mut found, group_skips, rows) = scan_file(&path, query, usize::MAX)?;
+        stats.row_groups_pruned += group_skips;
+        stats.rows_scanned += rows;
+        stats.rows_matched += found.len() as u64;
+        found.sort_by_key(|r| r.observed_unix_nano);
+        let mut rest = found;
+        while !rest.is_empty() {
+            let tail = rest.split_off(chunk.min(rest.len()));
+            if !sink(std::mem::replace(&mut rest, tail)) {
+                return Ok(stats);
+            }
+        }
+    }
+    Ok(stats)
+}
+
 /// Uses the `hour=…/level=…` path to skip whole files without opening them.
 fn partition_matches(path: &Path, query: &Query) -> bool {
     let mut hour = None;
@@ -477,5 +511,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.records.len(), 1);
+    }
+
+    #[test]
+    fn scan_each_streams_everything_in_range_oldest_first_without_a_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let records: Vec<LogRecord> = (0..50u64).map(|i| record(i * 1_000_000_000, Severity::INFO, "api", "line")).collect();
+        write_store(dir.path(), records);
+        let mut got = Vec::new();
+        let stats = scan_each(
+            dir.path(),
+            &Query { from_unix_nano: Some(10 * 1_000_000_000), until_unix_nano: Some(40 * 1_000_000_000), ..Query::new() },
+            7,
+            |chunk| {
+                assert!(chunk.len() <= 7);
+                got.extend(chunk);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(30, got.len());
+        assert_eq!(30, stats.rows_matched);
+        assert!(got.windows(2).all(|w| w[0].observed_unix_nano <= w[1].observed_unix_nano));
+        let mut first = 0;
+        scan_each(dir.path(), &Query::new(), 5, |c| {
+            first += c.len();
+            false
+        })
+        .unwrap();
+        assert_eq!(5, first, "the sink can stop the scan");
     }
 }
