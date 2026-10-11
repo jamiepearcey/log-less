@@ -368,6 +368,13 @@ fn read_request(
     if let Some(reply) = handler.preflight(&Incoming::new(method, m, &path, &query, &headers, Vec::new())) {
         return fail(Bad::Early(reply));
     }
+    if !chunked {
+        let expects_continue = headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("expect") && v.eq_ignore_ascii_case("100-continue"));
+        let mut reader = BodyReader::new(&mut *stream, &buf[end + 4..], declared as u64, head.request_timeout, expects_continue);
+        if let Some(reply) = handler.stream(&Incoming::new(method, m, &path, &query, &headers, Vec::new()), declared as u64, &mut reader) {
+            return fail(Bad::Early(reply));
+        }
+    }
     if declared > limits.max_body_bytes {
         return Err(Err(Reject::TooLarge));
     }
@@ -387,6 +394,66 @@ fn read_request(
         body = inflate(&body, limits.max_decompressed_bytes)?;
     }
     Ok(Parsed { method, method_name: m.to_string(), path, query, headers, body })
+}
+
+/// The slowest a streamed body may arrive, averaged over the whole of it. With the stall limit on each
+/// read, this bounds how long one upload can hold a connection.
+const MIN_STREAM_BYTES_PER_SEC: u64 = 64 * 1024;
+
+/// A request body handed to [`Handler::stream`]: at most `left` bytes, first what arrived with the head,
+/// then the socket. Each read must make progress within `stall` (the listener's request timeout), and the
+/// whole body within that plus its length at [`MIN_STREAM_BYTES_PER_SEC`]; past either the read fails with
+/// `TimedOut`. A client that hangs up early is `UnexpectedEof`. A client that sent `Expect: 100-continue`
+/// is told to go on only when the handler first reads, so a refusal from the head costs it no upload.
+struct BodyReader<'a> {
+    stream: &'a mut TcpStream,
+    prefix: &'a [u8],
+    left: u64,
+    stall: Duration,
+    deadline: Instant,
+    expects_continue: bool,
+}
+
+impl<'a> BodyReader<'a> {
+    fn new(stream: &'a mut TcpStream, prefix: &'a [u8], len: u64, stall: Duration, expects_continue: bool) -> Self {
+        let prefix = &prefix[..prefix.len().min(usize::try_from(len).unwrap_or(usize::MAX))];
+        let deadline = Instant::now() + stall + Duration::from_secs(len / MIN_STREAM_BYTES_PER_SEC);
+        Self { stream, prefix, left: len, stall, deadline, expects_continue }
+    }
+}
+
+impl Read for BodyReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let want = buf.len().min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        if want == 0 {
+            return Ok(0);
+        }
+        if !self.prefix.is_empty() {
+            let n = want.min(self.prefix.len());
+            buf[..n].copy_from_slice(&self.prefix[..n]);
+            self.prefix = &self.prefix[n..];
+            self.left -= n as u64;
+            return Ok(n);
+        }
+        if std::mem::take(&mut self.expects_continue) {
+            self.stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        }
+        let timed_out = || std::io::Error::new(std::io::ErrorKind::TimedOut, "the request body stalled");
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out());
+        }
+        self.stream.set_read_timeout(Some(remaining.min(self.stall)))?;
+        match self.stream.read(&mut buf[..want]) {
+            Ok(0) => Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "the client closed before the whole body arrived")),
+            Ok(n) => {
+                self.left -= n as u64;
+                Ok(n)
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Err(timed_out()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 /// Decodes a chunked body that starts with `buf`. Each size line is hex digits (an extension after `;` is
@@ -483,6 +550,7 @@ fn reason(status: u16) -> &'static str {
         500 => "Internal Server Error",
         501 => "Not Implemented",
         503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         508 => "Loop Detected",
         _ => "Status",
     }
@@ -723,6 +791,74 @@ mod tests {
         assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 408"), "{}", String::from_utf8_lossy(&out));
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
         assert!(probe.handled.lock().unwrap().is_empty());
+        server.shutdown();
+    }
+
+    /// Takes `PUT` bodies as a stream and answers with how many bytes it read, or why it stopped.
+    struct Streaming;
+    impl Handler for Streaming {
+        fn handle(&self, request: Incoming) -> Reply {
+            Reply::json(200, format!("buffered {}", request.body.len()))
+        }
+        fn reject(&self, _: Reject) -> Reply {
+            Reply::json(413, "{}")
+        }
+        fn stream(&self, head: &Incoming, len: u64, body: &mut dyn Read) -> Option<Reply> {
+            if head.method != Method::Put {
+                return None;
+            }
+            if head.header("x-refuse").is_some() {
+                return Some(Reply::json(403, "refused unread"));
+            }
+            let mut sink = Vec::new();
+            Some(match body.read_to_end(&mut sink) {
+                Ok(n) => Reply::json(200, format!("streamed {n} of {len}")),
+                Err(e) => Reply::json(400, format!("{:?} after {}", e.kind(), sink.len())),
+            })
+        }
+    }
+
+    #[test]
+    fn a_streamed_body_is_read_past_the_body_cap_never_past_its_length_and_not_while_it_stalls() {
+        let head = HeadLimits { request_timeout: Duration::from_millis(300), ..Default::default() };
+        let limits = Limits { max_body_bytes: 16, max_decompressed_bytes: 16 };
+        let server = BoundedServer::start("127.0.0.1:0", "test", limits, head, Arc::new(Streaming)).unwrap();
+        let a = server.local_addr();
+        let big = vec![7u8; 300_000];
+        // Over the 16-byte cap, which still holds for a body the handler leaves to be buffered.
+        let (status, text) = testing::exchange(a, &testing::request("PUT", "/", &[], &big), testing::WAIT);
+        assert!(status == 200 && text.ends_with("streamed 300000 of 300000"), "{text}");
+        assert_eq!(413, testing::exchange(a, &testing::request("POST", "/", &[], &big), testing::WAIT).0);
+        assert!(testing::exchange(a, &testing::request("POST", "/", &[], b"small"), testing::WAIT).1.ends_with("buffered 5"));
+        // Bytes after Content-Length are not the body.
+        let mut long = testing::request("PUT", "/", &[], b"twelve bytes");
+        long.extend_from_slice(b" and more");
+        assert!(testing::exchange(a, &long, testing::WAIT).1.ends_with("streamed 12 of 12"));
+        // A client that hangs up early, and one that goes quiet: the handler is told which, within the stall limit.
+        let mut c = TcpStream::connect(a).unwrap();
+        c.write_all(b"PUT / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n0123456789").unwrap();
+        c.shutdown(Shutdown::Write).unwrap();
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out);
+        assert!(out.ends_with("UnexpectedEof after 10"), "{out}");
+        let started = Instant::now();
+        let (status, text) = testing::exchange(a, b"PUT / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n0123456789", testing::WAIT);
+        assert!(status == 400 && text.ends_with("TimedOut after 10"), "{text}");
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        // `Expect: 100-continue` is answered when the handler reads, and not when it refuses from the head.
+        let asked = "PUT / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: 4\r\n";
+        let mut c = TcpStream::connect(a).unwrap();
+        c.set_read_timeout(Some(testing::WAIT)).unwrap();
+        c.write_all(format!("{asked}\r\n").as_bytes()).unwrap();
+        let mut interim = [0u8; 25];
+        c.read_exact(&mut interim).unwrap();
+        assert_eq!(b"HTTP/1.1 100 Continue\r\n\r\n", &interim);
+        c.write_all(b"body").unwrap();
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out);
+        assert!(out.starts_with("HTTP/1.1 200") && out.ends_with("streamed 4 of 4"), "{out}");
+        let (status, text) = testing::exchange(a, format!("{asked}X-Refuse: 1\r\n\r\n").as_bytes(), testing::WAIT);
+        assert!(status == 403 && !text.contains("100 Continue"), "{text}");
         server.shutdown();
     }
 

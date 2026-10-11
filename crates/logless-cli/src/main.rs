@@ -186,11 +186,12 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         tolerance: u64,
     },
-    /// Rebuild a store (Parquet parts, catalog, template dictionary) from the object store alone, verifying
-    /// every part. Exits 1 if any part is damaged, unreadable, unfetchable or missing from the inventory.
+    /// Rebuild a store (Parquet parts, catalog, template dictionary) from an edge's uploaded parts alone,
+    /// verifying every part. Exits 1 if any part is damaged, unreadable, unfetchable or missing from the inventory.
     ///
-    /// The source is `s3://bucket/prefix` (with `--endpoint`; credentials from LOGLESS_S3_ACCESS_KEY_ID and
-    /// LOGLESS_S3_SECRET_ACCESS_KEY) or a directory of `<sha256>.parquet` files. See docs/restore.md.
+    /// The source is a directory of `<sha256>.parquet` files (a node's directory under central's parts
+    /// directory, `<data_dir>/parts/<node>`) or `s3://bucket/prefix/node` (with `--endpoint`; credentials
+    /// from LOGLESS_S3_ACCESS_KEY_ID and LOGLESS_S3_SECRET_ACCESS_KEY). See docs/restore.md.
     Restore {
         #[arg(long)]
         from: String,
@@ -206,6 +207,9 @@ enum Command {
         /// that are missing from the bucket and to check sizes and row counts.
         #[arg(long)]
         inventory: Option<PathBuf>,
+        /// Take only this node's parts from the inventory. Needed when central catalogues more than one node.
+        #[arg(long)]
+        node: Option<String>,
         /// The edge's config, for its level buckets (default buckets otherwise). Only the buckets are used.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -575,14 +579,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Command::Restore { from, to, endpoint, region, inventory, config, verify, force, report_json } => {
+        Command::Restore { from, to, endpoint, region, inventory, node, config, verify, force, report_json } => {
             use logless_core::restore as rs;
             let buckets = match &config {
                 Some(path) => load(path)?.retention,
                 None => LevelBuckets::default(),
             };
             let inventory = match &inventory {
-                Some(path) => Some(rs::read_inventory(path)?),
+                Some(path) => Some(rs::read_inventory(path, node.as_deref())?),
                 None => None,
             };
             let source: Box<dyn rs::PartSource> = if let Some(rest) = from.strip_prefix("s3://") {
@@ -847,7 +851,7 @@ fn serve(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(signal, Arc::clone(&stop))?;
     }
-    let server = s3_serve::S3Server::start(&config.serve_s3, config.store_dir())?;
+    let server = s3_serve::S3Server::start_with_parts(&config.serve_s3, config.store_dir(), config.peer.parts.local_dir(&config.storage.data_dir))?;
     tracing::info!(addr = %server.local_addr(), bucket = %config.serve_s3.bucket, "s3 serve listening (read-only)");
     while !stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(200));
@@ -1233,7 +1237,7 @@ fn run(
     let mut hec_summary: Option<hec::StatsSnapshot> = None;
 
     let mut s3_server = if config.serve_s3.enabled {
-        let server = s3_serve::S3Server::start(&config.serve_s3, config.store_dir())?;
+        let server = s3_serve::S3Server::start_with_parts(&config.serve_s3, config.store_dir(), config.peer.parts.local_dir(&config.storage.data_dir))?;
         tracing::info!(addr = %server.local_addr(), "s3 serve listening (read-only)");
         Some(server)
     } else {
@@ -1316,6 +1320,9 @@ fn run(
         service.set_sync(Arc::clone(&sync_control));
         if let Some(r) = &peer_receiver {
             service.set_peer_stats(r.stats_handle());
+            if let Some(parts) = r.parts_handle() {
+                service.set_parts(parts);
+            }
         }
         let server = AdminServer::start(&config.admin, service)?;
         tracing::info!(addr = %server.local_addr(), "admin api listening");

@@ -1,7 +1,8 @@
-//! Verified restore: rebuild an edge store from the object store alone.
+//! Verified restore: rebuild an edge store from its uploaded parts alone.
 //!
-//! The object store holds Parquet parts and nothing else (`crate::parts`): objects named
-//! `<sha256 hex>.parquet`. This module lists them, fetches each one, checks it, and only then installs it under
+//! Central keeps an edge's parts on its own disk (`<parts dir>/<node>/`, read here with [`DirSource`]) or
+//! in an S3-compatible bucket ([`S3Source`]), whichever `[peer.parts]` names (`crate::parts`). Either
+//! holds Parquet parts and nothing else: files named `<sha256 hex>.parquet`. This module lists them, fetches each one, checks it, and only then installs it under
 //! `<to>/store/hour=…/level=…/<name>.parquet`. A part that fails a check is never installed, and is reported
 //! by name with the reason. Then the catalog and the template dictionary are rebuilt from what was installed.
 //!
@@ -50,7 +51,8 @@ pub trait PartSource {
     fn fetch(&self, name: &str, dest: &Path) -> Result<(), FetchError>;
 }
 
-/// A directory of `<name>.parquet` files, for tests and for a bucket mirrored to disk.
+/// A directory of `<name>.parquet` files: one node's directory under central's local parts directory, or a
+/// bucket mirrored to disk.
 pub struct DirSource(pub PathBuf);
 
 impl PartSource for DirSource {
@@ -204,13 +206,14 @@ pub struct Expected {
     pub rows: u64,
 }
 
-/// Reads `peer_parts` from a central catalog without writing to it.
-pub fn read_inventory(catalog: &Path) -> Result<BTreeMap<String, Expected>, String> {
+/// Reads `peer_parts` from a central catalog without writing to it: every node's parts, or with `node`
+/// only that node's (the catalog is keyed `(node, name)`, and a restore rebuilds one node).
+pub fn read_inventory(catalog: &Path, node: Option<&str>) -> Result<BTreeMap<String, Expected>, String> {
     let conn = rusqlite::Connection::open_with_flags(catalog, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("{}: {e}", catalog.display()))?;
-    let mut stmt = conn.prepare("SELECT name, size, rows FROM peer_parts").map_err(|e| format!("{}: {e}", catalog.display()))?;
+    let mut stmt = conn.prepare("SELECT name, size, rows FROM peer_parts WHERE ?1 IS NULL OR node = ?1").map_err(|e| format!("{}: {e}", catalog.display()))?;
     let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, Expected { size: r.get::<_, i64>(1)? as u64, rows: r.get::<_, i64>(2)? as u64 })))
+        .query_map([node], |r| Ok((r.get::<_, String>(0)?, Expected { size: r.get::<_, i64>(1)? as u64, rows: r.get::<_, i64>(2)? as u64 })))
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<BTreeMap<_, _>, _>>().map_err(|e| e.to_string())
 }
@@ -684,6 +687,46 @@ mod tests {
         assert_eq!(r.not_in_inventory, vec![f.parts[2].0.clone()]);
         assert_eq!(r.restored, 3);
         assert!(r.ok());
+    }
+
+    #[test]
+    fn centrals_parts_directory_and_catalog_restore_one_node_and_only_that_node() {
+        // Central's local backend: `<parts>/<node>/<name>`, and one catalog for every node.
+        let f = fixture();
+        let parts_dir = f._tmp.path().join("parts");
+        fs::create_dir_all(parts_dir.join("edge-b")).unwrap();
+        fs::rename(&f.bucket, parts_dir.join("edge-a")).unwrap();
+        let other: Vec<_> = (0..5).map(|i| record(600, i, Severity::INFO, Some(9), "b")).collect();
+        let (b_name, b_size, b_rows) = make_part(&parts_dir.join("edge-b"), &other);
+        // An upload cut off by a crash is not a part.
+        fs::write(parts_dir.join("edge-a/.upload-0198.tmp"), b"half").unwrap();
+        let catalog = f._tmp.path().join("central.sqlite");
+        {
+            let c = Catalog::open(&catalog).unwrap();
+            let commit = |node: &str, name: &str, size: u64, rows: u64| {
+                let part = parts::CommittedPart { name: name.into(), size, sha256: name[..64].into(), rows, min_unix_nano: 1, max_unix_nano: 2, origin: "o".into(), node: None };
+                assert!(c.record_peer_part(node, &part, 1).unwrap());
+            };
+            for (name, size, rows) in &f.parts {
+                commit("edge-a", name, *size, *rows);
+            }
+            commit("edge-b", &b_name, b_size, b_rows);
+        }
+        assert_eq!(4, read_inventory(&catalog, None).unwrap().len());
+        let inventory = read_inventory(&catalog, Some("edge-a")).unwrap();
+        assert_eq!(inventory, self::inventory(&f));
+        let buckets = LevelBuckets::default();
+        let run = |to: &Path, inventory| restore(&DirSource(parts_dir.join("edge-a")), &Options { to, inventory: Some(inventory), buckets: &buckets, force: false, reverify: true }).unwrap();
+        let r = run(&f.to, inventory.clone());
+        assert!(r.ok(), "{r:?}");
+        assert_eq!((3, 3, 75, 1, 0), (r.listed, r.restored, r.rows, r.ignored_keys, r.missing.len()));
+        // The whole catalog as the inventory would call the other node's part missing.
+        let whole = run(&f._tmp.path().join("restored-whole"), read_inventory(&catalog, None).unwrap());
+        assert_eq!(vec![b_name], whole.missing);
+        // A part lost from central's disk is named.
+        fs::remove_file(parts_dir.join("edge-a").join(&f.parts[2].0)).unwrap();
+        let lost = run(&f._tmp.path().join("restored-lost"), inventory);
+        assert_eq!((vec![f.parts[2].0.clone()], 2), (lost.missing, lost.restored));
     }
 
     #[test]
