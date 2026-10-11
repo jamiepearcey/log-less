@@ -81,6 +81,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::auth::{Listener, Op, Principal, Refusal, Verifier};
 use crate::bounded_http::{BoundedServer, HeadLimits};
 use crate::httpd::{self, Handler, Incoming, Limits, Method, Reject, Reply};
 use crate::model::{Attr, AttrValue, LogRecord};
@@ -116,6 +117,11 @@ pub struct PeerConfig {
     /// prefix `<parts.prefix>/<id>/` (`crate::parts`); its token is also accepted for ingest.
     #[serde(default)]
     pub nodes: Vec<PeerNode>,
+    /// Ask every request for a credential even though `tokens` and `nodes` are empty: the setting for an
+    /// instance whose senders are all `[[principals]]` or broker tokens (`docs/auth.md`). A non-loopback
+    /// bind always asks.
+    #[serde(default)]
+    pub require_auth: bool,
     #[serde(default = "default_max_body")]
     pub max_body_bytes: usize,
     #[serde(default = "default_max_decompressed")]
@@ -151,9 +157,10 @@ impl std::fmt::Debug for PeerNode {
 }
 
 impl PeerConfig {
-    /// No token of either kind: the listener is unauthenticated (loopback only).
+    /// No token of either kind, and none asked for: the listener takes requests without a credential
+    /// (loopback only).
     fn unauthenticated(&self) -> bool {
-        self.tokens.is_empty() && self.nodes.is_empty()
+        self.tokens.is_empty() && self.nodes.is_empty() && !self.require_auth && is_loopback(&self.addr)
     }
 }
 
@@ -184,6 +191,7 @@ impl Default for PeerConfig {
             workers: default_workers(),
             tokens: Vec::new(),
             nodes: Vec::new(),
+            require_auth: false,
             max_body_bytes: default_max_body(),
             max_decompressed_bytes: default_max_decompressed(),
             dedupe_window: default_dedupe_window(),
@@ -203,6 +211,7 @@ impl std::fmt::Debug for PeerConfig {
             .field("workers", &self.workers)
             .field("tokens", &format_args!("<{} redacted>", self.tokens.len()))
             .field("nodes", &self.nodes)
+            .field("require_auth", &self.require_auth)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_decompressed_bytes", &self.max_decompressed_bytes)
             .field("dedupe_window", &self.dedupe_window)
@@ -215,7 +224,7 @@ impl std::fmt::Debug for PeerConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
-    #[error("the peer listener on {addr} has no tokens; refusing to accept unauthenticated records on a non-loopback address")]
+    #[error("the peer listener on {addr} has no credential it could accept ([peer] tokens, [[peer.nodes]], [[principals]] or [auth]); refusing to accept unauthenticated records on a non-loopback address")]
     OpenOnPublicAddress { addr: String },
     #[error("a peer token is {len} characters; binding the non-loopback address {addr} needs at least {min}", min = crate::admin_api::MIN_REMOTE_TOKEN_LEN)]
     WeakToken { addr: String, len: usize },
@@ -227,6 +236,8 @@ pub enum PeerError {
     BadParts(String),
     #[error("the peer dedupe log could not be opened: {0}")]
     Dedupe(std::io::Error),
+    #[error(transparent)]
+    Auth(#[from] crate::auth::AuthError),
 }
 
 /// What a log-less instance says about itself at [`CAPABILITY_PATH`]. A sender reads it to learn whether
@@ -663,74 +674,58 @@ struct PeerHandler {
     sink: Box<dyn Fn(Vec<LogRecord>) -> Admitted + Send + Sync>,
     acks: Option<Arc<WalAcks>>,
     parts: Option<Arc<crate::parts::PartsCentral>>,
+    auth: Arc<Verifier>,
+    /// Takes requests without a credential: nothing configured for this listener, and a loopback bind.
+    open: bool,
 }
 
 impl PeerHandler {
     fn authorized(&self, request: &Incoming) -> Result<(), Reply> {
-        self.authenticated(request).map(|_| ())
+        self.authenticated(request, Op::Ingest).map(|_| ())
     }
 
-    /// Who the bearer token is: `Ok(Some(node id))` for a node token, `Ok(None)` for a shared ingest token
-    /// or an unauthenticated listener.
-    fn authenticated(&self, request: &Incoming) -> Result<Option<&str>, Reply> {
-        if self.config.unauthenticated() {
-            return Ok(None);
-        }
-        let Some(token) = bearer(request) else {
+    /// Who the request is from, and that its kind may do `op` (`crate::auth`). On a listener that asks for
+    /// no credential a request without one is the instance's own tenant, as it always was. The answer to a
+    /// refusal is 401 without a credential and 403 with one, and says no more: the reason is in the log and
+    /// in status.
+    fn authenticated(&self, request: &Incoming, op: Op) -> Result<Arc<Principal>, Reply> {
+        // The replica paths open with a replica credential and nothing else: the open-on-loopback mode does not apply.
+        let closed = op == Op::Replica || !self.open;
+        self.auth.authorize(Listener::Peer, op, closed, bearer(request)).map_err(|reason| {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
-            return Err(error_reply(401, "unauthorized", "a bearer token is required").with_header("WWW-Authenticate", "Bearer"));
-        };
-        // Compare against every token, with no early exit, so response time says nothing about which matched.
-        let mut matched = false;
-        for accepted in &self.config.tokens {
-            matched |= constant_time_eq(accepted.as_bytes(), token.as_bytes());
-        }
-        let mut node = None;
-        for n in &self.config.nodes {
-            if constant_time_eq(n.token.as_bytes(), token.as_bytes()) {
-                matched = true;
-                node = Some(n.id.as_str());
+            match reason {
+                Refusal::Missing => error_reply(401, "unauthorized", "a bearer token is required"),
+                // What an edge with an ingest-only credential needs to hear: its credential is good, and not enough.
+                Refusal::Kind if op == Op::Parts => error_reply(403, "no_node", "parts need a node credential ([[peer.nodes]], or a principal of kind node); this one owns no prefix"),
+                _ => error_reply(403, "forbidden", "the token is not accepted"),
             }
-        }
-        if matched {
-            Ok(node)
-        } else {
-            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
-            Err(error_reply(403, "forbidden", "the token is not accepted").with_header("WWW-Authenticate", "Bearer"))
-        }
+            .with_header("WWW-Authenticate", "Bearer")
+        })
     }
 
-    /// The replica paths (`GET /v1/parts/replica/...`) open with a `replication_tokens` token and nothing
-    /// else: not a node token, not an ingest token, and the listener's open-on-loopback mode does not
-    /// apply. `None` lets the request through.
+    /// What a parts route asks of a credential: a node, or where this peer takes no parts just a sender
+    /// (who is then told so with a 404).
+    fn parts_op(&self) -> Op {
+        if self.parts.is_some() { Op::Parts } else { Op::Ingest }
+    }
+
+    /// The replica paths (`GET /v1/parts/replica/...`). `None` lets the request through.
     fn replication_gate(&self, head: &Incoming) -> Option<Reply> {
-        let Some(parts) = self.parts.as_ref().filter(|p| p.replica_source_enabled()) else {
+        // Offered when there is a credential that could ask for it: a `replication_tokens` entry, or a replica principal.
+        let Some(parts) = self.parts.as_ref().filter(|p| p.replica_source_enabled() || self.auth.can_authenticate(Listener::Peer, Op::Replica)) else {
             return Some(error_reply(404, "not_found", "this peer does not offer replication"));
         };
-        let Some(token) = bearer(head) else {
-            parts.count_replica_refused();
-            return Some(error_reply(401, "unauthorized", "a replication token is required").with_header("WWW-Authenticate", "Bearer"));
-        };
-        let mut matched = false;
-        for accepted in &self.config.parts.replication_tokens {
-            matched |= constant_time_eq(accepted.as_bytes(), token.as_bytes());
-        }
-        if matched {
-            None
-        } else {
-            parts.count_replica_refused();
-            Some(error_reply(403, "forbidden", "the token is not a replication token").with_header("WWW-Authenticate", "Bearer"))
-        }
+        self.authenticated(head, Op::Replica).err().inspect(|_| parts.count_replica_refused())
     }
 
-    fn refuse_head(&self, head: &Incoming, ingest: bool) -> Option<Reply> {
+    fn refuse_head(&self, head: &Incoming, ingest: bool, op: Op) -> Option<Reply> {
         // Without tokens the listener is loopback only, and the only thing left between it and a web
         // page is the name the page used: DNS rebinding makes a page's own origin point here.
-        if self.config.unauthenticated() && (head.header_count("host") != 1 || !crate::admin_api::host_allowed(head.header("host"), &[])) {
+        if self.open && (head.header_count("host") != 1 || !crate::admin_api::host_allowed(head.header("host"), &[])) {
             self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
             return Some(error_reply(403, "forbidden_host", "the Host header is not a loopback name"));
         }
-        if let Err(denied) = self.authorized(head) {
+        if let Err(denied) = self.authenticated(head, op) {
             return Some(denied);
         }
         if !ingest {
@@ -760,7 +755,7 @@ impl PeerHandler {
             instance_id: self.instance.clone(),
             formats: vec![WIRE_FORMAT.into()],
             ingest: Some(INGEST_PATH.into()),
-            auth: if self.config.unauthenticated() { "none".into() } else { "bearer".into() },
+            auth: if self.open { "none".into() } else { "bearer".into() },
             max_body_bytes: self.config.max_body_bytes,
             max_hops: MAX_HOPS,
             s3: self.config.advertise_s3,
@@ -772,9 +767,10 @@ impl PeerHandler {
 
     fn ingest(&self, request: &Incoming) -> Reply {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
-        if let Err(denied) = self.authorized(request) {
-            return denied;
-        }
+        let principal = match self.authenticated(request, Op::Ingest) {
+            Ok(principal) => principal,
+            Err(denied) => return denied,
+        };
 
         let mut records: Vec<LogRecord> = Vec::new();
         for (index, line) in request.body.split(|b| *b == b'\n').enumerate() {
@@ -790,6 +786,15 @@ impl PeerHandler {
             }
         }
         self.stats.records.fetch_add(records.len() as u64, Ordering::Relaxed);
+
+        // The tenant is the principal's, whatever the records say, and the index must be one it may write.
+        // A record whose index is refused is left out here and counted (`GET /admin/v1/info`), as it was
+        // when the pipeline did this; a record for another tenant refuses the batch, and the sender keeps it.
+        if self.auth.admit(&principal, &mut records, crate::config::ATTR_INDEX, false).is_err() {
+            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+            self.auth.refuse(Listener::Peer, Refusal::WrongTenant);
+            return error_reply(403, "forbidden", "a record names a tenant other than this credential's");
+        }
 
         // Batches that timed out and synced since: saved first, so this request (often their resend) sees them.
         if let Some(acks) = &self.acks {
@@ -898,17 +903,16 @@ impl Handler for PeerHandler {
             (Method::Post, INGEST_PATH) => self.ingest(&request),
             (Method::Post, path @ (crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH | crate::parts::RETIRE_PATH)) => {
                 self.stats.requests.fetch_add(1, Ordering::Relaxed);
-                let node = match self.authenticated(&request) {
-                    Ok(node) => node,
+                let principal = match self.authenticated(&request, self.parts_op()) {
+                    Ok(principal) => principal,
                     Err(denied) => return denied,
                 };
                 let Some(parts) = &self.parts else {
                     return error_reply(404, "not_found", "this peer does not accept parts");
                 };
-                // The prefix a request may touch is the token's node and nothing else.
-                let Some(node) = node else {
-                    return error_reply(403, "no_node", "parts need a node token ([[peer.nodes]]); a shared token owns no prefix");
-                };
+                // The prefix a request may touch is the principal's own node id and nothing else: a node id
+                // in the body is checked against it (`PartsCentral::check_node`), never believed.
+                let node = principal.id.as_str();
                 match path {
                     crate::parts::PRESIGN_PATH => parts.presign(node, &request.body),
                     crate::parts::COMMIT_PATH => parts.commit(node, &request.body),
@@ -935,14 +939,14 @@ impl Handler for PeerHandler {
         if head.method == Method::Get && (head.path == crate::parts::REPLICA_CATALOG_PATH || head.path.starts_with(crate::parts::REPLICA_BLOB_PREFIX)) {
             return self.replication_gate(head);
         }
-        let (counted, ingest) = match (head.method, head.path) {
-            (Method::Get, CAPABILITY_PATH) => (false, false),
-            (Method::Post, INGEST_PATH) => (true, true),
+        let (counted, ingest, op) = match (head.method, head.path) {
+            (Method::Get, CAPABILITY_PATH) => (false, false, Op::Ingest),
+            (Method::Post, INGEST_PATH) => (true, true, Op::Ingest),
             // Parts take the same Content-Type rule as ingest: a typeless POST is a blind cross-site write.
-            (Method::Post, crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH | crate::parts::RETIRE_PATH) => (true, true),
+            (Method::Post, crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH | crate::parts::RETIRE_PATH) => (true, true, self.parts_op()),
             _ => return None,
         };
-        let refused = self.refuse_head(head, ingest);
+        let refused = self.refuse_head(head, ingest, op);
         if refused.is_some() && counted {
             self.stats.requests.fetch_add(1, Ordering::Relaxed);
         }
@@ -1023,14 +1027,6 @@ pub fn stamp_for_send(record: &mut LogRecord, own_instance: &str) {
     record.attributes.push(Attr { key: ATTR_HOPS.into(), value: AttrValue::I64(i64::from(hops)) });
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = u8::from(a.len() != b.len());
-    for i in 0..a.len().max(b.len()) {
-        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
-    }
-    diff == 0
-}
-
 fn error_reply(status: u16, code: &str, message: &str) -> Reply {
     Reply::json(status, serde_json::json!({ "error": code, "message": message }).to_string())
 }
@@ -1066,15 +1062,26 @@ impl Receiver {
         Self::start_in(config, instance, catalog, None, None, sink)
     }
 
+    /// As [`Receiver::start_with_auth`], knowing only this listener's own credentials (`tokens`, `nodes`,
+    /// `replication_tokens`) and the single tenant `default`: a listener run on its own.
+    pub fn start_in<F>(config: &PeerConfig, instance: String, catalog: Option<PathBuf>, data_dir: Option<&Path>, acks: Option<Arc<WalAcks>>, sink: F) -> Result<Self, PeerError>
+    where
+        F: Fn(Vec<LogRecord>) -> Admitted + Send + Sync + 'static,
+    {
+        let auth = crate::auth::Builder::standalone().peer(config).build();
+        Self::start_with_auth(config, instance, catalog, data_dir, acks, auth, sink)
+    }
+
     /// As [`Receiver::start_with_catalog`], with the dedupe window kept in [`DEDUPE_FILE`] under `data_dir`
     /// so it survives a restart, and `acks` to wait on when the sink answers [`Admitted::Pending`]. This is
-    /// how the agent runs it.
-    pub fn start_in<F>(
+    /// how the agent runs it. `auth` is the instance's one verifier: every credential this listener accepts.
+    pub fn start_with_auth<F>(
         config: &PeerConfig,
         instance: String,
         catalog: Option<PathBuf>,
         data_dir: Option<&Path>,
         acks: Option<Arc<WalAcks>>,
+        auth: Arc<Verifier>,
         sink: F,
     ) -> Result<Self, PeerError>
     where
@@ -1126,14 +1133,15 @@ impl Receiver {
         if config.parts.replication_tokens.iter().any(|t| config.tokens.contains(t) || config.nodes.iter().any(|n| &n.token == t)) {
             return Err(PeerError::BadNode("replication_tokens must differ from every peer token and node token".into()));
         }
-        if config.unauthenticated() && !is_loopback(&config.addr) {
-            return Err(PeerError::OpenOnPublicAddress { addr: config.addr.clone() });
-        }
         // A token that can be guessed online is no better than none once the listener is reachable.
         if !is_loopback(&config.addr) {
             if let Some(weak) = config.tokens.iter().chain(config.nodes.iter().map(|n| &n.token)).chain(&config.parts.replication_tokens).find(|t| t.len() < crate::admin_api::MIN_REMOTE_TOKEN_LEN) {
                 return Err(PeerError::WeakToken { addr: config.addr.clone(), len: weak.len() });
             }
+        }
+        // A listener that asks for a credential and could accept none would refuse every sender.
+        if (config.require_auth || !is_loopback(&config.addr)) && !auth.can_authenticate(Listener::Peer, Op::Ingest) {
+            return Err(PeerError::OpenOnPublicAddress { addr: config.addr.clone() });
         }
         let stats = Arc::new(PeerStats::default());
         let handler = Arc::new(PeerHandler {
@@ -1144,6 +1152,8 @@ impl Receiver {
             sink: Box::new(sink),
             acks,
             parts: parts.clone(),
+            auth,
+            open: config.unauthenticated(),
         });
         // One thread per connection, so `workers` sets how many senders are served at once; the head
         // and body must arrive within `REQUEST_TIMEOUT`, so a client that stalls frees its slot.
@@ -1846,18 +1856,28 @@ mod tests {
 
     #[test]
     fn the_token_comparison_looks_at_every_byte_and_cannot_be_fooled_by_length() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(constant_time_eq(b"", b""));
+        // The comparison is the verifier's now (a digest of what was presented against the digest of each
+        // key, `crate::auth`); the property is the same and is asked of it in both directions.
+        let accepts = |configured: &[u8], presented: &[u8]| {
+            let config = PeerConfig { tokens: vec![String::from_utf8(configured.to_vec()).unwrap()], ..PeerConfig::default() };
+            let verifier = crate::auth::Builder::new(Arc::new(crate::config::Tenancy::default())).peer(&config).build();
+            verifier.verify(Listener::Peer, std::str::from_utf8(presented).unwrap()).is_ok()
+        };
+        assert!(accepts(b"abc", b"abc"));
         for other in [&b"abd"[..], b"xbc", b"abcd", b"ab", b"", b"ABC"] {
-            assert!(!constant_time_eq(b"abc", other), "{other:?}");
-            assert!(!constant_time_eq(other, b"abc"), "{other:?}");
+            assert!(!accepts(b"abc", other), "{other:?}");
+            if !other.is_empty() {
+                assert!(!accepts(other, b"abc"), "{other:?}");
+            }
         }
+        // An empty string is not a credential, configured or presented.
+        assert!(!accepts(b"", b""));
         // A length difference that is a multiple of 256 vanishes if it is narrowed to a byte, and the
         // NUL padding then compares equal to the missing bytes.
         for extra in [256usize, 512, 65_536] {
             let padded = [&b"abc"[..], &vec![0u8; extra]].concat();
-            assert!(!constant_time_eq(b"abc", &padded), "+{extra} NULs");
-            assert!(!constant_time_eq(&padded, b"abc"), "+{extra} NULs");
+            assert!(!accepts(b"abc", &padded), "+{extra} NULs");
+            assert!(!accepts(&padded, b"abc"), "+{extra} NULs");
         }
     }
 

@@ -352,6 +352,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 peer: logless_core::peer::PeerConfig::default(),
                 sync_parts: Default::default(),
                 decision: logless_core::decision::DecisionConfig::default(),
+                auth: logless_core::auth::AuthConfig::default(),
+                principals: Vec::new(),
                 tenants: config::default_tenants(),
                 tail: Vec::new(),
                 destinations: Vec::new(),
@@ -1147,6 +1149,13 @@ fn run(
     let routes = Arc::new(config::RouteStats::default());
     tracing::info!(node = tenancy.node(), tenant = tenancy.tenant(), default_index = tenancy.default_index(), "store identity");
 
+    // Who may talk to this instance: one verifier for every listener (`docs/auth.md`). The credentials each
+    // listener always had are read as principals of the own tenant; `[[principals]]` adds named ones bound to a
+    // tenant; `[auth]` adds tokens signed by the broker, whose keys are refreshed on a thread of their own.
+    // Without `[auth]` there is no thread and no network call.
+    let verifier = logless_core::auth::Verifier::from_config(config, Arc::clone(&tenancy), Arc::clone(&routes))?;
+    let _auth_refresh = verifier.start_refresh();
+
     // Peer sync. The tap sits behind the WAL writer, so it sees exactly what the agent accepted and
     // costs one atomic load per batch while no peer is configured.
     // To its peers this instance is its node id: that is what `logless.origin` carries on the records it
@@ -1320,10 +1329,10 @@ fn run(
             let queue_capacity = config.ingest.queue_capacity;
             let queue_for_room = Arc::clone(&queue);
             let (hec_tenancy, hec_routes) = (Arc::clone(&tenancy), Arc::clone(&routes));
-            Some(hec::Receiver::start(&config.hec, Arc::clone(&acks), move |mut batch| {
-                // An event's `index` routes it. One the tenant does not have and refuses
-                // turns the whole request away with Splunk's code 7, before anything of it
-                // is admitted: an acked batch must be stored whole.
+            Some(hec::Receiver::start_with_auth(&config.hec, Arc::clone(&acks), Arc::clone(&verifier), move |mut batch| {
+                // The receiver has routed each event by its token's principal and its `index`
+                // (`auth::Verifier::admit`), so this finds every record already placed. It stays as
+                // the check that nothing reaches the queue unrouted.
                 for record in &mut batch.records {
                     match hec_tenancy.route_record(record, "index") {
                         Route::Known(_) => {}
@@ -1382,7 +1391,7 @@ fn run(
             peer_config.advertise_s3 = config.serve_s3.enabled;
             let data_dir = config.storage.data_dir.clone();
             let tickets = Arc::clone(&wal_acks);
-            Some(logless_core::peer::Receiver::start_in(&peer_config, instance_id.clone(), Some(config.catalog_path()), Some(&data_dir), Some(Arc::clone(&wal_acks)), move |records| {
+            Some(logless_core::peer::Receiver::start_with_auth(&peer_config, instance_id.clone(), Some(config.catalog_path()), Some(&data_dir), Some(Arc::clone(&wal_acks)), Arc::clone(&verifier), move |records| {
                 // Refuse rather than shed: the sender holds the batch and retries, which is the right answer
                 // to a peer that is outrunning us, and a shed record would be one the peer already forgot.
                 if queue_capacity.saturating_sub(queue_for_room.len()) < records.len() {
@@ -1438,13 +1447,14 @@ fn run(
             listeners,
         );
         service.set_sync(Arc::clone(&sync_control));
+        service.set_auth(Arc::clone(&verifier));
         if let Some(r) = &peer_receiver {
             service.set_peer_stats(r.stats_handle());
             if let Some(parts) = r.parts_handle() {
                 service.set_parts(parts);
             }
         }
-        let server = AdminServer::start(&config.admin, service)?;
+        let server = AdminServer::start_with_auth(&config.admin, service, Arc::clone(&verifier))?;
         tracing::info!(addr = %server.local_addr(), "admin api listening");
         Some(server)
     } else {
@@ -1472,10 +1482,11 @@ fn run(
                 .as_ref()
                 .map(|_| sentry::Upstream::new(Box::new(HttpTransport::default())));
             let sentry_spool = config.storage.data_dir.join("sentry-spool");
-            Some(sentry::Receiver::start(
+            Some(sentry::Receiver::start_with_auth(
                 &config.sentry,
                 upstream,
                 Some(sentry_spool.as_path()),
+                Arc::clone(&verifier),
                 move |records| {
                     match tx.try_send(records) {
                         Ok(()) => sentry::Admitted::Accepted,
@@ -1493,7 +1504,7 @@ fn run(
     let mut otlp_receiver = match (&otlp_tx, config.otlp.enabled) {
         (Some(tx), true) => {
             let tx = tx.clone();
-            Some(otlp::Receiver::start(&config.otlp, move |records| {
+            Some(otlp::Receiver::start_with_auth(&config.otlp, Arc::clone(&verifier), move |records| {
                 match tx.try_send(records) {
                     Ok(()) => Accepted::All,
                     Err(_) => Accepted::Rejected,
@@ -1508,7 +1519,12 @@ fn run(
     let mut otlp_grpc_receiver = match (&otlp_tx, config.otlp.grpc.enabled) {
         (Some(tx), true) => {
             let tx = tx.clone();
-            Some(otlp::GrpcReceiver::start(&config.otlp.grpc, move |records| {
+            Some(otlp::GrpcReceiver::start(&config.otlp.grpc, move |mut records| {
+                // The gRPC transport asks for no credential, so its records are the instance's own
+                // tenant. The attribute that carries another tenant is a listener's to set, never a sender's.
+                for record in &mut records {
+                    record.attributes.retain(|a| a.key != logless_core::auth::ATTR_TENANT);
+                }
                 match tx.try_send(records) {
                     Ok(()) => Accepted::All,
                     Err(_) => Accepted::Rejected,
@@ -1963,6 +1979,7 @@ fn run(
         sentry_summary = Some(s);
         sentry_upstream_summary = Some(upstream);
     }
+    verifier.stop_refresh();
     if let Some(server) = admin_server.take() {
         server.shutdown();
         tracing::info!("admin api stopped");

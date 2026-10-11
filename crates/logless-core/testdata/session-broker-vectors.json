@@ -1,0 +1,313 @@
+{
+  "audience": "logless",
+  "cases": [
+    {
+      "description": "A valid machine token, checked ten seconds after issue.",
+      "expect": {
+        "result": "accept"
+      },
+      "id": "V1.accept",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790086400,
+        "iat": 1790000000,
+        "indexes": [
+          "default"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "AAAAAAAAAAAAAAAAAAAAAA",
+        "kind": "ingest",
+        "name": "edge-1",
+        "scopes": [
+          "ingest"
+        ],
+        "sub": "sp_a1b2c3d4e5f6g7h8",
+        "tenant": "acme"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJzcF9hMWIyYzNkNGU1ZjZnN2g4IiwiYXVkIjoibG9nbGVzcyIsImV4cCI6MTc5MDA4NjQwMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwidGVuYW50IjoiYWNtZSIsImtpbmQiOiJpbmdlc3QiLCJuYW1lIjoiZWRnZS0xIiwic2NvcGVzIjpbImluZ2VzdCJdLCJpbmRleGVzIjpbImRlZmF1bHQiXX0.yqpwOkEHAPiDLAuOpFNpRhQUk7wAKNg_Yf2vEbIBuEatpQ-hnMxQn0pd832Ophz-rlAZ3ki1Os4ctveKFGtODQ",
+      "verify_at": 1790000010
+    },
+    {
+      "description": "The same token 200 s past exp: inside the 300 s allowance, so still accepted.",
+      "expect": {
+        "result": "accept"
+      },
+      "id": "V1.accept-inside-allowance-after-exp",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790086400,
+        "iat": 1790000000,
+        "indexes": [
+          "default"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "AAAAAAAAAAAAAAAAAAAAAA",
+        "kind": "ingest",
+        "name": "edge-1",
+        "scopes": [
+          "ingest"
+        ],
+        "sub": "sp_a1b2c3d4e5f6g7h8",
+        "tenant": "acme"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJzcF9hMWIyYzNkNGU1ZjZnN2g4IiwiYXVkIjoibG9nbGVzcyIsImV4cCI6MTc5MDA4NjQwMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwidGVuYW50IjoiYWNtZSIsImtpbmQiOiJpbmdlc3QiLCJuYW1lIjoiZWRnZS0xIiwic2NvcGVzIjpbImluZ2VzdCJdLCJpbmRleGVzIjpbImRlZmF1bHQiXX0.yqpwOkEHAPiDLAuOpFNpRhQUk7wAKNg_Yf2vEbIBuEatpQ-hnMxQn0pd832Ophz-rlAZ3ki1Os4ctveKFGtODQ",
+      "verify_at": 1790086600
+    },
+    {
+      "description": "The same token checked 200 s before iat, as a verifier with a slow clock would: accepted.",
+      "expect": {
+        "result": "accept"
+      },
+      "id": "V1.accept-inside-allowance-before-iat",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790086400,
+        "iat": 1790000000,
+        "indexes": [
+          "default"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "AAAAAAAAAAAAAAAAAAAAAA",
+        "kind": "ingest",
+        "name": "edge-1",
+        "scopes": [
+          "ingest"
+        ],
+        "sub": "sp_a1b2c3d4e5f6g7h8",
+        "tenant": "acme"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJzcF9hMWIyYzNkNGU1ZjZnN2g4IiwiYXVkIjoibG9nbGVzcyIsImV4cCI6MTc5MDA4NjQwMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwidGVuYW50IjoiYWNtZSIsImtpbmQiOiJpbmdlc3QiLCJuYW1lIjoiZWRnZS0xIiwic2NvcGVzIjpbImluZ2VzdCJdLCJpbmRleGVzIjpbImRlZmF1bHQiXX0.yqpwOkEHAPiDLAuOpFNpRhQUk7wAKNg_Yf2vEbIBuEatpQ-hnMxQn0pd832Ophz-rlAZ3ki1Os4ctveKFGtODQ",
+      "verify_at": 1789999800
+    },
+    {
+      "description": "The same token 301 s past exp: outside the allowance.",
+      "expect": {
+        "reason": "expired",
+        "result": "reject"
+      },
+      "id": "V1.expired",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790086400,
+        "iat": 1790000000,
+        "indexes": [
+          "default"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "AAAAAAAAAAAAAAAAAAAAAA",
+        "kind": "ingest",
+        "name": "edge-1",
+        "scopes": [
+          "ingest"
+        ],
+        "sub": "sp_a1b2c3d4e5f6g7h8",
+        "tenant": "acme"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJzcF9hMWIyYzNkNGU1ZjZnN2g4IiwiYXVkIjoibG9nbGVzcyIsImV4cCI6MTc5MDA4NjQwMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwidGVuYW50IjoiYWNtZSIsImtpbmQiOiJpbmdlc3QiLCJuYW1lIjoiZWRnZS0xIiwic2NvcGVzIjpbImluZ2VzdCJdLCJpbmRleGVzIjpbImRlZmF1bHQiXX0.yqpwOkEHAPiDLAuOpFNpRhQUk7wAKNg_Yf2vEbIBuEatpQ-hnMxQn0pd832Ophz-rlAZ3ki1Os4ctveKFGtODQ",
+      "verify_at": 1790086701
+    },
+    {
+      "description": "The same token checked 301 s before iat: outside the allowance.",
+      "expect": {
+        "reason": "not_yet_valid",
+        "result": "reject"
+      },
+      "id": "V1.issued-in-the-future",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790086400,
+        "iat": 1790000000,
+        "indexes": [
+          "default"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "AAAAAAAAAAAAAAAAAAAAAA",
+        "kind": "ingest",
+        "name": "edge-1",
+        "scopes": [
+          "ingest"
+        ],
+        "sub": "sp_a1b2c3d4e5f6g7h8",
+        "tenant": "acme"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJzcF9hMWIyYzNkNGU1ZjZnN2g4IiwiYXVkIjoibG9nbGVzcyIsImV4cCI6MTc5MDA4NjQwMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwidGVuYW50IjoiYWNtZSIsImtpbmQiOiJpbmdlc3QiLCJuYW1lIjoiZWRnZS0xIiwic2NvcGVzIjpbImluZ2VzdCJdLCJpbmRleGVzIjpbImRlZmF1bHQiXX0.yqpwOkEHAPiDLAuOpFNpRhQUk7wAKNg_Yf2vEbIBuEatpQ-hnMxQn0pd832Ophz-rlAZ3ki1Os4ctveKFGtODQ",
+      "verify_at": 1789999699
+    },
+    {
+      "description": "Correctly signed, but aud names another product.",
+      "expect": {
+        "reason": "audience",
+        "result": "reject"
+      },
+      "id": "V2.audience",
+      "payload": {
+        "aud": "other-product",
+        "exp": 1790086400,
+        "iat": 1790000000,
+        "indexes": [
+          "default"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "AAAAAAAAAAAAAAAAAAAAAA",
+        "kind": "ingest",
+        "name": "edge-1",
+        "scopes": [
+          "ingest"
+        ],
+        "sub": "sp_a1b2c3d4e5f6g7h8",
+        "tenant": "acme"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJzcF9hMWIyYzNkNGU1ZjZnN2g4IiwiYXVkIjoib3RoZXItcHJvZHVjdCIsImV4cCI6MTc5MDA4NjQwMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwidGVuYW50IjoiYWNtZSIsImtpbmQiOiJpbmdlc3QiLCJuYW1lIjoiZWRnZS0xIiwic2NvcGVzIjpbImluZ2VzdCJdLCJpbmRleGVzIjpbImRlZmF1bHQiXX0.Mcpfx40EtKeFQBgUTGlY9HxYYdK-9Whd5_dxS6IJ4OK5bxz6siKlLrVxvwdW7FQxMrFYK6yIoZ_FQ1YYt748Aw",
+      "verify_at": 1790000010
+    },
+    {
+      "description": "V1's claims re-signed as HS256 with the public key bytes as the HMAC secret, under the real kid.",
+      "expect": {
+        "reason": "alg",
+        "result": "reject"
+      },
+      "id": "V2.alg-hs256",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790086400,
+        "iat": 1790000000,
+        "indexes": [
+          "default"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "AAAAAAAAAAAAAAAAAAAAAA",
+        "kind": "ingest",
+        "name": "edge-1",
+        "scopes": [
+          "ingest"
+        ],
+        "sub": "sp_a1b2c3d4e5f6g7h8",
+        "tenant": "acme"
+      },
+      "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJzcF9hMWIyYzNkNGU1ZjZnN2g4IiwiYXVkIjoibG9nbGVzcyIsImV4cCI6MTc5MDA4NjQwMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwidGVuYW50IjoiYWNtZSIsImtpbmQiOiJpbmdlc3QiLCJuYW1lIjoiZWRnZS0xIiwic2NvcGVzIjpbImluZ2VzdCJdLCJpbmRleGVzIjpbImRlZmF1bHQiXX0.JgNF0foxcofN4I0zFOPys7rjz3KvGdt6fKs_29HIgLs",
+      "verify_at": 1790000010
+    },
+    {
+      "description": "V1's header and signature around a payload that names another tenant.",
+      "expect": {
+        "reason": "signature",
+        "result": "reject"
+      },
+      "id": "V2.tampered-payload",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790086400,
+        "iat": 1790000000,
+        "indexes": [
+          "default"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "AAAAAAAAAAAAAAAAAAAAAA",
+        "kind": "ingest",
+        "name": "edge-1",
+        "scopes": [
+          "ingest"
+        ],
+        "sub": "sp_a1b2c3d4e5f6g7h8",
+        "tenant": "someone-else"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJzcF9hMWIyYzNkNGU1ZjZnN2g4IiwiYXVkIjoibG9nbGVzcyIsImV4cCI6MTc5MDA4NjQwMCwiaWF0IjoxNzkwMDAwMDAwLCJqdGkiOiJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwidGVuYW50Ijoic29tZW9uZS1lbHNlIiwia2luZCI6ImluZ2VzdCIsIm5hbWUiOiJlZGdlLTEiLCJzY29wZXMiOlsiaW5nZXN0Il0sImluZGV4ZXMiOlsiZGVmYXVsdCJdfQ.yqpwOkEHAPiDLAuOpFNpRhQUk7wAKNg_Yf2vEbIBuEatpQ-hnMxQn0pd832Ophz-rlAZ3ki1Os4ctveKFGtODQ",
+      "verify_at": 1790000010
+    },
+    {
+      "description": "A valid user token, checked 30 s after issue.",
+      "expect": {
+        "result": "accept"
+      },
+      "id": "V3.accept",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790003600,
+        "iat": 1790000000,
+        "indexes": [
+          "*"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "BBBBBBBBBBBBBBBBBBBBBB",
+        "kind": "user",
+        "roles": [
+          "viewer"
+        ],
+        "sid": "sid_0123456789abcdef",
+        "sub": "auth0|user-42",
+        "tenant": "acme"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJhdXRoMHx1c2VyLTQyIiwic2lkIjoic2lkXzAxMjM0NTY3ODlhYmNkZWYiLCJhdWQiOiJsb2dsZXNzIiwiZXhwIjoxNzkwMDAzNjAwLCJpYXQiOjE3OTAwMDAwMDAsImp0aSI6IkJCQkJCQkJCQkJCQkJCQkJCQkJCQkIiLCJraW5kIjoidXNlciIsInRlbmFudCI6ImFjbWUiLCJyb2xlcyI6WyJ2aWV3ZXIiXSwiaW5kZXhlcyI6WyIqIl19.CyGSyN_E3e3iIPN10L_Z0etwBLLNfqZMWmAEF6OHA2q5MefcNTsX8tL6Ejo1iJD6ZAYU13O57ck8plg-e0a9CA",
+      "verify_at": 1790000030
+    },
+    {
+      "description": "The same user token 301 s past exp.",
+      "expect": {
+        "reason": "expired",
+        "result": "reject"
+      },
+      "id": "V3.expired",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790003600,
+        "iat": 1790000000,
+        "indexes": [
+          "*"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "BBBBBBBBBBBBBBBBBBBBBB",
+        "kind": "user",
+        "roles": [
+          "viewer"
+        ],
+        "sid": "sid_0123456789abcdef",
+        "sub": "auth0|user-42",
+        "tenant": "acme"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImhtSDQ0bXZDVWVJIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJhdXRoMHx1c2VyLTQyIiwic2lkIjoic2lkXzAxMjM0NTY3ODlhYmNkZWYiLCJhdWQiOiJsb2dsZXNzIiwiZXhwIjoxNzkwMDAzNjAwLCJpYXQiOjE3OTAwMDAwMDAsImp0aSI6IkJCQkJCQkJCQkJCQkJCQkJCQkJCQkIiLCJraW5kIjoidXNlciIsInRlbmFudCI6ImFjbWUiLCJyb2xlcyI6WyJ2aWV3ZXIiXSwiaW5kZXhlcyI6WyIqIl19.CyGSyN_E3e3iIPN10L_Z0etwBLLNfqZMWmAEF6OHA2q5MefcNTsX8tL6Ejo1iJD6ZAYU13O57ck8plg-e0a9CA",
+      "verify_at": 1790003901
+    },
+    {
+      "description": "A user token signed by the right key but naming a kid the key set does not contain.",
+      "expect": {
+        "reason": "unknown_kid",
+        "result": "reject"
+      },
+      "id": "V3.unknown-kid",
+      "payload": {
+        "aud": "logless",
+        "exp": 1790003600,
+        "iat": 1790000000,
+        "indexes": [
+          "*"
+        ],
+        "iss": "https://broker.example.test",
+        "jti": "BBBBBBBBBBBBBBBBBBBBBB",
+        "kind": "user",
+        "roles": [
+          "viewer"
+        ],
+        "sid": "sid_0123456789abcdef",
+        "sub": "auth0|user-42",
+        "tenant": "acme"
+      },
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6IkFBQUFBQUFBQUFBIn0.eyJpc3MiOiJodHRwczovL2Jyb2tlci5leGFtcGxlLnRlc3QiLCJzdWIiOiJhdXRoMHx1c2VyLTQyIiwic2lkIjoic2lkXzAxMjM0NTY3ODlhYmNkZWYiLCJhdWQiOiJsb2dsZXNzIiwiZXhwIjoxNzkwMDAzNjAwLCJpYXQiOjE3OTAwMDAwMDAsImp0aSI6IkJCQkJCQkJCQkJCQkJCQkJCQkJCQkIiLCJraW5kIjoidXNlciIsInRlbmFudCI6ImFjbWUiLCJyb2xlcyI6WyJ2aWV3ZXIiXSwiaW5kZXhlcyI6WyIqIl19.MnULSXLopJBhy9lHCDrMikum_Jk4rkTVSZ5cupQ2A2yjetVHUVa4iVIWMNxGLkPs0MXzqX8zsyTRHIu5ihlECA",
+      "verify_at": 1790000030
+    }
+  ],
+  "clock_allowance_secs": 300,
+  "description": "Test vectors for verifying tokens issued by session-broker. See docs/verifier/README.md for the checks, in order. Generated by repo/crates/session-broker/src/issuer/vectors.rs from a fixed test-only seed; do not edit by hand.",
+  "issuer": "https://broker.example.test",
+  "jwks": {
+    "keys": [
+      {
+        "alg": "EdDSA",
+        "crv": "Ed25519",
+        "kid": "hmH44mvCUeI",
+        "kty": "OKP",
+        "use": "sig",
+        "x": "606nBrIoAscX3mV8WxWKTOKsyysbgV6FDkMqPcebrig"
+      }
+    ]
+  }
+}

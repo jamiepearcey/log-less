@@ -1071,6 +1071,7 @@ dependencies = [
  "humantime-serde",
  "parquet",
  "postcard",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

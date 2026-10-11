@@ -35,6 +35,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::auth::{Listener, NotAdmitted, Op, Principal, Refusal, Verifier};
 use crate::bounded_http::{self, BoundedServer};
 use crate::httpd::{self, Handler, Incoming, Limits, Method, Reject, Reply};
 use crate::model::LogRecord;
@@ -79,6 +80,11 @@ pub struct HecConfig {
     /// misconfiguration cannot expose an open ingest endpoint to the network.
     #[serde(default)]
     pub tokens: Vec<String>,
+    /// Ask every request for a token even though `tokens` is empty: the setting for an instance whose
+    /// senders are all `[[principals]]` (a HEC token is a principal's key, `docs/auth.md`). A
+    /// non-loopback bind always asks.
+    #[serde(default)]
+    pub require_auth: bool,
     /// Serve indexer acknowledgement. Off by default because a client that
     /// enables `useACK` against a server that does not support it fails loudly,
     /// which is better than the reverse.
@@ -112,6 +118,7 @@ impl Default for HecConfig {
             addr: default_hec_addr(),
             workers: default_hec_workers(),
             tokens: Vec::new(),
+            require_auth: false,
             ack_enabled: false,
             max_body_bytes: default_hec_max_body(),
             max_decompressed_bytes: default_hec_max_decompressed(),
@@ -184,7 +191,7 @@ pub enum HecError {
     #[error(transparent)]
     Http(#[from] httpd::HttpError),
     #[error(
-        "hec.tokens is empty, which accepts any token; refusing to bind the non-loopback address {addr}"
+        "the hec listener on {addr} has no token it could accept (hec.tokens, [[principals]] or [auth]); refusing to bind a non-loopback address that would accept any"
     )]
     OpenOnPublicAddress { addr: String },
 }
@@ -201,17 +208,33 @@ struct HecHandler {
     stats: Arc<HecStats>,
     acks: Arc<AckTable>,
     sink: Box<dyn Fn(Batch) -> Admitted + Send + Sync>,
+    auth: Arc<Verifier>,
+    /// Accepts any token, and none: `tokens` is empty and the bind is loopback.
+    open: bool,
 }
 
 impl HecHandler {
-    fn authorized(&self, request: &Incoming) -> Result<(), Reply> {
+    /// Who the request is from: the principal its token is the key of (`crate::auth`). A token is a
+    /// `hec.tokens` entry, a `[[principals]]` key or a broker token.
+    fn authorized(&self, request: &Incoming) -> Result<Arc<Principal>, Reply> {
+        let header = request.header("authorization").unwrap_or("").trim();
+        let splunk = || header.strip_prefix("Splunk ").or_else(|| header.strip_prefix("splunk ")).map(str::trim);
+        let from_query: Vec<String> = if header.is_empty() {
+            // Splunk also accepts the token as a query parameter for clients
+            // that cannot set headers.
+            event::query_pairs(request.query).into_iter().filter(|(k, _)| k == "token").map(|(_, v)| v).collect()
+        } else {
+            Vec::new()
+        };
         // An empty token list accepts anything, including a request that
-        // presents nothing at all — otherwise "no tokens configured" would
+        // presents nothing at all: otherwise "no tokens configured" would
         // reject every client instead of accepting every client, which is the
         // opposite of what it reads as. Only reachable on loopback: see
-        // `Receiver::start`.
-        if self.config.tokens.is_empty() {
-            return Ok(());
+        // `Receiver::start`. A token that is a principal's key still names
+        // that principal.
+        if self.open {
+            let one = request.header_count("authorization") <= 1;
+            return self.check_token(splunk().filter(|_| one).or(from_query.first().map(String::as_str).filter(|_| from_query.len() == 1)));
         }
         // A token given twice is ambiguous (a proxy may act on the other one),
         // so neither counts.
@@ -219,19 +242,12 @@ impl HecHandler {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
             return Err(reply(401, code::INVALID_AUTHORIZATION, "Invalid authorization"));
         }
-        let header = request.header("authorization").unwrap_or("").trim();
         if header.is_empty() {
-            // Splunk also accepts the token as a query parameter for clients
-            // that cannot set headers.
-            let from_query: Vec<String> = event::query_pairs(request.query)
-                .into_iter()
-                .filter(|(k, _)| k == "token")
-                .map(|(_, v)| v)
-                .collect();
             return match from_query.as_slice() {
-                [token] => self.check_token(token),
+                [token] => self.check_token(Some(token)),
                 [] => {
                     self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                    self.auth.refuse(Listener::Hec, Refusal::Missing);
                     Err(reply(401, code::TOKEN_REQUIRED, "Token is required"))
                 }
                 _ => {
@@ -240,28 +256,19 @@ impl HecHandler {
                 }
             };
         }
-        let Some(token) = header
-            .strip_prefix("Splunk ")
-            .or_else(|| header.strip_prefix("splunk "))
-        else {
+        let Some(token) = splunk() else {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
             return Err(reply(401, code::INVALID_AUTHORIZATION, "Invalid authorization"));
         };
-        self.check_token(token.trim())
+        self.check_token(Some(token))
     }
 
-    fn check_token(&self, token: &str) -> Result<(), Reply> {
-        if self.config.tokens.is_empty() {
-            return Ok(());
-        }
-        // Length-independent comparison is not the point here — a HEC token is
-        // not a password hash and the endpoint is loopback by default — but an
-        // exact match against the configured set is.
-        if self.config.tokens.iter().any(|t| t == token) {
-            return Ok(());
-        }
-        self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
-        Err(reply(403, code::INVALID_TOKEN, "Invalid token"))
+    /// The comparison is the verifier's: by digest, the same time for any token.
+    fn check_token(&self, token: Option<&str>) -> Result<Arc<Principal>, Reply> {
+        self.auth.authorize(Listener::Hec, Op::Ingest, !self.open, token).map_err(|_| {
+            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+            reply(403, code::INVALID_TOKEN, "Invalid token")
+        })
     }
 
     fn channel(&self, request: &Incoming) -> Option<String> {
@@ -278,10 +285,13 @@ impl HecHandler {
     }
 
     fn ingest(&self, request: &Incoming, raw: bool) -> Reply {
-        if let Err(denied) = self.authorized(request) {
-            self.stats.requests.fetch_add(1, Ordering::Relaxed);
-            return denied;
-        }
+        let principal = match self.authorized(request) {
+            Ok(principal) => principal,
+            Err(denied) => {
+                self.stats.requests.fetch_add(1, Ordering::Relaxed);
+                return denied;
+            }
+        };
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
 
         // No channel means no ack, not an error. Splunk enables acknowledgement
@@ -298,7 +308,7 @@ impl HecHandler {
         } else {
             event::parse_event_body(&request.body, &defaults, now)
         };
-        let records = match parsed {
+        let mut records = match parsed {
             Ok(r) => r,
             Err(e) => {
                 self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
@@ -311,6 +321,23 @@ impl HecHandler {
                 return reply(status, code, &title_case(&e.to_string()));
             }
         };
+
+        // The token's principal decides the tenant, and an event's `index` routes it within that tenant.
+        // An index the tenant does not have (or the principal may not use) and refuses turns the whole
+        // request away with Splunk's code 7, before anything of it is admitted: an acked batch must be
+        // stored whole.
+        match self.auth.admit(&principal, &mut records, "index", true) {
+            Ok(_) => {}
+            Err(NotAdmitted::Index) => {
+                self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
+                return reply(400, code::INCORRECT_INDEX, "Incorrect index");
+            }
+            Err(NotAdmitted::WrongTenant) => {
+                self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                self.auth.refuse(Listener::Hec, Refusal::WrongTenant);
+                return reply(403, code::INVALID_AUTHORIZATION, "Forbidden");
+            }
+        }
 
         // A channel whose acks have stalled is refused before the data is
         // admitted: the alternative is either an unbounded ack map or acking
@@ -425,7 +452,7 @@ impl Handler for HecHandler {
         // POST, or its own name in `Host` after DNS rebinding. No HEC client
         // sends either of the first two.
         let browser = head.header("origin").is_some() || head.header("sec-fetch-site").is_some();
-        let (refused, counter) = if self.config.tokens.is_empty() && (browser || !bounded_http::loopback_host(head)) {
+        let (refused, counter) = if self.open && (browser || !bounded_http::loopback_host(head)) {
             (reply(403, code::INVALID_AUTHORIZATION, "Forbidden"), Some(&self.stats.unauthorized))
         } else if let Err(denied) = self.authorized(head) {
             (denied, None)
@@ -473,10 +500,22 @@ impl Receiver {
     where
         F: Fn(Batch) -> Admitted + Send + Sync + 'static,
     {
+        let auth = crate::auth::Builder::standalone().hec(config).build();
+        Self::start_with_auth(config, acks, auth, sink)
+    }
+
+    /// As [`Receiver::start`], with the instance's one verifier: every token this listener accepts, and
+    /// the tenants and indexes its events are routed to.
+    pub fn start_with_auth<F>(config: &HecConfig, acks: Arc<AckTable>, auth: Arc<Verifier>, sink: F) -> Result<Self, HecError>
+    where
+        F: Fn(Batch) -> Admitted + Send + Sync + 'static,
+    {
         // An empty token list means "accept anything". That is a reasonable
         // trial setting on loopback and an open ingest endpoint anywhere else,
-        // so it is refused rather than warned about.
-        if config.tokens.is_empty() && !is_loopback(&config.addr) {
+        // so off loopback (or with `require_auth`) a token is always asked
+        // for, and there has to be one that could be accepted.
+        let open = config.tokens.is_empty() && !config.require_auth && is_loopback(&config.addr);
+        if !open && !auth.can_authenticate(Listener::Hec, Op::Ingest) {
             return Err(HecError::OpenOnPublicAddress { addr: config.addr.clone() });
         }
 
@@ -486,6 +525,8 @@ impl Receiver {
             stats: Arc::clone(&stats),
             acks,
             sink: Box::new(sink),
+            auth,
+            open,
         });
         let server = BoundedServer::start(
             &config.addr,

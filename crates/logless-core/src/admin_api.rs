@@ -14,7 +14,6 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::budget::{DiskUsage, Pressure};
 use crate::catalog::Catalog;
@@ -76,7 +75,7 @@ impl std::fmt::Debug for AdminConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
-    #[error("admin api has no token; set {TOKEN_ENV} or [admin].token (every request needs one, including GET)")]
+    #[error("admin api has no token; set {TOKEN_ENV} or [admin].token, or add a [[principals]] entry of kind admin (every request needs a credential, including GET)")]
     MissingToken,
     #[error(
         "admin api token is {len} characters; binding the non-loopback address {addr} needs at least {MIN_REMOTE_TOKEN_LEN}"
@@ -166,6 +165,8 @@ pub struct AdminService {
     /// The part store the peer receiver serves, when it serves one: the sweep and the status use it, so
     /// they see the same disk budget the uploads do.
     parts_store: OnceLock<Arc<crate::parts::PartsCentral>>,
+    /// The instance's verifier, for the `auth` section of `GET /admin/v1/info`.
+    auth: OnceLock<Arc<crate::auth::Verifier>>,
 }
 
 type Resp = (u16, Value);
@@ -342,6 +343,7 @@ impl AdminService {
             parts: config.peer.parts.clone(),
             peer: OnceLock::new(),
             parts_store: OnceLock::new(),
+            auth: OnceLock::new(),
         })
     }
 
@@ -369,6 +371,11 @@ impl AdminService {
     }
 
     /// Hands the service the peer receiver's counters, which `/admin/v1/sync` reports as `receiver`.
+    /// Who is configured, who was seen and what was refused, in `GET /admin/v1/info`.
+    pub fn set_auth(&self, auth: Arc<crate::auth::Verifier>) {
+        let _ = self.auth.set(auth);
+    }
+
     pub fn set_peer_stats(&self, stats: Arc<crate::peer::PeerStats>) {
         let _ = self.peer.set(stats);
     }
@@ -781,6 +788,8 @@ impl AdminService {
                     "indexes": self.tenancy.indexes().map(|(tenant, index, _)| json!({"tenant": tenant, "index": index})).collect::<Vec<_>>(),
                 },
                 "store": {"files": files, "rows": rows, "bytes": bytes},
+                // Principals by id, refusals by reason, and the age of the broker's key set. Never a key.
+                "auth": self.auth.get().map(|a| a.status()),
             }),
         )
     }
@@ -1065,21 +1074,6 @@ fn stale(current_version: u64) -> Resp {
 
 // --- HTTP ---------------------------------------------------------------
 
-fn digest(s: &str) -> [u8; 32] {
-    Sha256::digest(s.as_bytes()).into()
-}
-
-/// Compares digests, not the tokens: equal-length inputs make the comparison
-/// time independent of where the first mismatch is, and of the token length.
-fn token_matches(expected: &[u8; 32], presented: &str) -> bool {
-    let got = digest(presented);
-    let mut diff = 0u8;
-    for (a, b) in expected.iter().zip(got.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
-
 /// Strict `host[:port]` / `[v6][:port]` check. Anything that is not exactly
 /// that (userinfo, trailing junk, odd characters) is refused rather than
 /// prefix-matched, so `localhost:80@evil.com` is not loopback.
@@ -1112,7 +1106,9 @@ pub(crate) fn host_allowed(host_header: Option<&str>, allowed: &[String]) -> boo
 
 struct Api {
     service: Arc<AdminService>,
-    token: [u8; 32],
+    /// Who may call: the admin token, a `[[principals]]` key of kind admin, or a broker token of kind
+    /// admin (`crate::auth`). Keys are compared by digest, so the time taken says nothing about them.
+    auth: Arc<crate::auth::Verifier>,
     allowed_hosts: Vec<String>,
 }
 
@@ -1146,9 +1142,15 @@ impl Handler for Api {
             .filter(|_| req.header_count("authorization") == 1)
             .and_then(|v| v.trim().strip_prefix("Bearer ").or_else(|| v.trim().strip_prefix("bearer ")))
             .map(str::trim);
-        if !presented.is_some_and(|t| token_matches(&self.token, t)) {
-            return reply(err(401, "unauthorized", "a valid bearer token is required"))
-                .with_header("WWW-Authenticate", "Bearer");
+        let principal = match self.auth.authorize(crate::auth::Listener::Admin, crate::auth::Op::Admin, true, presented) {
+            Ok(principal) => principal,
+            Err(_) => {
+                return reply(err(401, "unauthorized", "a valid bearer token is required")).with_header("WWW-Authenticate", "Bearer");
+            }
+        };
+        // Who changed something, by id. Reads are not logged: the console polls them.
+        if req.method != Method::Get {
+            tracing::info!(principal = %principal.id, method = req.method_name, path = req.path, "admin api call");
         }
 
         let s = &self.service;
@@ -1217,6 +1219,11 @@ impl Handler for Api {
     }
 }
 
+/// The admin token: `LOGLESS_ADMIN_TOKEN`, else `[admin] token`.
+pub fn configured_token(cfg: &AdminConfig) -> Option<String> {
+    std::env::var(TOKEN_ENV).ok().filter(|t| !t.is_empty()).or_else(|| cfg.token.clone().filter(|t| !t.is_empty()))
+}
+
 /// A running admin listener; stop it with [`AdminServer::shutdown`].
 pub struct AdminServer {
     server: BoundedServer,
@@ -1224,11 +1231,19 @@ pub struct AdminServer {
 
 impl AdminServer {
     pub fn start(cfg: &AdminConfig, service: Arc<AdminService>) -> Result<Self, AdminError> {
-        let token = std::env::var(TOKEN_ENV)
-            .ok()
-            .filter(|t| !t.is_empty())
-            .or_else(|| cfg.token.clone().filter(|t| !t.is_empty()))
-            .ok_or(AdminError::MissingToken)?;
+        let token = configured_token(cfg);
+        let auth = crate::auth::Builder::standalone().admin(token.as_ref()).build();
+        Self::start_with_auth(cfg, service, auth)
+    }
+
+    /// As [`AdminServer::start`], with the instance's one verifier: the admin token, and any
+    /// `[[principals]]` key or broker token of kind admin.
+    pub fn start_with_auth(cfg: &AdminConfig, service: Arc<AdminService>, auth: Arc<crate::auth::Verifier>) -> Result<Self, AdminError> {
+        // Every request needs a credential, so there has to be one that could be accepted.
+        if !auth.can_authenticate(crate::auth::Listener::Admin, crate::auth::Op::Admin) {
+            return Err(AdminError::MissingToken);
+        }
+        let token = configured_token(cfg);
 
         let addrs: Vec<SocketAddr> = cfg
             .addr
@@ -1238,13 +1253,13 @@ impl AdminServer {
         if addrs.is_empty() {
             return Err(HttpError::NoAddress { addr: cfg.addr.clone() }.into());
         }
-        if !addrs.iter().all(|a| a.ip().is_loopback()) && token.len() < MIN_REMOTE_TOKEN_LEN {
+        if let Some(token) = token.filter(|t| !addrs.iter().all(|a| a.ip().is_loopback()) && t.len() < MIN_REMOTE_TOKEN_LEN) {
             return Err(AdminError::WeakToken { addr: cfg.addr.clone(), len: token.len() });
         }
 
         let api = Arc::new(Api {
             service: Arc::clone(&service),
-            token: digest(&token),
+            auth,
             allowed_hosts: cfg.allowed_hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
         });
         let limits = Limits { max_body_bytes: MAX_BODY_BYTES, max_decompressed_bytes: MAX_BODY_BYTES };

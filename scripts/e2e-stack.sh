@@ -5,6 +5,8 @@
 # records, waits for sync, uploads parts, then checks counts, part checksums, peer counters, logs and shutdown. A
 # second edge (node edge-3, upload timer on, nothing sent but parts) then has central frozen and stopped in the middle
 # of its uploads and started again (no part lost, none duplicated), and its files removed by disk pressure (retired).
+# A third instance with two tenants takes records under `[[principals]]` keys: each lands under its key's tenant, and
+# a write that names another tenant is refused.
 # Prints a PASS/FAIL table and exits 1 if any check failed. Everything runs on random free ports in a throwaway
 # directory, with random credentials, and is removed on exit (KEEP=1 keeps the directory).
 #
@@ -747,6 +749,75 @@ check "origin is the node that first received the row" "$( [ "$origins" = "$NODE
   "central: $origins edge: $e_origins"
 late_e=$(find "$R/edge/data/wal-late" -name '*.wal' 2>/dev/null | wc -l | tr -d ' ')
 check "the late spool exists and is drained" "$( [ -d "$R/edge/data/wal-late" ] && [ "$late_e" = 0 ] && echo 1 || echo 0)" "wal-late segments left on the edge after the offline merge: $late_e"
+
+# --- principals and tenants --------------------------------------------------------------------------------------
+# A third instance with two tenants and `[[principals]]` keys (docs/auth.md): a key decides the tenant its records
+# are stored under, nothing in a request can name another, and status names the principal and never the key. Its
+# listeners are on loopback and closed with `require_auth`, as a multi-tenant central would run them.
+T_PEER=$(free_port); T_HEC=$(free_port); T_ADMIN=$(free_port)
+ACME_KEY="$(rand 24)"; OWN_KEY="$(rand 24)"; T_TOKEN="$(rand 24)"
+N_ACME=7; N_OWN=3
+mkdir -p "$R/tenants"; : > "$R/tenants/empty.log"
+render_config "$R/tenants/data" "
+node|id|\"central-t\"
+peer|enabled|true
+peer|addr|\"127.0.0.1:$T_PEER\"
+peer|require_auth|true
+hec|enabled|true
+hec|addr|\"127.0.0.1:$T_HEC\"
+hec|require_auth|true
+admin|enabled|true
+admin|addr|\"127.0.0.1:$T_ADMIN\"
+admin|token|\"$T_TOKEN\"
+" "
+[[tenants]]
+id = \"acme\"
+
+[[principals]]
+id = \"acme-app\"
+kind = \"ingest\"
+tenant = \"acme\"
+key = \"$ACME_KEY\"
+
+[[principals]]
+id = \"own-app\"
+kind = \"ingest\"
+key_sha256 = \"$(printf %s "$OWN_KEY" | shasum -a 256 | cut -d' ' -f1)\"
+" > "$R/tenants/config.toml"
+"$LOGLESS_BIN" run --config "$R/tenants/config.toml" --tail "$R/tenants/empty.log" > "$R/tenants/agent.log" 2>&1 &
+T_PID=$!; PIDS="$PIDS $T_PID"
+if wait_http "http://127.0.0.1:$T_ADMIN/" 30 && wait_http "http://127.0.0.1:$T_HEC/services/collector/health" 30; then
+  hec_as() { # key ("" for none), body -> status
+    if [ -n "$1" ]; then curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "Authorization: Splunk $1" -d "$2" "http://127.0.0.1:$T_HEC/services/collector/event"
+    else curl -s -o /dev/null -w '%{http_code}' --max-time 10 -d "$2" "http://127.0.0.1:$T_HEC/services/collector/event"; fi
+  }
+  events() { python3 -c 'import sys, json; print("".join(json.dumps({"event": "tenant check %d" % i, "sourcetype": sys.argv[2]}) for i in range(int(sys.argv[1]))))' "$1" "$2"; }
+  acme_sent=$(hec_as "$ACME_KEY" "$(events $N_ACME e2e-acme)"); own_sent=$(hec_as "$OWN_KEY" "$(events $N_OWN e2e-own)")
+  # Refused: no key, a key nobody has, and acme's key on a record that says it is the other tenant's (a HEC field,
+  # and the attribute itself on the peer wire).
+  no_key=$(hec_as "" '{"event":"x"}'); bad_key=$(hec_as "$(rand 24)" '{"event":"x"}')
+  wrong_hec=$(hec_as "$ACME_KEY" '{"event":"sneak","sourcetype":"e2e-sneak","fields":{"logless.tenant":"default"}}')
+  wrong_peer=$(python3 -c 'import json, time, uuid; t = int(time.time() * 1e9); print(json.dumps({"event_id": str(uuid.uuid4()), "timestamp_unix_nano": t, "observed_unix_nano": t, "severity": 9, "severity_text": None, "body": "sneak", "service": "e2e-sneak", "trace_id": None, "span_id": None, "attributes": [{"key": "logless.tenant", "value": {"Str": "default"}}], "template_id": None}))' \
+    | curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H "Authorization: Bearer $ACME_KEY" -H 'Content-Type: application/x-ndjson' --data-binary @- "http://127.0.0.1:$T_PEER/v1/ingest")
+  check "a wrong-tenant write, a missing key and an unknown key are refused" "$( [ "$no_key" = 401 ] && [ "$bad_key" = 403 ] && [ "$wrong_hec" = 403 ] && [ "$wrong_peer" = 403 ] && echo 1 || echo 0)" \
+    "no key=$no_key unknown key=$bad_key acme key naming tenant default: hec=$wrong_hec peer=$wrong_peer"
+  admin "$T_ADMIN" "$T_TOKEN" GET /admin/v1/info > "$R/tenants/info.json"
+  seen=$(jq_py '" ".join("%s:%d" % (s["principal"], s["records"]) for s in v["auth"]["seen"])' < "$R/tenants/info.json")
+  # `missing` also counts this script's own start-up polls of the admin port, which carry no token: at least one.
+  refused=$(jq_py '"%s %d %d" % (v["auth"]["refused"]["missing"] >= 1, v["auth"]["refused"]["unknown_key"], v["auth"]["refused"]["wrong_tenant"])' < "$R/tenants/info.json")
+  leaked=$(cat "$R/tenants/info.json" "$R/tenants/agent.log" | grep -c -e "$ACME_KEY" -e "$OWN_KEY" -e "$T_TOKEN")
+  check "status names the principal, counts refusals by reason, and holds no key" "$( [ "$seen" = "acme/acme-app:$N_ACME default/own-app:$N_OWN" ] && [ "$refused" = "True 1 2" ] && [ "$leaked" = 0 ] && echo 1 || echo 0)" \
+    "seen='$seen' refused missing>=1/unknown_key/wrong_tenant='$refused' keys in info or log: $leaked"
+  if stop_within "$T_PID" 10; then t_stop=1; else t_stop=0; fi
+  "$LOGLESS_BIN" merge --config "$R/tenants/config.toml" > "$R/tenants/merge.log" 2>&1
+  placed=$("$DUCKDB_BIN" -noheader -csv -c "select tenant, service, count(*)
+    from read_parquet('$R/tenants/data/store/**/*.parquet', hive_partitioning = true, union_by_name = true) group by 1, 2 order by 1, 2" | tr '\n' ' ')
+  acme_files=$(find "$R/tenants/data/store/tenant=acme/index=default" -name '*.parquet' 2>/dev/null | wc -l | tr -d ' ')
+  check "a [[principals]] key stores under its own tenant's path" "$( [ "$acme_sent" = 200 ] && [ "$own_sent" = 200 ] && [ "$placed" = "acme,e2e-acme,$N_ACME default,e2e-own,$N_OWN " ] && [ "$acme_files" -ge 1 ] && [ "$t_stop" = 1 ] && echo 1 || echo 0)" \
+    "acme key -> $acme_sent, own-tenant key (configured hashed) -> $own_sent; rows by tenant and service: $placed; files under tenant=acme/index=default/: $acme_files"
+else
+  check "a [[principals]] key stores under its own tenant's path" 0 "the instance did not start: $(tail -1 "$R/tenants/agent.log" | cut -c1-200)"
+fi
 
 # --- report ------------------------------------------------------------------------------------------------------
 echo
