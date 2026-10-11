@@ -491,11 +491,18 @@ pub struct Builder {
     readers: Vec<(Arc<Principal>, String)>,
     routes: Arc<RouteStats>,
     jwt: Option<Jwt>,
+    route_indexes: bool,
 }
 
 impl Builder {
     pub fn new(tenancy: Arc<Tenancy>) -> Self {
-        Self { tenancy, statics: HashMap::new(), readers: Vec::new(), routes: Arc::new(RouteStats::default()), jwt: None }
+        Self { tenancy, statics: HashMap::new(), readers: Vec::new(), routes: Arc::new(RouteStats::default()), jwt: None, route_indexes: true }
+    }
+
+    /// For a listener started on its own, outside the agent (a test, a tool): the single tenant
+    /// `default`, and records pass with the index they named, because nothing here knows which exist.
+    pub fn standalone() -> Self {
+        Self { route_indexes: false, ..Self::new(Arc::new(Tenancy::default())) }
     }
 
     /// The counters `GET /admin/v1/info` reports index routing from.
@@ -679,6 +686,7 @@ impl Builder {
             anonymous,
             jwt: self.jwt,
             routes: self.routes,
+            route_indexes: self.route_indexes,
             refused: Default::default(),
             refusal_logged: Default::default(),
             by_principal: Mutex::new(BTreeMap::new()),
@@ -698,6 +706,8 @@ pub struct Verifier {
     anonymous: Arc<Principal>,
     jwt: Option<Jwt>,
     routes: Arc<RouteStats>,
+    /// False only for [`Builder::standalone`]: `admit` then binds the tenant and leaves the index alone.
+    route_indexes: bool,
     refused: [AtomicU64; Refusal::ALL.len()],
     refusal_logged: [AtomicU64; Refusal::ALL.len()],
     by_principal: Mutex<BTreeMap<String, PrincipalCounters>>,
@@ -877,6 +887,7 @@ impl Verifier {
                 }
             }
             let index = match requested.as_deref() {
+                _ if !self.route_indexes => Some(""),
                 None => default,
                 Some(r) => match tenancy.index_of(tenant, r).filter(|i| principal.indexes.allows(i)) {
                     Some(i) => Some(i),
@@ -904,6 +915,10 @@ impl Verifier {
             let index = chosen[at];
             at += 1;
             let Some(index) = index else { return false };
+            if !self.route_indexes {
+                record.attributes.retain(|a| a.key != ATTR_TENANT);
+                return true;
+            }
             record.attributes.retain(|a| a.key != key && a.key != ATTR_INDEX && a.key != ATTR_TENANT);
             if Some(index) != tenant_default {
                 record.attributes.push(Attr { key: ATTR_INDEX.into(), value: AttrValue::Str(index.to_string()) });
@@ -1420,6 +1435,9 @@ pub(crate) mod testing {
         Builder { jwt: Some(jwt), ..builder }
     }
 }
+
+#[cfg(test)]
+mod route_tests;
 
 #[cfg(test)]
 mod tests {

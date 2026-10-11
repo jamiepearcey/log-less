@@ -45,6 +45,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::auth::{Listener, Op, Principal, Refusal, Verifier};
 use crate::bounded_http::{self, BoundedServer};
 use crate::httpd::{self, Handler, Incoming, Limits, Method, Reject, Reply};
 use crate::model::{Attr, AttrValue, LogRecord, Severity};
@@ -85,6 +86,10 @@ pub struct SentryConfig {
     /// on a public bind, exactly as the HEC receiver does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_keys: Vec<String>,
+    /// Accept only keys this instance knows even though `allowed_keys` is empty: the setting for an
+    /// instance whose DSN keys are all `[[principals]]` (`docs/auth.md`). A non-loopback bind always does.
+    #[serde(default)]
+    pub require_auth: bool,
     /// Forward errors and messages upstream. Off makes the proxy a pure local
     /// recorder — useful for measuring what Sentry would have cost.
     #[serde(default = "default_true")]
@@ -161,6 +166,7 @@ impl Default for SentryConfig {
             upstream_dsn: None,
             projects: Vec::new(),
             allowed_keys: Vec::new(),
+            require_auth: false,
             forward_events: true,
             transaction_sample_rate: default_transaction_sample_rate(),
             forward_attachments: false,
@@ -185,7 +191,7 @@ pub enum SentryError {
     #[error("sentry.upstream_auth = \"resign\" needs sentry.upstream_dsn")]
     ResignWithoutDsn,
     #[error(
-        "sentry.allowed_keys is empty, which accepts any key; refusing to bind the non-loopback address {addr}"
+        "the sentry listener on {addr} has no key it could accept (sentry.allowed_keys or [[principals]]); refusing to bind a non-loopback address that would accept any"
     )]
     OpenOnPublicAddress { addr: String },
 }
@@ -324,6 +330,9 @@ struct SentryHandler {
     /// Nudges the forwarder; the spool is the source of truth, so a missed
     /// wake-up costs latency and never data.
     wake: Option<crossbeam_channel::Sender<()>>,
+    auth: Arc<Verifier>,
+    /// Accepts any key: `allowed_keys` is empty and the bind is loopback.
+    open: bool,
 }
 
 impl SentryHandler {
@@ -364,7 +373,9 @@ impl SentryHandler {
         }
     }
 
-    fn authorize(&self, key: Result<Option<String>, ()>) -> Result<String, Reply> {
+    /// The key, and the principal it is the key of (`crate::auth`): an `allowed_keys` entry, a
+    /// `[[principals]]` key, or on a listener that accepts any key the instance's own tenant.
+    fn authorize(&self, key: Result<Option<String>, ()>) -> Result<(String, Arc<Principal>), Reply> {
         let key = match key {
             Ok(Some(key)) => key,
             Ok(None) => {
@@ -376,18 +387,18 @@ impl SentryHandler {
                 return Err(error_reply(401, "the sentry key is given more than once"));
             }
         };
-        if !self.config.allowed_keys.is_empty()
-            && !self.config.allowed_keys.iter().any(|k| *k == key)
-        {
-            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
-            return Err(error_reply(401, "unknown sentry key"));
+        match self.auth.authorize(Listener::Sentry, Op::Ingest, !self.open, Some(&key)) {
+            Ok(principal) => Ok((key, principal)),
+            Err(_) => {
+                self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                Err(error_reply(401, "unknown sentry key"))
+            }
         }
-        Ok(key)
     }
 
     fn ingest(&self, request: &Incoming, project: &str, endpoint: Endpoint) -> Reply {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
-        let key = match self.authorize(self.client_key(request)) {
+        let (key, principal) = match self.authorize(self.client_key(request)) {
             Ok(k) => k,
             Err(reply) => return reply,
         };
@@ -423,7 +434,13 @@ impl SentryHandler {
 
         // Everything is stored, whatever the forwarding policy decides. The
         // local copy is the point: a forwarding decision stays reversible.
-        let records = self.to_records(&env, project, &key);
+        let mut records = self.to_records(&env, project, &key);
+        // Stored under the tenant of the key's principal, whatever the envelope says.
+        if self.auth.admit(&principal, &mut records, crate::config::ATTR_INDEX, false).is_err() {
+            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+            self.auth.refuse(Listener::Sentry, Refusal::WrongTenant);
+            return error_reply(403, "the envelope names a tenant other than this key's");
+        }
         if self.sink(records) == Admitted::Busy {
             self.stats.busy.fetch_add(1, Ordering::Relaxed);
             return error_reply(429, "pipeline full").with_header("Retry-After", "1");
@@ -546,7 +563,7 @@ impl Handler for SentryHandler {
         if head.method != Method::Post || SentryHandler::route(head.path).is_none() {
             return None;
         }
-        let refused = if self.config.allowed_keys.is_empty() && !bounded_http::loopback_host(head) {
+        let refused = if self.open && !bounded_http::loopback_host(head) {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
             error_reply(403, "the Host header is not a loopback name")
         } else if let Err(denied) = self.authorize(self.client_key(head)) {
@@ -598,7 +615,24 @@ impl Receiver {
     where
         F: Fn(Vec<LogRecord>) -> Admitted + Send + Sync + 'static,
     {
-        if config.allowed_keys.is_empty() && !is_loopback(&config.addr) {
+        let auth = crate::auth::Builder::standalone().sentry(config).build();
+        Self::start_with_auth(config, upstream, spool_dir, auth, sink)
+    }
+
+    /// As [`Receiver::start`], with the instance's one verifier: every key this listener accepts, and the
+    /// tenant each stores under.
+    pub fn start_with_auth<F>(
+        config: &SentryConfig,
+        upstream: Option<Upstream>,
+        spool_dir: Option<&std::path::Path>,
+        auth: Arc<Verifier>,
+        sink: F,
+    ) -> Result<Self, SentryError>
+    where
+        F: Fn(Vec<LogRecord>) -> Admitted + Send + Sync + 'static,
+    {
+        let open = config.allowed_keys.is_empty() && !config.require_auth && is_loopback(&config.addr);
+        if !open && !auth.can_authenticate(Listener::Sentry, Op::Ingest) {
             return Err(SentryError::OpenOnPublicAddress { addr: config.addr.clone() });
         }
         let configured = match &config.upstream_dsn {
@@ -663,6 +697,8 @@ impl Receiver {
             sink: Box::new(sink),
             spool: spool.clone(),
             wake: wake.clone(),
+            auth,
+            open,
         });
 
         let server = BoundedServer::start(

@@ -20,7 +20,8 @@
 //! that window; the newer segments are simply merged on the next pass.
 //!
 //! A record's partition is `(tenant, index, event hour, level bucket, node)`:
-//! the instance's own tenant and node, the index the record was routed to at
+//! the tenant of the principal that sent it (`auth::ATTR_TENANT`, absent for the
+//! instance's own tenant), the instance's node, the index the record was routed to at
 //! ingest (`config::ATTR_INDEX`, absent for the default index), the hour of its
 //! `timestamp`, and the bucket its severity falls in under that index. The
 //! late spool (`wal-late/`, `wal::SplitWal`) is a second directory of the same
@@ -166,7 +167,15 @@ pub fn merge_all(
                     crate::model::AttrValue::Str(s) => Some(s.as_str()),
                     _ => None,
                 });
-                let index = match tenancy.route(asked) {
+                // So is the tenant. The attribute is set by the listener, from the
+                // principal that sent the record, and only for a tenant other than
+                // this instance's own (`auth::Verifier::admit`).
+                let named = record.attributes.iter().position(|a| a.key == crate::auth::ATTR_TENANT).map(|at| record.attributes.remove(at));
+                let tenant = match named.as_ref().map(|a| &a.value) {
+                    Some(crate::model::AttrValue::Str(t)) if crate::partition::valid_ident(t) => t.as_str(),
+                    _ => tenancy.tenant(),
+                };
+                let index = match tenancy.route_in(tenant, asked) {
                     Route::Known(index) => index,
                     // Routed at ingest to an index the config has since lost.
                     // The record was accepted, so it is kept.
@@ -174,14 +183,17 @@ pub fn merge_all(
                         rerouted += 1;
                         index
                     }
+                    // The index is refused now, or the whole tenant has left the
+                    // config since: kept under its tenant all the same, in that
+                    // tenant's default index (`default` when the tenant is gone).
                     Route::Refused => {
                         rerouted += 1;
-                        tenancy.default_index()
+                        tenancy.default_index_of(tenant).unwrap_or(crate::partition::DEFAULT_INDEX)
                     }
                 };
-                let buckets = tenancy.buckets(tenancy.tenant(), index).unwrap_or_else(|| tenancy.default_buckets());
+                let buckets = tenancy.buckets(tenant, index).unwrap_or_else(|| tenancy.default_buckets());
                 let key = PartitionKey::new(
-                    tenancy.tenant(),
+                    tenant,
                     index,
                     record.timestamp_unix_nano / crate::partition::NANOS_PER_HOUR,
                     &buckets.bucket_for(record.severity).name,
@@ -396,6 +408,47 @@ mod tests {
         assert_eq!(early.stats.min_ts_nanos, ((5 * SECS_PER_HOUR + 7) * 1_000_000_000) as i64);
         assert_eq!(early.stats.min_observed_nanos, ((90 * SECS_PER_HOUR + 1) * 1_000_000_000) as i64);
         assert_eq!(cat.files_overlapping("default", "default", 0, (6 * SECS_PER_HOUR * 1_000_000_000) as i64, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_record_is_stored_under_the_tenant_its_principal_gave_it() {
+        use crate::model::{Attr, AttrValue};
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, store_dir) = (tmp.path().join("wal"), tmp.path().join("store"));
+        let tenancy = crate::auth::testing::two_tenants(crate::config::UnknownIndex::Default);
+        let with = |attrs: &[(&str, &str)]| {
+            let mut r = record(10, Severity::INFO, "x");
+            r.attributes = attrs.iter().map(|(k, v)| Attr { key: (*k).into(), value: AttrValue::Str((*v).into()) }).collect();
+            r
+        };
+        write_wal(
+            &wal_dir,
+            vec![vec![
+                with(&[]),
+                with(&[(crate::auth::ATTR_TENANT, "acme")]),
+                with(&[(crate::auth::ATTR_TENANT, "acme"), (ATTR_INDEX, "payments")]),
+                // A tenant the config has lost since the record was accepted: kept, under its own name.
+                with(&[(crate::auth::ATTR_TENANT, "former")]),
+            ]],
+        );
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let report = merge_all(&wal_dir, &store_dir, &mut cat, &tenancy, &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
+        assert_eq!((report.records, report.files_written, report.index_rerouted), (4, 4, 1));
+        let mut dirs: Vec<String> = cat.list_files().unwrap().iter().map(|f| f.path.parent().unwrap().strip_prefix(&store_dir).unwrap().display().to_string()).collect();
+        dirs.sort();
+        assert_eq!(
+            dirs,
+            [
+                "tenant=acme/index=default/hour=1970-01-01T00/level=info/node=central",
+                "tenant=acme/index=payments/hour=1970-01-01T00/level=info/node=central",
+                "tenant=default/index=default/hour=1970-01-01T00/level=info/node=central",
+                "tenant=former/index=default/hour=1970-01-01T00/level=info/node=central",
+            ]
+        );
+        // The tenant is a directory, not a column: no row carries the routing attribute.
+        let rows = crate::scan::scan(&store_dir, &crate::scan::Query::new()).unwrap().records;
+        assert_eq!(4, rows.len());
+        assert!(rows.iter().all(|r| r.attributes.is_empty()), "{:?}", rows.iter().map(|r| &r.attributes).collect::<Vec<_>>());
     }
 
     fn two_indexes(unknown: crate::config::UnknownIndex) -> Tenancy {

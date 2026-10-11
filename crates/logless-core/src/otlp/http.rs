@@ -9,9 +9,13 @@
 //!
 //! # Who may send
 //!
-//! There is no credential in OTLP/HTTP as log-less serves it, so on a loopback
-//! address (the default) the `Host` must be a loopback name, and on any address
-//! the `Content-Type` must be one of the two OTLP types. A web page can send
+//! OTLP/HTTP asks for no credential unless `require_auth` is set, so on a
+//! loopback address (the default) the `Host` must be a loopback name, and on any
+//! address the `Content-Type` must be one of the two OTLP types. An exporter
+//! that does send `Authorization: Bearer <key>` (every collector can set a
+//! header) is the principal that key belongs to, and its records are stored
+//! under that principal's tenant (`crate::auth`, `docs/auth.md`); without one
+//! they are the instance's own tenant, as before. A web page can send
 //! neither type without a CORS preflight, which this listener never answers, so
 //! a page in a local browser cannot write logs here. Both rules are checked from
 //! the head, before the body is read.
@@ -29,6 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::logs::{decode_request, Decoded};
+use crate::auth::{Listener, Op, Principal, Refusal, Verifier};
 use crate::bounded_http::{self, BoundedServer};
 use crate::httpd::{self, Handler, Incoming, Limits, Method, Reject, Reply};
 use crate::model::LogRecord;
@@ -47,6 +52,7 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 mod rpc {
     pub const INVALID_ARGUMENT: u32 = 3;
     pub const PERMISSION_DENIED: u32 = 7;
+    pub const UNAUTHENTICATED: u32 = 16;
     pub const RESOURCE_EXHAUSTED: u32 = 8;
     pub const UNAVAILABLE: u32 = 14;
     pub const UNIMPLEMENTED: u32 = 12;
@@ -72,6 +78,11 @@ pub struct ReceiverConfig {
     pub max_body_bytes: usize,
     #[serde(default = "default_max_decompressed")]
     pub max_decompressed_bytes: usize,
+    /// Refuse a request without a good `Authorization: Bearer` key. Off by
+    /// default: this listener never asked for one, and an exporter that sends
+    /// none keeps working.
+    #[serde(default)]
+    pub require_auth: bool,
     /// The gRPC transport, on its own port. Declared last so TOML serialises it
     /// as a nested `[otlp.grpc]` table after this table's own scalars.
     #[serde(default)]
@@ -99,6 +110,7 @@ impl Default for ReceiverConfig {
             workers: default_otlp_workers(),
             max_body_bytes: default_max_body(),
             max_decompressed_bytes: default_max_decompressed(),
+            require_auth: false,
             grpc: super::grpc::GrpcConfig::default(),
         }
     }
@@ -126,6 +138,9 @@ pub struct ReceiverStats {
     pub bad_request: AtomicU64,
     pub too_large: AtomicU64,
     pub dropped_upstream: AtomicU64,
+    /// Requests refused for their credential. Counted in `bad_request` too, so
+    /// the accounting invariant keeps its four terms.
+    pub unauthorized: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -167,6 +182,24 @@ struct OtlpHandler {
     /// Bound to a loopback address, so the `Host` has to be a loopback name.
     loopback: bool,
     sink: Box<dyn Fn(Vec<LogRecord>) -> Accepted + Send + Sync>,
+    auth: Arc<Verifier>,
+    require_auth: bool,
+}
+
+impl OtlpHandler {
+    /// Who the request is from. Two `Authorization` headers are ambiguous, so neither counts.
+    fn principal(&self, request: &Incoming) -> Result<Arc<Principal>, Reply> {
+        let bearer = request
+            .header("authorization")
+            .filter(|_| request.header_count("authorization") == 1)
+            .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+            .map(str::trim);
+        self.auth.authorize(Listener::Otlp, Op::Ingest, self.require_auth, bearer).map_err(|reason| {
+            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+            let (status, code) = if reason == Refusal::Missing { (401, rpc::UNAUTHENTICATED) } else { (403, rpc::PERMISSION_DENIED) };
+            status_reply(status, code, "the credential is not accepted").with_header("WWW-Authenticate", "Bearer")
+        })
+    }
 }
 
 impl Handler for OtlpHandler {
@@ -181,6 +214,13 @@ impl Handler for OtlpHandler {
         }
 
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
+        let principal = match self.principal(&request) {
+            Ok(principal) => principal,
+            Err(denied) => {
+                self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
+                return denied;
+            }
+        };
 
         // Both encodings of the same message. Chosen by content type, because
         // that is what the spec says and what every emitter sets.
@@ -204,9 +244,19 @@ impl Handler for OtlpHandler {
         };
 
         self.stats.dropped_upstream.fetch_add(decoded.dropped_upstream, Ordering::Relaxed);
-        let count = decoded.records.len() as u64;
+        // Stored under the principal's tenant, whatever a resource attribute says, in an index it may
+        // write. A record whose index is refused is left out and counted, as the pipeline always did.
+        let mut records = decoded.records;
+        if self.auth.admit(&principal, &mut records, crate::config::ATTR_INDEX, false).is_err() {
+            self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
+            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+            self.auth.refuse(Listener::Otlp, Refusal::WrongTenant);
+            let message = "a record names a tenant other than this credential's";
+            return if json { json_status_reply(403, message) } else { status_reply(403, rpc::PERMISSION_DENIED, message) };
+        }
+        let count = records.len() as u64;
 
-        match (self.sink)(decoded.records) {
+        match (self.sink)(records) {
             Accepted::All => {
                 self.stats.accepted.fetch_add(1, Ordering::Relaxed);
                 self.stats.records.fetch_add(count, Ordering::Relaxed);
@@ -241,6 +291,8 @@ impl Handler for OtlpHandler {
         let kind = head.content_type();
         let refused = if self.loopback && !bounded_http::loopback_host(head) {
             status_reply(403, rpc::PERMISSION_DENIED, "the Host header is not a loopback name")
+        } else if let Err(denied) = self.principal(head) {
+            denied
         } else if head.header_count("content-type") != 1 || (kind != CONTENT_TYPE && kind != JSON_CONTENT_TYPE) {
             status_reply(415, rpc::INVALID_ARGUMENT, "send application/x-protobuf or application/json")
         } else if !bounded_http::encoding_accepted(head) {
@@ -283,11 +335,26 @@ impl Receiver {
     where
         F: Fn(Vec<LogRecord>) -> Accepted + Send + Sync + 'static,
     {
+        let auth = crate::auth::Builder::standalone().build();
+        Self::start_with_auth(config, auth, sink)
+    }
+
+    /// As [`Receiver::start`], with the instance's one verifier: the keys an exporter may present, and
+    /// the tenant each stores under.
+    pub fn start_with_auth<F>(config: &ReceiverConfig, auth: Arc<Verifier>, sink: F) -> Result<Self, ReceiverError>
+    where
+        F: Fn(Vec<LogRecord>) -> Accepted + Send + Sync + 'static,
+    {
+        if config.require_auth && !auth.can_authenticate(Listener::Otlp, Op::Ingest) {
+            return Err(httpd::HttpError::Bind { addr: config.addr.clone(), message: "otlp.require_auth is set and there is no credential it could accept ([[principals]] or [auth])".into() });
+        }
         let stats = Arc::new(ReceiverStats::default());
         let handler = Arc::new(OtlpHandler {
             stats: Arc::clone(&stats),
             loopback: bounded_http::loopback_addr(&config.addr),
             sink: Box::new(sink),
+            auth,
+            require_auth: config.require_auth,
         });
         let server = BoundedServer::start(
             &config.addr,
