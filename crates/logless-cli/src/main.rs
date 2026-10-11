@@ -1009,10 +1009,12 @@ fn run(
     };
 
     // Ends when the writer (the only holder of the tap) is gone and the tap is empty.
+    // The control keeps a sender of its own (for range fetches), so the channel never closes by itself: say when to stop.
+    let sync_stop = Arc::new(AtomicBool::new(false));
     let sync_thread = {
         let control = Arc::clone(&sync_control);
         let spool_dir = config.storage.data_dir.join(sync::SPOOL_DIR);
-        let never = Arc::new(AtomicBool::new(false));
+        let never = Arc::clone(&sync_stop);
         // Templates the catalog already knows are not novel to the anomaly logic after a restart.
         let known: Vec<u64> = Catalog::open(&catalog_path(config))
             .and_then(|c| c.load_templates())
@@ -1725,7 +1727,8 @@ fn run(
     stop.store(true, Ordering::Relaxed);
     drop(queue);
     let written = writer.join().map_err(|_| "wal writer panicked")??;
-    // The writer held the only tap, so the sender now drains what is left and ends.
+    // The writer held the only tap: the sender drains what is left and ends once told to.
+    sync_stop.store(true, Ordering::Release);
     let _ = sync_thread.join();
     let sync_status = sync_control.status();
     if sync_status.state != "off" {
