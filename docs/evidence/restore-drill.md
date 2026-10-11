@@ -125,9 +125,10 @@ with link bandwidth. Nothing here measures a multi-GB store or a real network.
   made visible; it is not a defect of the restore.
 * Template text is not in the bucket, so restored template text is an exemplar (see `docs/restore.md`). Ids, counts and
   the `(template_id, service)` keys were identical to before in every run.
-* Flake, environmental: one of five runs failed because the machine had 16,685 sockets in TIME_WAIT (measured with
-  `netstat` just after) and loopback connects failed with `Can't assign requested address (os error 49)`, from curl and
-  from the restore's own S3 listing. Other sessions were using the loopback at the time. The script now retries OTLP
+* Flake, environmental: two early runs (before the retry below) saw curl exit with status 000 on OTLP posts. In the one
+  whose logs were read, loopback connects failed with `Can't assign requested address (os error 49)`, also from the
+  restore's own S3 listing; the machine had 10,155 sockets in TIME_WAIT then and 16,685 a minute later (`netstat`). The
+  cause of the other early failure was not examined. Other sessions were using the loopback at the time. The script now retries OTLP
   posts (`--retry 6 --retry-all-errors`); the restore itself does not retry, and an `fetch_failed` or list error is
   reported honestly if it happens.
 
