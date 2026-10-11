@@ -352,6 +352,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 peer: logless_core::peer::PeerConfig::default(),
                 sync_parts: Default::default(),
                 decision: logless_core::decision::DecisionConfig::default(),
+                auth: logless_core::auth::AuthConfig::default(),
+                principals: Vec::new(),
                 tenants: config::default_tenants(),
                 tail: Vec::new(),
                 destinations: Vec::new(),

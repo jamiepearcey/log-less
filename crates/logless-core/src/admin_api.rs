@@ -1217,6 +1217,11 @@ impl Handler for Api {
     }
 }
 
+/// The admin token: `LOGLESS_ADMIN_TOKEN`, else `[admin] token`.
+pub fn configured_token(cfg: &AdminConfig) -> Option<String> {
+    std::env::var(TOKEN_ENV).ok().filter(|t| !t.is_empty()).or_else(|| cfg.token.clone().filter(|t| !t.is_empty()))
+}
+
 /// A running admin listener; stop it with [`AdminServer::shutdown`].
 pub struct AdminServer {
     server: BoundedServer,

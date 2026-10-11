@@ -6,6 +6,7 @@
 //! it accepts.
 
 pub mod admin_api;
+pub mod auth;
 pub mod budget;
 pub mod catalog;
 pub mod compact;

@@ -16,6 +16,8 @@ crossbeam-channel.workspace = true
 humantime-serde.workspace = true
 parquet = "59.1.0"
 postcard.workspace = true
+# Already in the tree through ureq's rustls; used directly for Ed25519 (broker tokens, `auth.rs`).
+ring = "0.17"
 sha2 = "0.10"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde.workspace = true

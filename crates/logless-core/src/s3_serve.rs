@@ -146,6 +146,11 @@ fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.is_empty())
 }
 
+/// The store's one key pair, from the config or the environment, when both halves are there.
+pub fn configured_credentials(cfg: &S3ServeConfig) -> Option<(String, String)> {
+    resolve_credentials(cfg).ok().flatten().map(|c| (c.access_key, c.secret_key))
+}
+
 fn resolve_credentials(cfg: &S3ServeConfig) -> Result<Option<Credentials>, S3ServeError> {
     let access = non_empty(cfg.access_key.clone())
         .or_else(|| non_empty(std::env::var("LOGLESS_S3_ACCESS_KEY").ok()));
@@ -1032,7 +1037,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 
 /// Parses the IMF-fixdate form [`http_date`] emits. The obsolete RFC 850 and
 /// asctime forms are not accepted; an unparseable date makes the header ignored.
-fn parse_http_date(v: &str) -> Option<u64> {
+pub(crate) fn parse_http_date(v: &str) -> Option<u64> {
     const MONTHS: [&str; 12] =
         ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     let parts: Vec<&str> = v.split_whitespace().collect();

@@ -59,6 +59,10 @@ pub struct Config {
     /// An optional decision model that suggests which templates are the same failure (`docs/decision-model.md`). Off unless `url` is set.
     #[serde(default)]
     pub decision: crate::decision::DecisionConfig,
+    /// `[auth]`: where signed tokens come from (session-broker). Left out, only static keys are accepted and
+    /// no network call is ever made (`docs/auth.md`).
+    #[serde(default, skip_serializing_if = "crate::auth::AuthConfig::is_default")]
+    pub auth: crate::auth::AuthConfig,
     /// Tenants and their indexes (`[[tenants]]`, `[[tenants.indexes]]`): the
     /// first two directories of the store and where retention is set. Left
     /// out, the install is one tenant `default` with one index `default`. The
@@ -66,6 +70,11 @@ pub struct Config {
     /// under.
     #[serde(default = "default_tenants")]
     pub tenants: Vec<TenantConfig>,
+    /// `[[principals]]`: who may talk to this instance, each with one long-lived key, a kind, a tenant and
+    /// optionally an index allow-list (`docs/auth.md`). The preferred form of every credential here; the
+    /// older per-listener token lists keep working and are read as principals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principals: Vec<crate::auth::PrincipalConfig>,
     /// File tailing sources (`[[tail]]`). Combined with any `--tail` flags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail: Vec<crate::tail::TailSource>,
@@ -405,12 +414,45 @@ impl Tenancy {
         self.tenants.iter().flat_map(|t| t.indexes.iter().map(move |i| (t.id.as_str(), i.name.as_str(), &i.retention)))
     }
 
+    fn configured(&self, tenant: &str) -> Option<&TenantConfig> {
+        self.tenants.iter().find(|t| t.id == tenant)
+    }
+
+    pub fn has_tenant(&self, tenant: &str) -> bool {
+        self.configured(tenant).is_some()
+    }
+
+    /// The default index of `tenant` (the one named `default`, or else its
+    /// first); `None` when the tenant is not configured.
+    pub fn default_index_of(&self, tenant: &str) -> Option<&str> {
+        let t = self.configured(tenant)?;
+        let at = t.indexes.iter().position(|i| i.name == crate::partition::DEFAULT_INDEX).unwrap_or(0);
+        Some(&t.indexes[at].name)
+    }
+
+    /// What `tenant` does with a record for an index it does not have.
+    pub fn unknown_index(&self, tenant: &str) -> Option<UnknownIndex> {
+        self.configured(tenant).map(|t| t.unknown_index)
+    }
+
+    /// The name of `index` as `tenant` has it configured.
+    pub fn index_of(&self, tenant: &str, index: &str) -> Option<&str> {
+        self.configured(tenant)?.indexes.iter().find(|i| i.name == index).map(|i| i.name.as_str())
+    }
+
     /// Routes a record of the own tenant that asked for `requested`.
     pub fn route(&self, requested: Option<&str>) -> Route<'_> {
-        let Some(requested) = requested else { return Route::Known(self.default_index()) };
-        match self.own().indexes.iter().find(|i| i.name == requested) {
+        self.route_in(self.tenant(), requested)
+    }
+
+    /// Routes a record of `tenant` that asked for `requested`. A tenant that
+    /// is not configured has no index to route to: `Refused`.
+    pub fn route_in(&self, tenant: &str, requested: Option<&str>) -> Route<'_> {
+        let (Some(t), Some(default)) = (self.configured(tenant), self.default_index_of(tenant)) else { return Route::Refused };
+        let Some(requested) = requested else { return Route::Known(default) };
+        match t.indexes.iter().find(|i| i.name == requested) {
             Some(i) => Route::Known(&i.name),
-            None if self.own().unknown_index == UnknownIndex::Default => Route::Defaulted(self.default_index()),
+            None if t.unknown_index == UnknownIndex::Default => Route::Defaulted(default),
             None => Route::Refused,
         }
     }
@@ -419,20 +461,29 @@ impl Tenancy {
     /// receiver whose protocol names it otherwise) and rewrites the attribute
     /// to the index chosen: absent for the default index, so the common case
     /// costs no bytes in the WAL. Returns `Refused` with the record untouched.
+    ///
+    /// The tenant is the record's [`crate::auth::ATTR_TENANT`] attribute, which
+    /// only a listener sets, from the principal that sent the record
+    /// (`crate::auth::Verifier::admit`); absent, it is the own tenant.
     pub fn route_record(&self, record: &mut crate::model::LogRecord, key: &str) -> Route<'_> {
+        let tenant = match record.attributes.iter().find(|a| a.key == crate::auth::ATTR_TENANT).map(|a| &a.value) {
+            Some(crate::model::AttrValue::Str(t)) => t.clone(),
+            Some(_) => return Route::Refused,
+            None => self.tenant().to_string(),
+        };
         let requested = record.attributes.iter().find(|a| a.key == key || a.key == ATTR_INDEX).map(|a| match &a.value {
             crate::model::AttrValue::Str(s) => s.clone(),
             crate::model::AttrValue::I64(n) => n.to_string(),
             crate::model::AttrValue::F64(n) => n.to_string(),
             crate::model::AttrValue::Bool(b) => b.to_string(),
         });
-        let route = self.route(requested.as_deref());
+        let route = self.route_in(&tenant, requested.as_deref());
         let chosen = match route {
             Route::Known(i) | Route::Defaulted(i) => i,
             Route::Refused => return route,
         };
         record.attributes.retain(|a| a.key != key && a.key != ATTR_INDEX);
-        if chosen != self.default_index() {
+        if Some(chosen) != self.default_index_of(&tenant) {
             record.attributes.push(crate::model::Attr { key: ATTR_INDEX.into(), value: crate::model::AttrValue::Str(chosen.to_string()) });
         }
         route
@@ -654,7 +705,10 @@ impl Config {
         self.sync_parts.check().map_err(|message| ConfigError::Policy { path: "sync_parts.interval".into(), message })?;
         // Re-run tenant, index and bucket invariants: a config deserialised
         // from TOML bypasses `Tenancy::new` and `LevelBuckets::new`.
-        Tenancy::new(self.tenants.clone(), self.node.id.clone().unwrap_or_else(|| "node-a".into()))?;
+        let tenancy = Tenancy::new(self.tenants.clone(), self.node.id.clone().unwrap_or_else(|| "node-a".into()))?;
+        // Principals name tenants and indexes, so they are checked against them here: a typo is a refusal
+        // to start, not a key that silently opens nothing.
+        crate::auth::check_config(&self.auth, &self.principals, &tenancy).map_err(|message| ConfigError::Policy { path: "principals".into(), message })?;
         // The runtime policy API edits these same values, so the file must
         // satisfy the same rules or the first API read would be an invalid
         // document nobody can PUT back.
@@ -761,7 +815,9 @@ mod tests {
             peer: crate::peer::PeerConfig::default(),
             sync_parts: Default::default(),
             decision: crate::decision::DecisionConfig::default(),
+            auth: crate::auth::AuthConfig::default(),
             tenants: default_tenants(),
+            principals: Vec::new(),
             tail: Vec::new(),
             destinations: Vec::new(),
         })
