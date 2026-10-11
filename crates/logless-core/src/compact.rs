@@ -375,13 +375,14 @@ mod tests {
             write_file(tmp.path(), 10, "warn_plus", segment, 10);
         }
         let config = CompactConfig { quiet: std::time::Duration::from_secs(600), ..Default::default() };
-        let now = crate::now_unix_secs();
+        // The moment the newest file was written, so the test does not depend on which second it runs in.
+        let now = store::list_parquet_files(tmp.path()).iter().filter_map(|p| written_unix_secs(p)).max().unwrap();
         let report = compact(tmp.path(), &mut catalog, &config, Some(now)).unwrap();
         assert_eq!(report.partitions_compacted, 0, "written a moment ago");
         let report = compact(tmp.path(), &mut catalog, &config, Some(now + 599)).unwrap();
         assert_eq!(report.partitions_compacted, 0, "still inside the quiet period");
         // An old event hour is no reason to compact, and the current hour no reason not to.
-        let report = compact(tmp.path(), &mut catalog, &config, Some(now + 601)).unwrap();
+        let report = compact(tmp.path(), &mut catalog, &config, Some(now + 600)).unwrap();
         assert_eq!((report.partitions_compacted, report.files_replaced), (1, 8));
     }
 
