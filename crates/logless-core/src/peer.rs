@@ -110,6 +110,10 @@ pub struct PeerConfig {
     /// bind without tokens is refused, so a misconfiguration cannot open an ingest endpoint to the network.
     #[serde(default)]
     pub tokens: Vec<String>,
+    /// Edge nodes allowed to upload parts, each bound to its own token. A node writes only under its own
+    /// prefix `<parts.prefix>/<id>/` (`crate::parts`); its token is also accepted for ingest.
+    #[serde(default)]
+    pub nodes: Vec<PeerNode>,
     #[serde(default = "default_max_body")]
     pub max_body_bytes: usize,
     #[serde(default = "default_max_decompressed")]
@@ -127,6 +131,28 @@ pub struct PeerConfig {
     /// `[peer.parts]`: object storage edges upload finished Parquet parts to (`crate::parts`).
     #[serde(default)]
     pub parts: crate::parts::PartsConfig,
+}
+
+/// `[[peer.nodes]]`: an edge node and the token that proves it. The token is the only identity the
+/// parts path trusts; a node id in a request body is checked against it, never believed.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerNode {
+    pub id: String,
+    pub token: String,
+}
+
+impl std::fmt::Debug for PeerNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerNode").field("id", &self.id).field("token", &"<redacted>").finish()
+    }
+}
+
+impl PeerConfig {
+    /// No token of either kind: the listener is unauthenticated (loopback only).
+    fn unauthenticated(&self) -> bool {
+        self.tokens.is_empty() && self.nodes.is_empty()
+    }
 }
 
 fn default_addr() -> String {
@@ -155,6 +181,7 @@ impl Default for PeerConfig {
             addr: default_addr(),
             workers: default_workers(),
             tokens: Vec::new(),
+            nodes: Vec::new(),
             max_body_bytes: default_max_body(),
             max_decompressed_bytes: default_max_decompressed(),
             dedupe_window: default_dedupe_window(),
@@ -173,6 +200,7 @@ impl std::fmt::Debug for PeerConfig {
             .field("addr", &self.addr)
             .field("workers", &self.workers)
             .field("tokens", &format_args!("<{} redacted>", self.tokens.len()))
+            .field("nodes", &self.nodes)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_decompressed_bytes", &self.max_decompressed_bytes)
             .field("dedupe_window", &self.dedupe_window)
@@ -191,6 +219,8 @@ pub enum PeerError {
     WeakToken { addr: String, len: usize },
     #[error(transparent)]
     Http(#[from] httpd::HttpError),
+    #[error("[[peer.nodes]] is wrong: {0}")]
+    BadNode(String),
     #[error("the peer dedupe log could not be opened: {0}")]
     Dedupe(std::io::Error),
 }
@@ -633,8 +663,14 @@ struct PeerHandler {
 
 impl PeerHandler {
     fn authorized(&self, request: &Incoming) -> Result<(), Reply> {
-        if self.config.tokens.is_empty() {
-            return Ok(());
+        self.authenticated(request).map(|_| ())
+    }
+
+    /// Who the bearer token is: `Ok(Some(node id))` for a node token, `Ok(None)` for a shared ingest token
+    /// or an unauthenticated listener.
+    fn authenticated(&self, request: &Incoming) -> Result<Option<&str>, Reply> {
+        if self.config.unauthenticated() {
+            return Ok(None);
         }
         // Two Authorization headers are ambiguous (a proxy may pick the other one), so neither counts.
         let presented = request
@@ -651,8 +687,15 @@ impl PeerHandler {
         for accepted in &self.config.tokens {
             matched |= constant_time_eq(accepted.as_bytes(), token.as_bytes());
         }
+        let mut node = None;
+        for n in &self.config.nodes {
+            if constant_time_eq(n.token.as_bytes(), token.as_bytes()) {
+                matched = true;
+                node = Some(n.id.as_str());
+            }
+        }
         if matched {
-            Ok(())
+            Ok(node)
         } else {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
             Err(error_reply(403, "forbidden", "the token is not accepted").with_header("WWW-Authenticate", "Bearer"))
@@ -662,7 +705,7 @@ impl PeerHandler {
     fn refuse_head(&self, head: &Incoming, ingest: bool) -> Option<Reply> {
         // Without tokens the listener is loopback only, and the only thing left between it and a web
         // page is the name the page used: DNS rebinding makes a page's own origin point here.
-        if self.config.tokens.is_empty() && (head.header_count("host") != 1 || !crate::admin_api::host_allowed(head.header("host"), &[])) {
+        if self.config.unauthenticated() && (head.header_count("host") != 1 || !crate::admin_api::host_allowed(head.header("host"), &[])) {
             self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
             return Some(error_reply(403, "forbidden_host", "the Host header is not a loopback name"));
         }
@@ -696,7 +739,7 @@ impl PeerHandler {
             instance_id: self.instance.clone(),
             formats: vec![WIRE_FORMAT.into()],
             ingest: Some(INGEST_PATH.into()),
-            auth: if self.config.tokens.is_empty() { "none".into() } else { "bearer".into() },
+            auth: if self.config.unauthenticated() { "none".into() } else { "bearer".into() },
             max_body_bytes: self.config.max_body_bytes,
             max_hops: MAX_HOPS,
             s3: self.config.advertise_s3,
@@ -823,15 +866,23 @@ impl Handler for PeerHandler {
                 }
             }
             (Method::Post, INGEST_PATH) => self.ingest(&request),
-            (Method::Post, path @ (crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH)) => {
+            (Method::Post, path @ (crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH | crate::parts::RETIRE_PATH)) => {
                 self.stats.requests.fetch_add(1, Ordering::Relaxed);
-                if let Err(denied) = self.authorized(&request) {
-                    return denied;
-                }
-                match &self.parts {
-                    Some(parts) if path == crate::parts::PRESIGN_PATH => parts.presign(&request.body),
-                    Some(parts) => parts.commit(&request.body),
-                    None => error_reply(404, "not_found", "this peer does not accept parts"),
+                let node = match self.authenticated(&request) {
+                    Ok(node) => node,
+                    Err(denied) => return denied,
+                };
+                let Some(parts) = &self.parts else {
+                    return error_reply(404, "not_found", "this peer does not accept parts");
+                };
+                // The prefix a request may touch is the token's node and nothing else.
+                let Some(node) = node else {
+                    return error_reply(403, "no_node", "parts need a node token ([[peer.nodes]]); a shared token owns no prefix");
+                };
+                match path {
+                    crate::parts::PRESIGN_PATH => parts.presign(node, &request.body),
+                    crate::parts::COMMIT_PATH => parts.commit(node, &request.body),
+                    _ => parts.retire(node, &request.body),
                 }
             }
             (Method::Get, INGEST_PATH) => error_reply(405, "method_not_allowed", "POST records here"),
@@ -847,7 +898,7 @@ impl Handler for PeerHandler {
             (Method::Get, CAPABILITY_PATH) => (false, false),
             (Method::Post, INGEST_PATH) => (true, true),
             // Parts take the same Content-Type rule as ingest: a typeless POST is a blind cross-site write.
-            (Method::Post, crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH) => (true, true),
+            (Method::Post, crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH | crate::parts::RETIRE_PATH) => (true, true),
             _ => return None,
         };
         let refused = self.refuse_head(head, ingest);
@@ -992,12 +1043,21 @@ impl Receiver {
                 }
             },
         };
-        if config.tokens.is_empty() && !is_loopback(&config.addr) {
+        let mut seen = std::collections::HashSet::new();
+        for n in &config.nodes {
+            if !crate::parts::valid_node(&n.id) {
+                return Err(PeerError::BadNode(format!("node id {:?} must be 1 to 64 of A-Za-z0-9._- and not . or ..", n.id)));
+            }
+            if n.token.is_empty() || !seen.insert(n.id.as_str()) || config.nodes.iter().filter(|o| o.token == n.token).count() > 1 || config.tokens.contains(&n.token) {
+                return Err(PeerError::BadNode(format!("node {:?} needs its own non-empty token, and ids are unique", n.id)));
+            }
+        }
+        if config.unauthenticated() && !is_loopback(&config.addr) {
             return Err(PeerError::OpenOnPublicAddress { addr: config.addr.clone() });
         }
         // A token that can be guessed online is no better than none once the listener is reachable.
         if !is_loopback(&config.addr) {
-            if let Some(weak) = config.tokens.iter().find(|t| t.len() < crate::admin_api::MIN_REMOTE_TOKEN_LEN) {
+            if let Some(weak) = config.tokens.iter().chain(config.nodes.iter().map(|n| &n.token)).find(|t| t.len() < crate::admin_api::MIN_REMOTE_TOKEN_LEN) {
                 return Err(PeerError::WeakToken { addr: config.addr.clone(), len: weak.len() });
             }
         }

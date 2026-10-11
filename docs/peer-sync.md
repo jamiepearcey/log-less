@@ -226,7 +226,19 @@ access_key_id = "..."
 secret_access_key = "..."                         # never logged, serialized or returned
 max_part_bytes = 536870912                        # 512 MiB, the default
 url_ttl_secs = 900                                # how long an upload URL works, the default
+warm_retention_secs = 0                           # expire uploaded parts whose newest data is older than this (0: keep)
+cold_retention_secs = 0                           # the same for parts the node has dropped locally
+
+[[peer.nodes]]                                    # one per edge: its token IS its identity and its prefix
+id = "edge-1"                                     # A-Za-z0-9._- , 1 to 64 characters, not "." or ".."
+token = "..."                                     # the edge's [[destinations]] token; distinct per node
 ```
+
+**Node-owned prefixes.** A part lives at `<prefix>/<node>/<name>`, where `<node>` is the id of the `[[peer.nodes]]` entry
+whose token made the request. Central builds the key; a request cannot choose it. A body that names another node is 403
+`foreign_prefix`, a name that is not `<64 hex>.parquet` (traversal, slashes, query strings) is 422 `bad_name`, and a
+shared `[peer] tokens` token owns no prefix (403 `no_node`). The catalog is keyed `(node, name)`. Decision and rejected
+alternatives: `docs/adr/0001-parts-tiering-and-lifecycle.md`.
 
 The capability document says `parts: true` only when this is enabled and complete; an incomplete table is logged (not
 the secret) and the endpoints answer 404. Both endpoints take the same bearer token, body limits and `Content-Type` rule
@@ -235,9 +247,11 @@ form or text one is a 415 before it is read, so a web page cannot post here with
 
 | Step | Request | Central does |
 |---|---|---|
-| 1 | `POST /v1/parts/presign {name, size, sha256}` | checks the name is `<64 hex sha256>.parquet` and matches `sha256`, and that `size` is 1 to `max_part_bytes` (422 otherwise); HEADs `<prefix>/<name>` with `x-amz-checksum-mode: ENABLED`; answers `already_present: true` only if the object has that size and storage reports the SHA-256 checksum of the name, else a presigned PUT `url` valid `url_ttl_secs`, its `expires_at_ms`, and `headers: {x-amz-checksum-sha256}` (signed into the URL) |
+| 1 | `POST /v1/parts/presign {name, size, sha256}` | checks the name is `<64 hex sha256>.parquet` and matches `sha256`, and that `size` is 1 to `max_part_bytes` (422 otherwise); HEADs `<prefix>/<node>/<name>` with `x-amz-checksum-mode: ENABLED`; answers `already_present: true` only if the object has that size and storage reports the SHA-256 checksum of the name, else a presigned PUT `url` valid `url_ttl_secs`, its `expires_at_ms`, and `headers: {x-amz-checksum-sha256}` (signed into the URL) |
 | 2 | `PUT <url>` with `headers` (edge to object storage) | nothing: the file goes straight to the bucket, and the storage refuses a body whose SHA-256 is not the one signed |
 | 3 | `POST /v1/parts/commit {name, size, sha256, rows, min_unix_nano, max_unix_nano, origin}` | HEADs the object and needs that size and checksum (409 otherwise), records it in the catalog's `peer_parts` table, answers `{recorded}`; a repeated commit records nothing |
+
+| 4 | `POST /v1/parts/retire {name}` | the node says it no longer holds its local copy: the part goes from `warm` to `cold` (404 if this node has no warm part of that name); audited |
 
 Parts are named by their content, so every step is idempotent: the same file is the same object. The content is
 checked by the storage, through S3's SHA-256 checksum: an object of the right size without the name's checksum (written
@@ -260,6 +274,29 @@ URL, streams the file to it and commits. Progress is `parts` in `GET /admin/v1/s
   minutes (not yet merged from the WAL) are not included, and a file compacted after upload is a new part with the same
   rows: a reader of the bucket dedupes on event id, as with records.
 
+### Tiers, listing and retention
+
+| Tier | Meaning | In the central catalog |
+|---|---|---|
+| `hot` | a Parquet file only the node has | no: it is the node's local file |
+| `warm` | uploaded and committed; the node may still hold its copy | yes |
+| `cold` | the node dropped its copy; the object is the only one | yes |
+
+On central's admin API (bearer token as the rest of `/admin/v1`):
+
+* `GET /admin/v1/parts?node=&tier=warm|cold&from_ms=&to_ms=&limit=` lists catalogued parts, oldest data first
+  (`limit` 1 to 1000, default 100; a part matches a time range when its observed-time span overlaps it).
+  `tier=hot` is a 400 that says why. Each part carries `node, name, size, rows, min_unix_nano, max_unix_nano,
+  origin, committed_ms, tier, tier_ms`.
+* `POST /admin/v1/parts/sweep {"dry_run": false}` expires catalogued parts whose newest data is older than their
+  tier's `*_retention_secs`: it deletes the object, removes the row and writes an audit row in one step per part. It
+  reads only the catalog, so it never deletes an object nobody committed. The default is a dry run; at most 1000
+  parts per tier per call (`truncated` says there were more). A failed delete keeps the row and audits
+  `delete_failed`. Needs `[peer.parts]` enabled (409 `parts_disabled` otherwise).
+* `GET /admin/v1/parts/audit?limit=` lists tier moves and expiries, newest first (`peer_parts_audit` in the catalog).
+
+Not built: the edge calling `retire` on its own when its retention removes a file, and a timer for the sweep.
+
 ### Damage to a stored part: what is and is not checked
 
 Central trusts the storage for the integrity of what it holds. When a part is uploaded the storage verifies the content against
@@ -274,7 +311,7 @@ What an operator does about it:
 * Run the storage's own scrub. On MinIO that is its background healing and scanner (`mc admin heal` monitors healing and `mc admin scanner`
   shows the scanner; check both in your MinIO release, since the admin commands change between versions); on AWS S3 and other managed stores durability and checksum scrubbing are the provider's. Run it on a
   schedule the retention policy can live with.
-* A read that fails with a checksum or bitrot error means the part is damaged. Delete the object and its row in `peer_parts`, then
+* A read that fails with a checksum or bitrot error means the part is damaged. Delete the object (under `<prefix>/<node>/`) and its row in `peer_parts`, then
   upload the part again from the edge (`POST /admin/v1/sync/parts` over the range, after removing its entry from
   `parts-uploaded.jsonl` in the edge's data dir if the edge still has the file). Parts whose edge copy has been retired cannot be
   rebuilt this way: keep storage-level replication or versioning for them.
