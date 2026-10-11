@@ -27,7 +27,9 @@ use crate::typed::{self, Cell, ColumnType, TypedColumn, TypedLayout};
 /// 2: typed `attr_*` columns after the base columns (`crate::typed`).
 /// 3: the `origin` column; files are cut on the event hour and sorted
 /// `(service, trace_id, timestamp, event_id)`.
-pub const SCHEMA_VERSION: &str = "3";
+/// 4: `template_id` is the content hash of the template text (`drain::fingerprint_of`),
+/// not a counter local to the writer. `logless migrate-layout` re-keys files below 4.
+pub const SCHEMA_VERSION: &str = "4";
 
 /// Timestamps are UTC and say so. See the note on the `timestamp` field.
 const UTC: &str = "UTC";

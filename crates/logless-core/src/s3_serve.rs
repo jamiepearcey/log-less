@@ -915,11 +915,13 @@ fn list_base(store_dir: &Path, prefix: &str) -> Option<(PathBuf, String)> {
 }
 
 /// The keys this server will list or return: the store's `.parquet` files and
-/// the template dictionary (`_meta/templates.pq`, see [`crate::template_dict`]),
-/// whose `.pq` extension keeps it out of every `**/*.parquet` glob. Anything
-/// else under the store — temp files, stray uploads — stays invisible.
+/// the `.pq` files under a `_meta` directory (the template dictionary and shape
+/// history, `tenant=<t>/index=<i>/_meta/templates/writer=<node>.pq`, see
+/// [`crate::template_dict`]), whose `.pq` extension keeps them out of every
+/// `**/*.parquet` glob. Anything else under the store — temp files, stray
+/// uploads — stays invisible.
 fn servable(key: &str) -> bool {
-    key.ends_with(".parquet") || key == crate::template_dict::DICT_KEY
+    key.ends_with(".parquet") || (key.ends_with(".pq") && key.split('/').any(|segment| segment == crate::template_dict::META_DIR))
 }
 
 fn safe_segments(key: &str) -> Option<Vec<&str>> {
@@ -1287,8 +1289,9 @@ mod tests {
         for (i, key) in keys.iter().enumerate() {
             crate::store::write_partition_file(&key.dir(&store).join("f.parquet"), &rows(10 + i as u64)).unwrap();
         }
-        fs::create_dir_all(store.join("_meta")).unwrap();
-        fs::write(store.join(crate::template_dict::DICT_KEY), b"dict").unwrap();
+        let dict = store.join("_meta/templates/writer=edge-1.pq");
+        fs::create_dir_all(dict.parent().unwrap()).unwrap();
+        fs::write(&dict, b"dict").unwrap();
         let server = S3Server::start(&S3ServeConfig { addr: "127.0.0.1:0".into(), ..Default::default() }, store.clone()).unwrap();
         let addr = server.local_addr();
         let list = |query: &str| String::from_utf8(http(addr, "GET", &format!("/logs?list-type=2&{query}"), &[]).body).unwrap();
@@ -1298,7 +1301,7 @@ mod tests {
         assert_eq!(
             all,
             vec![
-                "_meta/templates.pq",
+                "_meta/templates/writer=edge-1.pq",
                 "tenant=acme/index=default/hour=2026-01-22T00/level=info/node=edge-1/f.parquet",
                 "tenant=acme/index=default/hour=2026-01-22T01/level=warn_plus/node=edge-1/f.parquet",
                 "tenant=acme/index=payments/hour=2026-01-22T00/level=info/node=edge-1/f.parquet",
@@ -1511,39 +1514,56 @@ mod tests {
     }
 
     #[test]
-    fn the_template_dictionary_is_served_and_listed_but_no_other_pq() {
+    fn the_dictionary_and_shape_history_are_served_and_listed_but_no_other_pq() {
         let f = Fixture::new();
         let rows = vec![crate::template_dict::DictRow {
-            template_id: 1,
+            tenant: "default".into(),
+            index: "default".into(),
+            template_id: crate::drain::fingerprint_of("user <*> logged in"),
             service: Some("api".into()),
             text: "user <*> logged in".into(),
+            count: 3,
             first_seen_micros: 1,
             last_seen_micros: 2,
-            agent: "space".into(),
-            global_id: crate::drain::fingerprint_of("user <*> logged in"),
             lineage_id: crate::drain::fingerprint_of("user <*> logged in"),
         }];
-        crate::template_dict::write(&f.store, &rows).unwrap();
-        let meta = f.store.join("_meta");
-        fs::write(meta.join(".templates.pq.tmp"), b"partial").unwrap();
-        fs::write(meta.join("other.pq"), b"not the dictionary").unwrap();
+        let history = vec![crate::template_dict::HistoryRow {
+            tenant: "default".into(),
+            index: "default".into(),
+            lineage_id: 5,
+            template_id: 6,
+            text: "user <*> logged in".into(),
+            count: 3,
+            first_ts_micros: 1,
+            last_ts_micros: 2,
+        }];
+        crate::template_dict::write_all(&f.store, "edge-1", &rows, &history).unwrap();
+        let meta = f.store.join("tenant=default/index=default/_meta");
+        fs::write(meta.join("templates/.writer=edge-2.pq.tmp"), b"partial").unwrap();
+        fs::write(meta.join("templates/writer=edge-2.pq.bak"), b"not a dictionary").unwrap();
         fs::write(f.store.join("hour=2026-01-01T00/level=info/x.pq"), b"stray").unwrap();
 
-        let r = f.get(&obj("_meta/templates.pq"));
+        let dict = "tenant=default/index=default/_meta/templates/writer=edge-1.pq";
+        let hist = "tenant=default/index=default/_meta/shape_history/writer=edge-1.pq";
+        let r = f.get(&obj(dict));
         assert_eq!(r.status, 200);
-        assert_eq!(r.body, fs::read(meta.join("templates.pq")).unwrap());
+        assert_eq!(r.body, fs::read(meta.join("templates/writer=edge-1.pq")).unwrap());
         assert!(r.body.starts_with(b"PAR1"));
-        for key in ["_meta/.templates.pq.tmp", "_meta/other.pq", "hour=2026-01-01T00/level=info/x.pq"] {
+        assert_eq!(f.get(&obj(hist)).status, 200);
+        for key in [
+            "tenant=default/index=default/_meta/templates/.writer=edge-2.pq.tmp",
+            "tenant=default/index=default/_meta/templates/writer=edge-2.pq.bak",
+            "hour=2026-01-01T00/level=info/x.pq",
+        ] {
             assert_eq!(f.get(&obj(key)).status, 404, "{key}");
         }
 
         let keys = tags(&f.list("").text(), "Key");
-        assert_eq!(keys, vec!["_meta/templates.pq", K_ERR_B, K_INFO_A, K_INFO_E, K_H1_C]);
-        let keys = tags(&f.list("prefix=_meta%2F").text(), "Key");
-        assert_eq!(keys, vec!["_meta/templates.pq"]);
-        // A `**/*.parquet` glob filters the listing by suffix; the dictionary
-        // never matches it.
-        assert!(!keys[0].ends_with(".parquet"));
+        assert_eq!(keys, vec![K_ERR_B, K_INFO_A, K_INFO_E, K_H1_C, hist, dict]);
+        let keys = tags(&f.list("prefix=tenant%3Ddefault%2Findex%3Ddefault%2F_meta%2F").text(), "Key");
+        assert_eq!(keys, vec![hist, dict]);
+        // A `**/*.parquet` glob filters the listing by suffix; they never match it.
+        assert!(keys.iter().all(|k| !k.ends_with(".parquet")));
     }
 
     #[test]

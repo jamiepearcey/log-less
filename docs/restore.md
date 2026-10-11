@@ -77,8 +77,11 @@ Parts are still `<node>/<sha256>.parquet` on central (their move into the tree i
 thing that says which index a part belongs to. Then:
 
 * `<to>/catalog.sqlite` is rebuilt from the installed files (`Catalog::rebuild`),
-* template ids are kept: `templates` (id, count, first/last seen) and `template_services` ((id, service), first/last
-  observed) are derived from the rows, and `<to>/store/_meta/templates.pq` is exported from them,
+* template ids are kept (they are content hashes, so they mean the same in the restored catalog): `template_shapes`
+  (id to exemplar text; the lineage is the id itself, the birth text is not in the bucket), `template_services`
+  (`(tenant, index, id, service)`, rows, first/last observed) and the miner's `templates` (numbered afresh; they are its
+  private counters) are derived from the rows, and `<to>/store/tenant=<t>/index=<i>/_meta/templates/writer=<node>.pq`
+  (and `shape_history/`) is exported from them,
 * with `--verify`, every installed file is hashed again and the rebuilt catalog's file, row and byte totals are compared
   with what was installed.
 
@@ -95,9 +98,12 @@ nothing was damaged, unreadable, unfetchable or missing.
 * **Template text.** Rows in a part carry `template_id` only; the text lives in the catalog, which is not in the bucket.
   The restore keeps every id, count, service pairing and first/last seen exactly, but the text of each template is an
   exemplar: the masked body of the first restored row for that id, with no mined `<*>` wildcards. Ids and joins are
-  right; titles are less general than before. Fix, if it matters: upload `_meta/templates.pq` with the parts.
-* **`template_id_space`.** The rebuilt catalog mints a new one (a UUID per catalog). Ids are preserved, but a consumer
-  that keys on `(agent, template_id)` sees a new agent.
+  right; titles are less general than before. A widened template's earlier hashes get their own exemplar and no
+  lineage link (the history that said they were one is not in the bucket). Fix, if it matters: upload the dictionary
+  (`_meta/templates/writer=<node>.pq`) with the parts, a later slice.
+* **Parts written before ids were content hashes.** They carry the old writer's counter; restore keeps whatever the
+  rows hold, so such an id restores as an opaque number with an exemplar text. Re-key them with `logless migrate-layout`
+  on the source store before uploading, or re-ingest.
 * **Counters, the WAL, spool, sync state, policy and admin state.** None of these are in the bucket. A restored edge
   starts as a new edge on an existing store.
 * **A part that is in the bucket and not in the inventory** is installed (it is intact) and reported as

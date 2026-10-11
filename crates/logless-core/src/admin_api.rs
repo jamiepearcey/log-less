@@ -2522,7 +2522,12 @@ mod tests {
         assert_eq!("decision-model", v["source"]);
         let found = v["report"]["suggestions"].as_array().unwrap();
         assert_eq!(1, found.len(), "{v}");
-        assert_eq!((1, 2), (found[0]["a"]["id"].as_u64().unwrap(), found[0]["b"]["id"].as_u64().unwrap()));
+        // The ids are the content hashes rows carry, as strings: a 64-bit number does not survive a JSON reader's double.
+        let hash = |text: &str| crate::drain::fingerprint_of(text).to_string();
+        assert_eq!(
+            (hash("redis timeout after <*> ms on GET session"), hash("redis exceptions timeout reading from redis session")),
+            (found[0]["a"]["id"].as_str().unwrap().to_string(), found[0]["b"]["id"].as_str().unwrap().to_string())
+        );
         assert_eq!(900, found[0]["a"]["count"]);
         assert!(found[0]["p_same"].as_f64().unwrap() >= 0.9);
         assert!(calls.load(Ordering::SeqCst) >= 1, "the model was asked over HTTP, with the bearer token");

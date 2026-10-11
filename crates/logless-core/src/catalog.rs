@@ -39,23 +39,53 @@ pub struct FileEntry {
     pub stats: FileStats,
 }
 
-/// Rows of one template in one service within a merged segment, by `observed`.
+/// Rows of one template (by content hash) in one service of one `(tenant, index)` within a merged segment, by `observed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateSighting {
+    pub tenant: String,
+    pub index: String,
+    /// The rows' `template_id`: the content hash of the template text ([`crate::drain::fingerprint_of`]).
     pub template_id: u64,
     pub service: Option<String>,
+    pub rows: u64,
     pub first_observed_nanos: i64,
     pub last_observed_nanos: i64,
 }
 
-/// One `(template_id, service)` pair of the exported dictionary.
+/// What a content-hash `template_id` stands for (`template_shapes`): the text it hashed and the lineage of the
+/// template that held it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeRow {
+    pub template_id: u64,
+    pub lineage_id: u64,
+    pub text: String,
+}
+
+/// One `(tenant, index, template_id, service)` row of the exported dictionary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DictionaryEntry {
+    pub tenant: String,
+    pub index: String,
     pub template_id: u64,
     pub service: Option<String>,
     pub text: String,
     /// `Template::lineage_id`: survives widening, unlike a hash of `text`.
     pub lineage_id: u64,
+    /// Rows merged with this `(template_id, service)`.
+    pub rows: u64,
+    pub first_observed_nanos: i64,
+    pub last_observed_nanos: i64,
+}
+
+/// One hash a lineage has held in one `(tenant, index)`, with the span of `observed` time rows carried it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShapeHistoryEntry {
+    pub tenant: String,
+    pub index: String,
+    pub lineage_id: u64,
+    pub template_id: u64,
+    pub text: String,
+    pub rows: u64,
     pub first_observed_nanos: i64,
     pub last_observed_nanos: i64,
 }
@@ -139,6 +169,29 @@ fn overlap_sql(level: &str) -> String {
     )
 }
 
+/// Adds a sighting, widening the bounds and adding the rows of the one already there.
+fn upsert_sighting(conn: &Connection, s: &TemplateSighting) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO template_services
+            (tenant, idx, template_id, has_service, service, rows, first_observed, last_observed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(tenant, idx, template_id, has_service, service) DO UPDATE SET
+            rows = rows + excluded.rows,
+            first_observed = MIN(first_observed, excluded.first_observed),
+            last_observed  = MAX(last_observed, excluded.last_observed)",
+        params![
+            s.tenant,
+            s.index,
+            s.template_id as i64,
+            s.service.is_some(),
+            s.service.as_deref().unwrap_or(""),
+            s.rows as i64,
+            s.first_observed_nanos,
+            s.last_observed_nanos,
+        ],
+    )
+}
+
 /// Inserts a file row, or replaces the numbers of the row already at its path.
 fn upsert_file(conn: &Connection, f: &FileEntry) -> rusqlite::Result<usize> {
     conn.execute(
@@ -215,6 +268,14 @@ impl Catalog {
         if old_files {
             conn.execute_batch("DROP TABLE files")?;
         }
+        // `template_services` from before content-hash ids is keyed by a counter local to one catalog and has
+        // no tenant or index. Rows cannot be re-keyed from it; it is derived from Parquet, so it is dropped
+        // and `logless migrate-layout` (or a restore) refills it under the new key.
+        let old_services: bool = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('template_services')", [], |r| r.get::<_, i64>(0))? > 0
+            && conn.query_row("SELECT COUNT(*) FROM pragma_table_info('template_services') WHERE name = 'tenant'", [], |r| r.get::<_, i64>(0))? == 0;
+        if old_services {
+            conn.execute_batch("DROP TABLE template_services")?;
+        }
         conn.execute_batch(
             r#"
             -- One row per Parquet file of this instance's own store
@@ -250,8 +311,9 @@ impl Catalog {
             );
 
             -- Templates are the one piece of state that is NOT derivable from
-            -- Parquet: ids must survive restarts or every downstream baseline
-            -- and Sentry fingerprint shifts. Losing this table is recoverable
+            -- Parquet: the miner's tree must survive restarts or every
+            -- downstream baseline and Sentry fingerprint shifts. `id` is the
+            -- miner's private counter; what rows carry is the hash of `text`. Losing this table is recoverable
             -- (ids simply restart) but is a real degradation, not a no-op.
             CREATE TABLE IF NOT EXISTS templates (
                 id         INTEGER PRIMARY KEY,
@@ -263,24 +325,40 @@ impl Catalog {
                 lineage_id INTEGER
             );
 
-            -- Which services each template has been seen in, and when (by the
-            -- rows' `observed` time, nanoseconds). Written in the same
-            -- transaction as the merge that produced the rows, so every
-            -- (template_id, service) pair in Parquet has a row here. Feeds the
-            -- exported dictionary (`template_dict`). `has_service` keeps a NULL
-            -- service distinct from an empty one inside the primary key.
+            -- Which services each template has been seen in, per (tenant,
+            -- index), how many rows, and when (by the rows' `observed` time,
+            -- nanoseconds). `template_id` is the rows' id: the content hash of
+            -- the template text, so it means the same thing on every node.
+            -- Written in the same transaction as the merge that produced the
+            -- rows, so every (template_id, service) pair in Parquet has a row
+            -- here. Feeds the exported dictionary (`template_dict`).
+            -- `has_service` keeps a NULL service distinct from an empty one
+            -- inside the primary key.
             CREATE TABLE IF NOT EXISTS template_services (
+                tenant         TEXT    NOT NULL,
+                idx            TEXT    NOT NULL,
                 template_id    INTEGER NOT NULL,
                 has_service    INTEGER NOT NULL,
                 service        TEXT    NOT NULL,
+                rows           INTEGER NOT NULL,
                 first_observed INTEGER NOT NULL,
                 last_observed  INTEGER NOT NULL,
-                PRIMARY KEY (template_id, has_service, service)
+                PRIMARY KEY (tenant, idx, template_id, has_service, service)
             );
 
-            -- Small key/value facts about this catalog. `template_id_space`
-            -- names the namespace template ids are minted in: ids are a counter
-            -- local to this catalog, so they mean nothing without it.
+            -- What each content-hash id stands for: its text and the lineage of
+            -- the template that held it. One row per hash this node has seen a
+            -- row with and knows the text of (a hash an edge minted and this
+            -- node never mined has no row, and no dictionary entry). The first
+            -- text registered for a hash wins; a different text for the same
+            -- hash is a 64-bit collision, counted in meta `template_hash_collisions`.
+            CREATE TABLE IF NOT EXISTS template_shapes (
+                template_id INTEGER PRIMARY KEY,
+                lineage_id  INTEGER NOT NULL,
+                text        TEXT    NOT NULL
+            );
+
+            -- Small key/value facts about this catalog.
             CREATE TABLE IF NOT EXISTS meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -338,13 +416,7 @@ impl Catalog {
             "#,
         )?;
         Self::migrate_lineage(&conn)?;
-        // Minted once, with the templates table it qualifies. A lost catalog
-        // restarts template ids at 1 and gets a new space with them, which is
-        // exactly right: the old ids and the new ones are different namespaces.
-        conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('template_id_space', ?1)",
-            params![uuid::Uuid::now_v7().to_string()],
-        )?;
+        Self::seed_shapes(&conn)?;
         Ok(Self { conn })
     }
 
@@ -380,15 +452,88 @@ impl Catalog {
         Ok(())
     }
 
-    /// The namespace this catalog's template ids are minted in (a UUID). Two
-    /// agents can both hold template 7 for different shapes; `(agent, id)` is
-    /// unambiguous.
-    pub fn template_id_space(&self) -> Result<String, CatalogError> {
-        Ok(self.conn.query_row(
-            "SELECT value FROM meta WHERE key = 'template_id_space'",
-            [],
-            |r| r.get(0),
-        )?)
+    /// Gives every template already in the catalog its `template_shapes` row, once: the hash of its
+    /// current text, and its lineage. A catalog from before content-hash ids is thereby enough to
+    /// name the shapes `logless migrate-layout` re-keys rows to.
+    fn seed_shapes(conn: &Connection) -> Result<(), CatalogError> {
+        let seeded: bool = conn.prepare("SELECT 1 FROM meta WHERE key = 'template_shapes_seeded'")?.exists([])?;
+        if seeded {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare("SELECT text, lineage_id FROM templates ORDER BY id")?;
+        let rows: Vec<(String, i64)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        for (text, lineage) in rows {
+            conn.execute(
+                "INSERT OR IGNORE INTO template_shapes (template_id, lineage_id, text) VALUES (?1, ?2, ?3)",
+                params![crate::drain::fingerprint_of(&text) as i64, lineage, text],
+            )?;
+        }
+        conn.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('template_shapes_seeded', '1')", [])?;
+        Ok(())
+    }
+
+    /// Records what content-hash ids stand for. The first text registered for a hash is kept. A different
+    /// text for a hash already registered is a 64-bit collision: the new text is not stored (the id is
+    /// still the one rows carry, so both shapes count as one in `GROUP BY template_id`), the number of
+    /// collisions is added to meta `template_hash_collisions`, and it is returned so the caller can log it.
+    pub fn register_shapes(&mut self, shapes: &[ShapeRow]) -> Result<u64, CatalogError> {
+        let tx = self.conn.transaction()?;
+        let mut collisions = 0u64;
+        for s in shapes {
+            let existing: Option<String> = tx
+                .query_row("SELECT text FROM template_shapes WHERE template_id = ?1", params![s.template_id as i64], |r| r.get(0))
+                .optional()?;
+            match existing {
+                None => {
+                    tx.execute(
+                        "INSERT INTO template_shapes (template_id, lineage_id, text) VALUES (?1, ?2, ?3)",
+                        params![s.template_id as i64, s.lineage_id as i64, s.text],
+                    )?;
+                }
+                Some(text) if text != s.text => collisions += 1,
+                Some(_) => {}
+            }
+        }
+        if collisions > 0 {
+            tx.execute(
+                "INSERT INTO meta (key, value) VALUES ('template_hash_collisions', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + CAST(excluded.value AS INTEGER)",
+                params![collisions.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(collisions)
+    }
+
+    /// Whether `template_id` (a content hash) has a registered text.
+    pub fn knows_shape(&self, template_id: u64) -> Result<bool, CatalogError> {
+        Ok(self.conn.prepare("SELECT 1 FROM template_shapes WHERE template_id = ?1")?.exists(params![template_id as i64])?)
+    }
+
+    /// Hash collisions seen so far (see [`Catalog::register_shapes`]).
+    pub fn template_hash_collisions(&self) -> Result<u64, CatalogError> {
+        let v: Option<String> = self.conn.query_row("SELECT value FROM meta WHERE key = 'template_hash_collisions'", [], |r| r.get(0)).optional()?;
+        Ok(v.and_then(|v| v.parse().ok()).unwrap_or(0))
+    }
+
+    /// Every counter the miner holds and the content hash its text has now: how rows written with counter
+    /// ids are re-keyed (`crate::migrate`).
+    pub fn counter_to_hash(&self) -> Result<std::collections::HashMap<u64, u64>, CatalogError> {
+        let mut stmt = self.conn.prepare("SELECT id, text FROM templates")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, crate::drain::fingerprint_of(&r.get::<_, String>(1)?))))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Replaces every sighting with `sightings`, in one transaction: how a migration refills the table
+    /// from the rows themselves.
+    pub fn replace_sightings(&mut self, sightings: &[TemplateSighting]) -> Result<(), CatalogError> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM template_services", [])?;
+        for s in sightings {
+            upsert_sighting(&tx, s)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Record one segment's merge output. Atomic: either the files and the
@@ -403,21 +548,7 @@ impl Catalog {
     ) -> Result<(), CatalogError> {
         let tx = self.conn.transaction()?;
         for s in sightings {
-            tx.execute(
-                "INSERT INTO template_services
-                    (template_id, has_service, service, first_observed, last_observed)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(template_id, has_service, service) DO UPDATE SET
-                    first_observed = MIN(first_observed, excluded.first_observed),
-                    last_observed  = MAX(last_observed, excluded.last_observed)",
-                params![
-                    s.template_id as i64,
-                    s.service.is_some(),
-                    s.service.as_deref().unwrap_or(""),
-                    s.first_observed_nanos,
-                    s.last_observed_nanos,
-                ],
-            )?;
+            upsert_sighting(&tx, s)?;
         }
         for f in files {
             upsert_file(&tx, f)?;
@@ -735,33 +866,30 @@ impl Catalog {
         Ok(())
     }
 
-    /// Writes the templates and `(template, service)` sightings a restore derived from the parts
-    /// themselves, in one transaction (`crate::restore`). Merges first-seen/last-seen like a merge does.
+    /// Writes the templates, what their ids stand for and the sightings a restore derived from the parts
+    /// themselves, in one transaction (`crate::restore`). The sightings replace the table: they describe
+    /// every part, so adding them to an earlier run's would count rows twice.
     pub fn restore_templates(
         &mut self,
         templates: &[crate::drain::Template],
+        shapes: &[ShapeRow],
         sightings: &[TemplateSighting],
     ) -> Result<(), CatalogError> {
         self.save_templates(templates)?;
+        self.register_shapes(shapes)?;
         let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM template_services", [])?;
         for s in sightings {
-            tx.execute(
-                "INSERT INTO template_services
-                    (template_id, has_service, service, first_observed, last_observed)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(template_id, has_service, service) DO UPDATE SET
-                    first_observed = MIN(first_observed, excluded.first_observed),
-                    last_observed  = MAX(last_observed, excluded.last_observed)",
-                params![s.template_id as i64, s.service.is_some(), s.service.as_deref().unwrap_or(""), s.first_observed_nanos, s.last_observed_nanos],
-            )?;
+            upsert_sighting(&tx, s)?;
         }
         tx.commit()?;
         Ok(())
     }
 
     /// Every (service, template id) pair ever merged into the store, for the sync planner's "first time in this service".
+    /// The id is the content hash, so a pair known under any tenant or index is known.
     pub fn load_template_services(&self) -> Result<Vec<(Option<String>, u64)>, CatalogError> {
-        let mut stmt = self.conn.prepare("SELECT template_id, has_service, service FROM template_services")?;
+        let mut stmt = self.conn.prepare("SELECT DISTINCT template_id, has_service, service FROM template_services")?;
         let rows = stmt.query_map([], |row| {
             let has: bool = row.get(1)?;
             Ok((has.then(|| row.get::<_, String>(2)).transpose()?, row.get::<_, i64>(0)? as u64))
@@ -787,29 +915,65 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// One entry per `(template_id, service)` pair ever merged into the store,
-    /// with the template's current text. Templates that no merged row carries
-    /// yet are left out: nothing in Parquet can refer to them.
+    /// One entry per `(tenant, index, template_id, service)` ever merged into the store, with the text and
+    /// lineage the hash was registered with. A hash whose text this node never learned (an edge minted it and
+    /// the record was kept unmined) is left out: there is nothing to say about it yet.
     pub fn template_dictionary(&self) -> Result<Vec<DictionaryEntry>, CatalogError> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.template_id, s.has_service, s.service, t.tokens,
-                    s.first_observed, s.last_observed, t.lineage_id
-             FROM template_services s JOIN templates t ON t.id = s.template_id
-             ORDER BY s.template_id, s.has_service, s.service",
+            "SELECT s.tenant, s.idx, s.template_id, s.has_service, s.service, h.text, h.lineage_id,
+                    s.rows, s.first_observed, s.last_observed
+             FROM template_services s JOIN template_shapes h ON h.template_id = s.template_id
+             ORDER BY s.tenant, s.idx, s.template_id, s.has_service, s.service",
         )?;
         let rows = stmt.query_map([], |row| {
-            let has_service: bool = row.get(1)?;
-            let service: String = row.get(2)?;
-            let tokens: String = row.get(3)?;
+            let has_service: bool = row.get(3)?;
+            let service: String = row.get(4)?;
             Ok(DictionaryEntry {
-                template_id: row.get::<_, i64>(0)? as u64,
+                tenant: row.get(0)?,
+                index: row.get(1)?,
+                template_id: row.get::<_, i64>(2)? as u64,
                 service: has_service.then_some(service),
-                // Same rendering as `Template::text`: tokens are tab-joined in
-                // storage and space-joined for display.
-                text: tokens.split('\t').collect::<Vec<_>>().join(" "),
-                first_observed_nanos: row.get(4)?,
-                last_observed_nanos: row.get(5)?,
+                text: row.get(5)?,
                 lineage_id: row.get::<_, i64>(6)? as u64,
+                rows: row.get::<_, i64>(7)? as u64,
+                first_observed_nanos: row.get(8)?,
+                last_observed_nanos: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The `(tenant, index)` pairs that have at least one dictionary entry.
+    pub fn dictionary_scopes(&self) -> Result<Vec<(String, String)>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT s.tenant, s.idx FROM template_services s JOIN template_shapes h ON h.template_id = s.template_id
+             ORDER BY s.tenant, s.idx",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Every hash each lineage has held, per `(tenant, index)`, with the span of rows that carried it.
+    /// Rows already written keep the hash they were written with; this is how a reader folds a widened
+    /// shape back into one identity.
+    pub fn shape_history(&self) -> Result<Vec<ShapeHistoryEntry>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.tenant, s.idx, h.lineage_id, s.template_id, h.text,
+                    SUM(s.rows), MIN(s.first_observed), MAX(s.last_observed)
+             FROM template_services s JOIN template_shapes h ON h.template_id = s.template_id
+             GROUP BY s.tenant, s.idx, s.template_id
+             ORDER BY s.tenant, s.idx, h.lineage_id, MIN(s.first_observed), s.template_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ShapeHistoryEntry {
+                tenant: row.get(0)?,
+                index: row.get(1)?,
+                lineage_id: row.get::<_, i64>(2)? as u64,
+                template_id: row.get::<_, i64>(3)? as u64,
+                text: row.get(4)?,
+                rows: row.get::<_, i64>(5)? as u64,
+                first_observed_nanos: row.get(6)?,
+                last_observed_nanos: row.get(7)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)

@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::catalog::{Catalog, CatalogError, FileEntry, TemplateSighting};
+use crate::catalog::{Catalog, CatalogError, FileEntry, ShapeRow, TemplateSighting};
 use crate::config::{Route, Tenancy, ATTR_INDEX};
 use crate::drain::Drain;
 use crate::model::LogRecord;
@@ -68,7 +68,7 @@ pub struct MergeReport {
     pub untemplated: u64,
     /// Templates seen for the first time in this merge — the novelty signal.
     pub new_templates: u64,
-    /// Rows written to `_meta/templates.pq`, when this pass rewrote it.
+    /// Rows written to the `_meta/templates/writer=<node>.pq` files, when this pass rewrote them.
     pub dictionary_rows: Option<usize>,
     /// Why the dictionary could not be rewritten. Never fails the merge: the
     /// data is committed and the next merge rewrites the whole file.
@@ -197,12 +197,14 @@ pub fn merge_all(
         report.records += outcome.records;
 
         let mut entries = Vec::with_capacity(partitions.len());
-        let mut sightings: BTreeMap<(u64, Option<String>), (i64, i64)> = BTreeMap::new();
+        let mut sightings: BTreeMap<(String, String, u64, Option<String>), (u64, i64, i64)> = BTreeMap::new();
         for (key, mut records) in partitions {
             // Templating normally happens at ingest, so pushdown can use the
             // id while the error is still in flight. This is the fallback for
             // records that arrived without one — a WAL written before the id
-            // was assigned, or a receiver that skipped it.
+            // was assigned, or a receiver that skipped it. An id that is
+            // present is kept: it is a content hash, the same on every node,
+            // so one that another node assigned means what it means here.
             for record in &mut records {
                 if record.template_id.is_some() {
                     report.templated += 1;
@@ -210,7 +212,7 @@ pub fn merge_all(
                 }
                 match drain.add_line(&record.body, now_unix_secs) {
                     Some(m) => {
-                        record.template_id = Some(m.template_id);
+                        record.template_id = Some(m.shape_id);
                         report.templated += 1;
                         if m.is_new {
                             report.new_templates += 1;
@@ -220,17 +222,19 @@ pub fn merge_all(
                 }
             }
             // Every (template, service) pair that reaches Parquet is recorded
-            // with the commit, so the exported dictionary covers every row.
+            // with the commit, so the exported dictionary covers every row
+            // whose template text this node knows.
             for record in &records {
                 if let Some(id) = record.template_id {
                     let t = record.observed_unix_nano as i64;
                     sightings
-                        .entry((id, record.service.clone()))
-                        .and_modify(|(lo, hi)| {
+                        .entry((key.tenant.clone(), key.index.clone(), id, record.service.clone()))
+                        .and_modify(|(n, lo, hi)| {
+                            *n += 1;
                             *lo = (*lo).min(t);
                             *hi = (*hi).max(t);
                         })
-                        .or_insert((t, t));
+                        .or_insert((1, t, t));
                 }
             }
             schema::sort_records(&mut records);
@@ -257,11 +261,26 @@ pub fn merge_all(
         }
         report.files_written += entries.len();
 
+        // What each hash stands for, for every hash these rows carry that this miner knows the text of
+        // (it minted the hash, here or earlier, widened or not). A hash an edge minted and this node never
+        // mined stays unregistered: its rows are counted and have no dictionary entry yet.
+        let shapes: BTreeMap<u64, ShapeRow> = sightings
+            .keys()
+            .filter_map(|(_, _, id, _)| drain.shape(*id).map(|s| (*id, ShapeRow { template_id: *id, lineage_id: s.lineage_id, text: s.text.clone() })))
+            .collect();
+        let shapes: Vec<ShapeRow> = shapes.into_values().collect();
+        let collisions = catalog.register_shapes(&shapes)?;
+        if collisions > 0 {
+            tracing::warn!(collisions, "two different template texts hash to one template_id; they will be one shape in queries");
+        }
         let sightings: Vec<TemplateSighting> = sightings
             .into_iter()
-            .map(|((template_id, service), (first, last))| TemplateSighting {
+            .map(|((tenant, index, template_id, service), (rows, first, last))| TemplateSighting {
+                tenant,
+                index,
                 template_id,
                 service,
+                rows,
                 first_observed_nanos: first,
                 last_observed_nanos: last,
             })
@@ -278,18 +297,14 @@ pub fn merge_all(
         report.segments_merged += 1;
     }
 
-    // Once per pass, not per segment: the file is rewritten whole, and every
-    // segment's sightings are already committed. Also rewritten when it has
+    // Once per pass, not per segment: the files are rewritten whole, and every
+    // segment's sightings are already committed. Also rewritten when one has
     // gone missing and there is something to say, so a wiped `_meta` comes back
     // without waiting for new data, while an empty pass stays a true no-op.
-    let missing = !template_dict::dict_path(store_dir).exists();
-    if report.segments_merged > 0 || missing {
-        let written = template_dict::rows_from_catalog(catalog).and_then(|rows| {
-            if report.segments_merged == 0 && rows.is_empty() {
-                return Ok(None);
-            }
-            template_dict::write(store_dir, &rows).map(|_| Some(rows.len()))
-        });
+    let node = tenancy.node();
+    let rewrite = report.segments_merged > 0 || template_dict::missing(store_dir, node, catalog).unwrap_or(false);
+    if rewrite {
+        let written = template_dict::export(store_dir, node, catalog).map(|r| (r.files > 0).then_some(r.rows));
         match written {
             Ok(rows) => report.dictionary_rows = rows,
             Err(e) => {
@@ -470,7 +485,7 @@ mod tests {
         let path = &store::list_parquet_files(&store_dir)[0];
         let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap()).unwrap();
         let version = reader.metadata().file_metadata().key_value_metadata().unwrap().iter().find(|e| e.key == "logless.schema_version").unwrap().value.clone();
-        assert_eq!(version.as_deref(), Some("3"));
+        assert_eq!(version.as_deref(), Some("4"));
         let mut by_body = BTreeMap::new();
         for batch in reader.build().unwrap() {
             let batch = batch.unwrap();
@@ -682,8 +697,9 @@ mod tests {
         assert_eq!(report.dictionary_rows, Some(3));
         assert_eq!(report.dictionary_error, None);
 
-        let path = template_dict::dict_path(&store_dir);
-        let rows = template_dict::read(&path).unwrap();
+        let path = template_dict::dict_path(&store_dir, "default", "default", Tenancy::default().node());
+        let read = |path: &Path| template_dict::read(path, "default", "default").unwrap();
+        let rows = read(&path);
         let in_dict: std::collections::BTreeSet<_> =
             rows.iter().map(|r| (r.service.clone(), r.template_id)).collect();
         assert_eq!(in_dict, pairs_in_store(&store_dir), "the dictionary covers every row's key");
@@ -694,8 +710,8 @@ mod tests {
         assert_eq!((api.first_seen_micros, api.last_seen_micros), (10_000_000, 30_000_000));
         let worker = rows.iter().find(|r| r.service.as_deref() == Some("worker")).unwrap();
         assert_eq!(worker.template_id, api.template_id, "one shape, one id, two services");
-        assert_eq!(worker.global_id, api.global_id);
-        assert!(rows.iter().all(|r| r.agent == cat.template_id_space().unwrap()));
+        assert_eq!(api.template_id, crate::drain::fingerprint_of(&api.text), "the id is the hash of the text");
+        assert_eq!((api.count, worker.count), (2, 1));
 
         // A later merge rewrites the file: bounds move, new pairs appear.
         write_wal(
@@ -708,9 +724,9 @@ mod tests {
         let report =
             merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
         assert_eq!(report.dictionary_rows, Some(4));
-        let rows = template_dict::read(&path).unwrap();
+        let rows = read(&path);
         let api = rows.iter().find(|r| r.service.as_deref() == Some("api")).unwrap();
-        assert_eq!((api.first_seen_micros, api.last_seen_micros), (10_000_000, 50_000_000));
+        assert_eq!((api.first_seen_micros, api.last_seen_micros, api.count), (10_000_000, 50_000_000, 3));
         let in_dict: std::collections::BTreeSet<_> =
             rows.iter().map(|r| (r.service.clone(), r.template_id)).collect();
         assert_eq!(in_dict, pairs_in_store(&store_dir));
@@ -724,7 +740,7 @@ mod tests {
         let report =
             merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
         assert_eq!(report.dictionary_rows, Some(4));
-        assert_eq!(template_dict::read(&path).unwrap(), rows);
+        assert_eq!(read(&path), rows);
     }
 
     #[test]

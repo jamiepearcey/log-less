@@ -1,5 +1,6 @@
 <!-- Slice 1 of section 9 ("layout v3 at the edge") is built: docs/architecture.md section 2, docs/evidence/layout-v3.md.
-     Slices 2 to 7 are not. The rest of this header is as written before the owner decisions at the end.
+     Slice 2 ("template id = content hash") is built: docs/architecture.md section 3, docs/evidence/template-hash-ids.md.
+     Slices 3 to 7 are not. The rest of this header is as written before the owner decisions at the end.
      Status: PROPOSED (2026-10-11). Consultant design recommendation, not yet accepted by the owner and not built.
      Numbers in section 8 are estimates. Owner decisions are listed in section 10. Tracked in Plane (LOG project). -->
 
@@ -430,7 +431,7 @@ Each slice ships alone and is testable alone.
 ## Current code that contradicts this design (file:line)
 
 - `crates/logless-core/src/merge.rs:130` partitions on `observed`; ADR 0002 wants `timestamp`.
-- `crates/logless-core/src/merge.rs:147-150` keeps a foreign `template_id` unmined; `crates/logless-core/src/peer.rs:784` deserialises it; mixed id spaces land in one store with no agent column (`docs/tasks/current.md:239`).
+- ~~`crates/logless-core/src/merge.rs:147-150` keeps a foreign `template_id` unmined; `crates/logless-core/src/peer.rs:784` deserialises it; mixed id spaces land in one store with no agent column (`docs/tasks/current.md:239`).~~ **Fixed (slice 2):** the id an edge sends is a content hash, so keeping it unmined is right; `docs/evidence/template-hash-ids.md`.
 - `crates/logless-core/src/store.rs:25` `ROW_GROUP_ROWS = 64 * 1024`.
 - `crates/logless-core/src/store.rs:195` and `scan.rs:247` read/prune stats on `observed` only; `catalog.rs:169-177` `files` has no event-time range.
 - `crates/logless-core/src/catalog.rs:440-481` `list_files`/`files_overlapping` load the whole table; `catalog.rs:637` `forget_missing_files` stats every path; `catalog.rs:830` `rebuild` is whole-store.
@@ -442,8 +443,8 @@ Each slice ships alone and is testable alone.
 - `crates/logless-core/src/restore.rs:339` places a restored part by `observed` hour.
 - `crates/logless-core/src/catalog.rs:232-238` typed-column registry is per store with "type never changes" (cross-writer/cross-tenant conflict).
 - `crates/logless-core/src/peer.rs:675-700` `authenticated` yields a node id only; no tenant.
-- `crates/logless-core/src/template_dict.rs:55` one `_meta/templates.pq` per store.
-- `crates/logless-core/src/sync.rs:55` rollups keyed by per-edge template ids.
+- ~~`crates/logless-core/src/template_dict.rs:55` one `_meta/templates.pq` per store.~~ **Fixed (slice 2):** `tenant=<t>/index=<i>/_meta/templates/writer=<node>.pq`, plus `_meta/shape_history/`.
+- ~~`crates/logless-core/src/sync.rs:55` rollups keyed by per-edge template ids.~~ **Fixed (slice 2):** rollups are keyed by the record's `template_id`, now a content hash; two edges' rollups for one shape add up.
 - Console: `crates/sqls-source/src/logless.rs:239` one whole-store glob (20k cap, ADR-0008); `logless_scan.rs:40-50` `MAX_SCAN_FILES = 50_000`, `OPEN_GRACE_HOURS` assumes observed-time partitioning; console never reads the `parts` bucket.
 - `docs/tasks/current.md:241` HEC `index` is ignored.
 

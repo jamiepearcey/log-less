@@ -300,8 +300,10 @@ sql_csv() { "$DUCKDB_BIN" -noheader -csv -c "$1"; }
 by_template() { sql_csv "select coalesce(cast(template_id as varchar), 'none') t, count(*) from read_parquet('$1/**/*.parquet', union_by_name = true) group by 1 order by 1"; }
 by_pair() { sql_csv "select coalesce(cast(template_id as varchar), 'none') t, coalesce(service, '~') s, count(*) from read_parquet('$1/**/*.parquet', union_by_name = true) group by 1, 2 order by 1, 2"; }
 total_rows() { sql_csv "select count(*) from read_parquet('$1/**/*.parquet', union_by_name = true)"; }
-dict_keys() { sql_csv "select template_id, coalesce(service, '~') from read_parquet('$1/_meta/templates.pq') order by 1, 2"; }
-cat_templates() { sqlite3 "$1" "select id, count from templates order by id"; }
+dict_keys() { sql_csv "select template_id, coalesce(service, '~') from read_parquet('$1/tenant=*/index=*/_meta/templates/*.pq') order by 1, 2"; }
+# The catalog's templates table is the miner's private counter state (a restore numbers it afresh); what rows carry
+# and what the catalog keys its sightings on is the content hash, so that is what must survive.
+cat_templates() { sqlite3 "$1" "select template_id, sum(rows) from template_services group by 1 order by 1"; }
 
 BEFORE_ROWS=$(total_rows "$EDGE_STORE")
 by_template "$EDGE_STORE" > "$R/before.tpl"; by_pair "$EDGE_STORE" > "$R/before.pair"; dict_keys "$EDGE_STORE" > "$R/before.dict"
@@ -311,6 +313,8 @@ EDGE_FILES=$(find "$EDGE_STORE" -name '*.parquet' | wc -l | tr -d ' ')
 EDGE_BYTES=$(find "$EDGE_STORE" -name '*.parquet' -exec stat -f %z {} + | awk '{s+=$1} END {print s}')
 check "before: every accepted record is in a part" "$(eq "$BEFORE_ROWS" "$N_RECORDS")" "edge parquet rows=$BEFORE_ROWS accepted=$N_RECORDS files=$EDGE_FILES bytes=$EDGE_BYTES"
 check "before: templates were mined" "$( [ "$N_TPL" -ge 3 ] && echo 1 || echo 0)" "template ids=$N_TPL (template,service) pairs=$N_PAIR"
+SMALL_IDS=$(grep -v '^none,' "$R/before.tpl" | awk -F, '$1 < 1000000' | wc -l | tr -d ' ')
+check "before: template ids are content hashes, not the miner's counter" "$(eq "$SMALL_IDS" 0)" "ids below 1000000: $SMALL_IDS of $N_TPL"
 
 # --- the stored parts match the edge's files ---------------------------------------------------------------------
 OBJECTS=$(node_parts)
@@ -358,7 +362,7 @@ by_template "$R/restored1/store" > "$R/after.tpl"; by_pair "$R/restored1/store" 
 cat_templates "$R/restored1/catalog.sqlite" > "$R/after.cat"
 check "case 1: per-template row counts identical" "$(eq "$(cat "$R/before.tpl")" "$(cat "$R/after.tpl")")" "$(wc -l < "$R/after.tpl" | tr -d ' ') groups ($N_TPL template ids + none): $(tr '\n' ' ' < "$R/after.tpl")"
 check "case 1: per-(template,service) row counts identical" "$(eq "$(cat "$R/before.pair")" "$(cat "$R/after.pair")")" "$(wc -l < "$R/after.pair" | tr -d ' ') groups"
-check "case 1: catalog templates (id,count) identical" "$(eq "$(cat "$R/before.cat")" "$(cat "$R/after.cat")")" "$(wc -l < "$R/after.cat" | tr -d ' ') templates"
+check "case 1: catalog sightings (template_id,rows) identical" "$(eq "$(cat "$R/before.cat")" "$(cat "$R/after.cat")")" "$(wc -l < "$R/after.cat" | tr -d ' ') template ids"
 check "case 1: dictionary (template_id,service) keys identical" "$(eq "$(cat "$R/before.dict")" "$(cat "$R/after.dict")")" "$(wc -l < "$R/after.dict" | tr -d ' ') keys (dictionary text differs by design: exemplar, not mined)"
 RESTORED_PLACES=$(places "$R/restored1/store" "")
 check "case 1: every part is back in the directory it was written in" "$( [ "$RESTORED_PLACES" = "$EDGE_PLACES" ] && [ "$(echo "$EDGE_PLACES" | grep -c "^tenant=default/index=default/hour=[^/]*/level=[^/]*/node=$NODE ")" = "$EDGE_FILES" ] && echo 1 || echo 0)" \

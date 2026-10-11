@@ -267,7 +267,7 @@ enum Command {
         config: PathBuf,
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Rewrite `<store>/_meta/templates.pq` from the catalog now, instead
+        /// Rewrite the `_meta/templates` and `_meta/shape_history` files of every tenant and index from the catalog now, instead
         /// of waiting for the next merge.
         #[arg(long)]
         export: bool,
@@ -533,9 +533,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             match (report.dictionary_rows, &report.dictionary_error) {
                 (Some(rows), _) => println!(
-                    "exported {} rows to {}",
+                    "exported {} rows to <store>/tenant=*/index=*/_meta/templates/writer={}.pq",
                     rows,
-                    logless_core::template_dict::dict_path(&config.store_dir()).display()
+                    tenancy.node()
                 ),
                 (None, Some(e)) => println!("template dictionary not exported: {e}"),
                 (None, None) => {}
@@ -798,24 +798,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = load(&config)?;
             let catalog = Catalog::open(&catalog_path(&config))?;
             if export {
-                let r = logless_core::template_dict::export(&config.store_dir(), &catalog)?;
+                let tenancy = config.tenancy()?;
+                let r = logless_core::template_dict::export(&config.store_dir(), tenancy.node(), &catalog)?;
                 println!(
-                    "dictionary={} rows={} bytes={}",
-                    logless_core::template_dict::dict_path(&config.store_dir()).display(),
+                    "dictionary={}/tenant=*/index=*/_meta/templates/writer={}.pq files={} rows={} history_rows={} bytes={}",
+                    config.store_dir().display(),
+                    tenancy.node(),
+                    r.files,
                     r.rows,
+                    r.history_rows,
                     r.bytes
                 );
             }
             let templates = catalog.top_templates(limit)?;
             let total: u64 = catalog.load_templates()?.iter().map(|t| t.count).sum();
             println!(
-                "templates={} lines_covered={} id_space={}",
+                "templates={} lines_covered={} hash_collisions={}",
                 catalog.load_templates()?.len(),
                 total,
-                catalog.template_id_space()?
+                catalog.template_hash_collisions()?
             );
             for t in templates {
-                println!("  id={:<5} count={:<9} {}", t.id, t.count, t.text());
+                // The id rows carry: the hash of the text, not the miner's counter.
+                println!("  id={:<20} count={:<9} {}", t.fingerprint(), t.count, t.text());
             }
         }
 
@@ -1556,13 +1561,20 @@ fn run(
         }
 
         // Assign the template id here so it reaches both the WAL and pushdown.
+        // The id is the content hash of the template text, the same on every
+        // node, which is what lets a central add one shape up across edges.
         // The template *text* is carried alongside for aggregate events, whose
         // job is to show the shape rather than one arbitrary example of it.
+        // A record that arrives with an id (another log-less instance sent it)
+        // keeps it and is not mined: its text is not known here, and a shape
+        // that has not widened has a lineage equal to its id.
         let mut template_text = String::new();
         let mut template_lineage = None;
-        if let Ok(mut d) = drain.lock() {
+        if let Some(id) = record.template_id {
+            template_lineage = Some(id);
+        } else if let Ok(mut d) = drain.lock() {
             if let Some(m) = d.add_line(&record.body, now_unix_secs()) {
-                record.template_id = Some(m.template_id);
+                record.template_id = Some(m.shape_id);
                 if let Some(t) = d.template(m.template_id) {
                     template_text = t.text();
                     template_lineage = Some(t.lineage_id);

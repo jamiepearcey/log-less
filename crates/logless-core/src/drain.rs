@@ -13,6 +13,16 @@
 //! template, which is what makes this viable at line rate and why it was chosen
 //! over MinHash/LSH clustering.
 //!
+//! **The id inside the tree is a counter; the id outside it is a content hash.**
+//! A template's counter ([`Template::id`], [`Match::template_id`]) is local
+//! bookkeeping and means nothing on another node. Everything that leaves the
+//! miner (a record's `template_id`, a rollup key, the dictionary, a Sentry
+//! fingerprint) uses [`Match::shape_id`], the hash of the template text
+//! ([`fingerprint_of`]), so two nodes that mined the same shape agree without
+//! coordinating. Widening changes the hash and not the lineage
+//! ([`Template::lineage_id`]); [`Drain::shape`] remembers every hash a template
+//! has held so a reader can fold them.
+//!
 //! **Template ids are stable and exact.** The same line always lands on the same
 //! id, for the lifetime of the store. Everything downstream depends on that:
 //! novelty detection ("an id never seen before"), rate baselines per template,
@@ -138,11 +148,22 @@ pub fn fingerprint_of(template_text: &str) -> u64 {
 
 #[derive(Debug, PartialEq)]
 pub struct Match {
+    /// The template's local counter. Not for storage or the wire: see [`Match::shape_id`].
     pub template_id: u64,
+    /// The template's content hash after this line was merged into it
+    /// ([`Template::fingerprint`]): the id records, rollups and the dictionary carry.
+    pub shape_id: u64,
     /// Original text at each variable position, in order.
     pub params: Vec<String>,
     /// First time this template has ever been seen — the novelty signal.
     pub is_new: bool,
+}
+
+/// What a content-hash id stands for: the text it hashed, and the lineage of the template that held it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shape {
+    pub lineage_id: u64,
+    pub text: String,
 }
 
 #[derive(Debug, Default)]
@@ -157,6 +178,11 @@ pub struct Drain {
     /// Keyed by token count, then by leading tokens.
     roots: HashMap<usize, Node>,
     templates: HashMap<u64, Template>,
+    /// Counter -> the hash of the template's current text, so labelling a line costs a lookup and not a hash.
+    shape_ids: HashMap<u64, u64>,
+    /// Every content hash a template here has held, current or since widened away. The first template to hold a
+    /// hash names its lineage; a later template that widens into the same text shares the hash (it is the same shape).
+    shapes: HashMap<u64, Shape>,
     /// Every `lineage_id` in use, so a re-minted shape cannot share one.
     lineages: std::collections::HashSet<u64>,
     next_id: u64,
@@ -185,6 +211,8 @@ impl Drain {
             config,
             roots: HashMap::new(),
             templates: HashMap::new(),
+            shape_ids: HashMap::new(),
+            shapes: HashMap::new(),
             lineages: std::collections::HashSet::new(),
             next_id: 1,
             untemplated: 0,
@@ -205,6 +233,7 @@ impl Drain {
             let key: Vec<String> = template.tokens.clone();
             drain.insert_into_tree(&key, template.id);
             drain.lineages.insert(template.lineage_id);
+            drain.note_shape(&template);
             drain.templates.insert(template.id, template);
         }
         drain
@@ -220,6 +249,26 @@ impl Drain {
 
     pub fn template_count(&self) -> usize {
         self.templates.len()
+    }
+
+    /// The content hash template `id` (a counter) currently has.
+    pub fn shape_id(&self, id: u64) -> Option<u64> {
+        self.shape_ids.get(&id).copied()
+    }
+
+    /// What a content-hash id was: its text and lineage. Knows every hash a template here has held since this
+    /// miner started or was restored, including ones since widened away; `None` for a hash minted elsewhere.
+    pub fn shape(&self, shape_id: u64) -> Option<&Shape> {
+        self.shapes.get(&shape_id)
+    }
+
+    /// Records the hash `template` has now, and that it is a shape of its lineage.
+    fn note_shape(&mut self, template: &Template) -> u64 {
+        let text = template.text();
+        let hash = fingerprint_of(&text);
+        self.shape_ids.insert(template.id, hash);
+        self.shapes.entry(hash).or_insert(Shape { lineage_id: template.lineage_id, text });
+        hash
     }
 
     /// Match a line, creating or updating a template.
@@ -255,12 +304,19 @@ impl Drain {
 
         if let Some((id, _)) = best {
             let template = self.templates.get_mut(&id).expect("candidate exists");
-            merge_into(&mut template.tokens, masked);
+            let widened = merge_into(&mut template.tokens, masked);
             template.count += 1;
             template.last_seen_unix_secs = now_unix_secs;
             let params = params_for(&template.tokens, masked, raw);
+            let shape_id = if widened {
+                let template = template.clone();
+                self.note_shape(&template)
+            } else {
+                self.shape_ids[&id]
+            };
             return Some(Match {
                 template_id: id,
+                shape_id,
                 params,
                 is_new: false,
             });
@@ -285,19 +341,19 @@ impl Drain {
             lineage_id = fingerprint_of(&format!("{text}\u{1f}{id}"));
             self.lineages.insert(lineage_id);
         }
-        self.templates.insert(
+        let template = Template {
             id,
-            Template {
-                id,
-                tokens,
-                count: 1,
-                first_seen_unix_secs: now_unix_secs,
-                last_seen_unix_secs: now_unix_secs,
-                lineage_id,
-            },
-        );
+            tokens,
+            count: 1,
+            first_seen_unix_secs: now_unix_secs,
+            last_seen_unix_secs: now_unix_secs,
+            lineage_id,
+        };
+        let shape_id = self.note_shape(&template);
+        self.templates.insert(id, template);
         Some(Match {
             template_id: id,
+            shape_id,
             params,
             is_new: true,
         })
@@ -408,13 +464,17 @@ fn similarity(template: &[String], tokens: &[String]) -> f64 {
 }
 
 /// Widen a template to cover a new line: differing positions become wildcards.
-fn merge_into(template: &mut [String], tokens: &[String]) {
+/// Returns whether the text changed, which is when its content hash does.
+fn merge_into(template: &mut [String], tokens: &[String]) -> bool {
+    let mut widened = false;
     for (slot, token) in template.iter_mut().zip(tokens) {
-        if slot != token {
+        if slot != token && slot != WILDCARD {
             slot.clear();
             slot.push_str(WILDCARD);
+            widened = true;
         }
     }
+    widened
 }
 
 /// Parameters are the raw text at every position the template treats as
@@ -648,5 +708,43 @@ mod tests {
         let r = Drain::restore(DrainConfig::default(), ts);
         assert_eq!(r.template(a).unwrap().lineage_id, d.template(a).unwrap().lineage_id);
         assert_ne!(r.template(a).unwrap().lineage_id, r.template(a).unwrap().fingerprint());
+    }
+
+    #[test]
+    fn the_boundary_id_is_the_hash_of_the_text_and_does_not_depend_on_arrival_order() {
+        let mut a = drain();
+        let mut b = drain();
+        let a_user = a.add_line("user 42 logged in from 10.0.0.1", 0).unwrap();
+        a.add_line("payment 99 failed for order 7", 0).unwrap();
+        b.add_line("cache miss for key 9", 0).unwrap();
+        b.add_line("payment 12 failed for order 1", 0).unwrap();
+        let b_user = b.add_line("user 1 logged in from 10.1.1.1", 0).unwrap();
+        assert_ne!(a_user.template_id, b_user.template_id, "the counters are local to a miner");
+        assert_eq!(a_user.shape_id, b_user.shape_id, "the content hash is not");
+        // Pinned: the Sentry fingerprint of an unwidened template was this value before ids were hashes
+        // (lineage = the hash of the text at birth), and must stay it.
+        assert_eq!(a_user.shape_id, 0xebd9_c098_a3d9_03f0);
+        assert_eq!(a_user.shape_id, fingerprint_of("user <NUM> logged in from <IP>"));
+        assert_eq!(a.template(a_user.template_id).unwrap().lineage_id, a_user.shape_id, "unwidened: lineage = id");
+    }
+
+    #[test]
+    fn widening_changes_the_id_and_not_the_lineage_and_both_ids_stay_resolvable() {
+        let mut d = loose();
+        let before = d.add_line("job run alpha finished ok in cache", 1).unwrap();
+        let widened = d.add_line("job run beta finished ok in cache", 2).unwrap();
+        let again = d.add_line("job run gamma finished ok in cache", 3).unwrap();
+        assert_eq!(before.template_id, widened.template_id, "the counter is the same template");
+        assert_ne!(before.shape_id, widened.shape_id, "the content hash moved");
+        assert_eq!(widened.shape_id, again.shape_id, "and settles");
+        let lineage = d.template(before.template_id).unwrap().lineage_id;
+        assert_eq!(lineage, before.shape_id, "the Sentry fingerprint (the lineage) is the first hash");
+        assert_eq!(d.shape(before.shape_id).unwrap(), &Shape { lineage_id: lineage, text: "job run alpha finished ok in cache".into() });
+        assert_eq!(d.shape(widened.shape_id).unwrap(), &Shape { lineage_id: lineage, text: "job run <*> finished ok in cache".into() });
+        assert_eq!(d.shape_id(before.template_id), Some(widened.shape_id));
+        // A restart keeps the current hash and its lineage; the old hash is the catalog's to remember.
+        let r = Drain::restore(DrainConfig::default(), d.templates().cloned().collect());
+        assert_eq!(r.shape(widened.shape_id).unwrap().lineage_id, lineage);
+        assert_eq!(r.shape_id(before.template_id), Some(widened.shape_id));
     }
 }

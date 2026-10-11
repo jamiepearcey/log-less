@@ -162,8 +162,15 @@ pub fn same_failure(provider: &dyn DecisionProvider, a: &str, b: &str) -> Result
     Ok(probs.get("same").copied().unwrap_or(0.0))
 }
 
+fn id_as_string<S: serde::Serializer>(id: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&id.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Side {
+    /// The template's content hash, the `template_id` its rows carry. A 64-bit number: a JSON reader that
+    /// holds numbers as doubles loses its low bits, so it is sent as a string.
+    #[serde(serialize_with = "id_as_string")]
     pub id: u64,
     pub text: String,
     pub count: u64,
@@ -238,7 +245,7 @@ pub fn suggest_merges(provider: &dyn DecisionProvider, templates: &[Template], c
             Ok(p) => {
                 checked += 1;
                 if p >= cfg.min_confidence {
-                    let side = |t: &Template| Side { id: t.id, text: t.text(), count: t.count };
+                    let side = |t: &Template| Side { id: t.fingerprint(), text: t.text(), count: t.count };
                     suggestions.push(MergeSuggestion { a: side(&templates[i]), b: side(&templates[j]), p_same: (p * 10_000.0).round() / 10_000.0 });
                 }
             }
@@ -313,10 +320,13 @@ mod tests {
         let cfg = DecisionConfig::default();
         let report = suggest_merges(&Keyword, &corpus(), &cfg, Duration::from_secs(5));
         assert_eq!(0, report.failed);
+        // A side is named by its content hash, the id its rows carry, not by the miner's counter.
+        let templates = corpus();
+        let hash = |counter: u64| templates.iter().find(|t| t.id == counter).unwrap().fingerprint();
         let ids: Vec<(u64, u64)> = report.suggestions.iter().map(|s| (s.a.id, s.b.id)).collect();
-        assert!(ids.contains(&(5, 6)) && ids.contains(&(1, 2)), "{ids:?}");
-        assert!(!ids.contains(&(1, 3)), "different services' timeouts are not one failure: {ids:?}");
-        let s = report.suggestions.iter().find(|s| s.a.id == 1).unwrap();
+        assert!(ids.contains(&(hash(5), hash(6))) && ids.contains(&(hash(1), hash(2))), "{ids:?}");
+        assert!(!ids.contains(&(hash(1), hash(3))), "different services' timeouts are not one failure: {ids:?}");
+        let s = report.suggestions.iter().find(|s| s.a.id == hash(1)).unwrap();
         assert_eq!((900, 40), (s.a.count, s.b.count));
         assert!(s.p_same >= 0.8);
     }

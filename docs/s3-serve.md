@@ -88,52 +88,74 @@ and opening every file. `union_by_name=true` is needed because files differ in
 which typed `attr_*` columns they hold (`docs/typed-columns.md`); without it
 DuckDB takes the first file's schema. No performance figures are claimed here.
 
-## Template dictionary (`_meta/templates.pq`)
+## Template dictionary and shape history (`_meta/`)
 
-Log rows carry only `template_id`; the template text lives in the catalog's
-SQLite. After every merge that commits a segment, log-less rewrites
-`store/_meta/templates.pq` from the catalog (temp file, fsync, rename), and the
-endpoint serves it as the key `_meta/templates.pq`. It is the only key served
-besides `*.parquet`. The `.pq` extension is deliberate: a `**/*.parquet` glob
-never sweeps it into a logs query. `logless templates --export` rewrites it on
-demand.
+Log rows carry only `template_id`: the 64-bit content hash of the masked template text, so equal shapes have equal ids
+on every node. The text lives in the catalog's SQLite. After every merge that commits a segment, log-less rewrites, for
+each `(tenant, index)` that has rows, two files for its own node id (temp file, fsync, rename):
+
+```
+tenant=<t>/index=<i>/_meta/templates/writer=<node>.pq       the dictionary
+tenant=<t>/index=<i>/_meta/shape_history/writer=<node>.pq   the shape history
+```
+
+The endpoint serves them as those keys. Besides `*.parquet` it serves any `.pq` key with a `_meta` path segment and
+nothing else. The `.pq` extension is deliberate: a `**/*.parquet` glob never sweeps them into a logs query. Each writer
+owns its own file, so no two writers write one key; a reader unions `_meta/templates/*.pq` (ids agree across writers
+because they are hashes). `logless templates --export` rewrites them on demand.
+
+Dictionary, one row per `(template_id, service)` (footer `logless.templates_version = 2`):
 
 | column        | Parquet / DuckDB type                    | null | meaning |
 |---------------|------------------------------------------|------|---------|
-| `template_id` | UINT64 / `UBIGINT`                       | no   | equals the logs' `template_id`; a counter local to `agent` |
+| `template_id` | UINT64 / `UBIGINT`                       | no   | equals the logs' `template_id`; the hash of `text` |
 | `service`     | UTF8 / `VARCHAR`                         | yes  | equals the logs' `service`; null for rows without one |
-| `text`        | UTF8 / `VARCHAR`                         | no   | current template text (masked tokens such as `<NUM>`, `<IP>`; `<*>` for mined wildcards) |
+| `text`        | UTF8 / `VARCHAR`                         | no   | the text `template_id` hashes (masked tokens such as `<NUM>`, `<IP>`; `<*>` for mined wildcards) |
+| `count`       | UINT64 / `UBIGINT`                       | no   | rows merged with this (template, service) |
 | `first_seen`  | TIMESTAMP(MICROS, UTC) / `TIMESTAMPTZ`   | no   | earliest `observed` of a merged row with this (template, service) |
 | `last_seen`   | TIMESTAMP(MICROS, UTC) / `TIMESTAMPTZ`   | no   | latest `observed` of a merged row with this (template, service) |
-| `agent`       | UTF8 / `VARCHAR`                         | no   | the id space `template_id` was minted in: a UUID per catalog |
-| `global_id`   | UINT64 / `UBIGINT`                       | no   | FNV-1a 64 of `text`; equal across agents and services for equal text |
-| `lineage_id`  | UINT64 / `UBIGINT`                       | no   | `global_id` of the text the template was minted with; unchanged when it widens |
+| `lineage_id`  | UINT64 / `UBIGINT`                       | no   | the id the template was minted with; unchanged when it widens; what the Sentry forwarder fingerprints with |
 
-- One row per `(template_id, service)` pair ever merged, so a join on
-  `template_id` plus `service IS NOT DISTINCT FROM` matches exactly one row.
-  Templates no merged row carries yet are not listed.
-- `template_id` is a per-catalog counter: two agents can both call different
-  shapes `7`. `(agent, template_id)` is unambiguous; `global_id` is the key for
-  merging one shape across services or agents; it changes when a template
-  widens. `lineage_id` does not change when it widens and is what the Sentry
-  forwarder fingerprints with, so group a widened template's rows by it.
+Shape history, one row per `(lineage_id, template_id)` (footer `logless.shape_history_version = 1`). It is a separate
+file because its grain differs from the dictionary's, and rows of two grains in `_meta/templates/` would be mixed by
+`union_by_name`:
+
+| column        | type                | meaning |
+|---------------|---------------------|---------|
+| `lineage_id`  | UINT64              | as above |
+| `template_id` | UINT64              | a hash this lineage has held; rows carry it |
+| `text`        | UTF8                | the text that hash is of |
+| `count`       | UINT64              | rows merged carrying it |
+| `first_ts`, `last_ts` | TIMESTAMP(MICROS, UTC) | earliest and latest `observed` of a row carrying it |
+
+- `tenant` and `index` are the directories (hive columns), not columns of the files.
+- One row per `(template_id, service)` pair ever merged whose text this writer knows, so a join on `template_id` plus
+  `service IS NOT DISTINCT FROM` matches exactly one row. A hash this writer never mined (an edge minted it and this
+  node kept the record unmined) has no row; the edge's own file has it.
+- Widening changes the hash from that moment; rows already written keep theirs. Group by `lineage_id` (join
+  `shape_history` on `template_id`) to see a widened template as one issue.
+- Two different texts with one hash are one shape to a query; the first text registered is kept and the collision is
+  counted in the catalog (`template_hash_collisions`).
 - `first_seen`/`last_seen` describe rows as merged; retention does not move them.
-- A lost catalog restarts ids under a new `agent`, so rows written before the
-  loss keep ids the new dictionary no longer describes.
-- The footer carries `logless.templates_version = 1`.
+- Parquet written before ids were hashes carries counters; `logless migrate-layout` re-keys it.
 
 ```
 CREATE VIEW log_templates AS
-  SELECT * FROM read_parquet('s3://logs/_meta/templates.pq');
+  SELECT * FROM read_parquet('s3://logs/tenant=*/index=*/_meta/templates/*.pq', hive_partitioning=true, union_by_name=true);
 
 SELECT t.text, count(*)
 FROM read_parquet('s3://logs/**/*.parquet', hive_partitioning=true, union_by_name=true) l
 JOIN log_templates t
   ON l.template_id = t.template_id AND l.service IS NOT DISTINCT FROM t.service
+  AND l.tenant = t.tenant AND l.index = t.index
 WHERE l.hour = '2026-10-03T14'
 GROUP BY t.text;
 ```
 
-Checked against a local store of 22,000 merged lines (6 templates, no service):
+A union of several writers' dictionaries has one row per writer for the same `(template_id, service)`: sum `count`,
+take the min of `first_seen` and the max of `last_seen`.
+
+Checked against a local store of 22,000 merged lines (6 templates, no service) with the earlier single-file
+dictionary, before content-hash ids (the join above was checked on a current store: `docs/evidence/template-hash-ids.md`):
 the file was 2,829 bytes, DuckDB read the types above, and the join matched all
 22,000 rows.

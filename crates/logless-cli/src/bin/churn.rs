@@ -45,6 +45,9 @@ fn main() {
             lines += 1;
             match drain.add_line(line, 1_700_000_000 + n as u64) {
                 Some(m) => {
+                    // The id the store would carry is the hash of the template's text right now, so the
+                    // `fingerprint` column below is the stored-id history and `lineage` the folded one.
+                    assert_eq!(Some(m.shape_id), drain.template(m.template_id).map(|t| t.fingerprint()), "shape_id must be the content hash");
                     *events.entry(m.template_id).or_default() += 1;
                     if m.is_new {
                         new_ids.push(m.template_id);
