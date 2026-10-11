@@ -60,6 +60,11 @@ pub struct S3ServeConfig {
     /// browser page; with credentials Host is already part of the signature.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// A second, read-only bucket: the parts edges uploaded to this instance's own disk
+    /// (`[peer.parts]` with the local backend), as `<node>/<sha256>.parquet`. A bucket of its own so a
+    /// `**/*.parquet` read of the store never counts an uploaded part's rows as well. Served only when
+    /// that backend is on.
+    pub parts_bucket: String,
 }
 
 impl Default for S3ServeConfig {
@@ -72,6 +77,7 @@ impl Default for S3ServeConfig {
             access_key: None,
             secret_key: None,
             allowed_hosts: Vec::new(),
+            parts_bucket: "parts".to_string(),
         }
     }
 }
@@ -87,6 +93,7 @@ impl std::fmt::Debug for S3ServeConfig {
             .field("access_key", &self.access_key)
             .field("secret_key", &self.secret_key.as_ref().map(|_| "<redacted>"))
             .field("allowed_hosts", &self.allowed_hosts)
+            .field("parts_bucket", &self.parts_bucket)
             .finish()
     }
 }
@@ -103,6 +110,8 @@ pub enum S3ServeError {
         "s3 serve needs both an access key and a secret key (config or LOGLESS_S3_ACCESS_KEY / LOGLESS_S3_SECRET_KEY) but only the {present} is set"
     )]
     PartialCredentials { present: &'static str },
+    #[error("s3 serve parts_bucket is {0:?}, the same name as the store's bucket; give the uploaded parts a bucket of their own")]
+    SameBucket(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -115,6 +124,8 @@ pub struct S3Stats {
 struct Inner {
     store_dir: PathBuf,
     bucket: String,
+    /// The parts bucket and its directory, when uploaded parts are on this disk.
+    parts: Option<(String, PathBuf)>,
     creds: Option<Credentials>,
     allowed_hosts: Vec<String>,
     requests: AtomicU64,
@@ -147,7 +158,16 @@ fn resolve_credentials(cfg: &S3ServeConfig) -> Result<Option<Credentials>, S3Ser
 
 impl S3Server {
     pub fn start(cfg: &S3ServeConfig, store_dir: PathBuf) -> Result<S3Server, S3ServeError> {
+        Self::start_with_parts(cfg, store_dir, None)
+    }
+
+    /// As [`S3Server::start`], and serves `parts_dir` (the local parts directory, `crate::parts`) as the
+    /// bucket `cfg.parts_bucket`, under the same credentials and the same rules.
+    pub fn start_with_parts(cfg: &S3ServeConfig, store_dir: PathBuf, parts_dir: Option<PathBuf>) -> Result<S3Server, S3ServeError> {
         let creds = resolve_credentials(cfg)?;
+        if parts_dir.is_some() && cfg.parts_bucket == cfg.bucket {
+            return Err(S3ServeError::SameBucket(cfg.bucket.clone()));
+        }
 
         let addrs: Vec<SocketAddr> = cfg
             .addr
@@ -168,6 +188,7 @@ impl S3Server {
         let inner = Arc::new(Inner {
             store_dir,
             bucket: cfg.bucket.clone(),
+            parts: parts_dir.map(|dir| (cfg.parts_bucket.clone(), dir)),
             allowed_hosts: cfg.allowed_hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
             creds,
             requests: AtomicU64::new(0),
@@ -422,9 +443,14 @@ impl Inner {
         let has_param = |name: &str| parse_query(raw_query).iter().any(|(k, _)| k == name);
 
         let (bucket_raw, key_raw) = rest.split_once('/').unwrap_or((rest, ""));
-        if percent_decode(bucket_raw, false).as_deref() != Some(self.bucket.as_str()) {
-            return Reply::error(id, 404, "NoSuchBucket", "The specified bucket does not exist");
-        }
+        let (bucket, root) = match percent_decode(bucket_raw, false) {
+            Some(b) if b == self.bucket => (self.bucket.as_str(), self.store_dir.as_path()),
+            Some(b) if self.parts.as_ref().is_some_and(|(name, _)| *name == b) => {
+                let (name, dir) = self.parts.as_ref().expect("checked");
+                (name.as_str(), dir.as_path())
+            }
+            _ => return Reply::error(id, 404, "NoSuchBucket", "The specified bucket does not exist"),
+        };
         if key_raw.is_empty() {
             let reply = if head {
                 Reply::xml(200, String::new())
@@ -434,25 +460,26 @@ impl Inner {
                     format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"{XMLNS}\">{REGION}</LocationConstraint>"),
                 )
             } else {
-                self.list_objects(id, raw_query, meta)
+                self.list_objects(id, bucket, root, raw_query, meta)
             };
             return reply.with("x-amz-bucket-region", REGION);
         }
-        self.object(id, head, key_raw, headers, meta)
+        self.object(id, head, root, key_raw, headers, meta)
     }
 
     fn no_such_key(id: u64) -> Reply {
         Reply::error(id, 404, "NoSuchKey", "The specified key does not exist.")
     }
 
-    /// Maps a decoded key to a file under the store, or `None` for anything
-    /// that is not a servable regular file reachable without a symlink.
-    fn resolve(&self, key: &str) -> Option<PathBuf> {
+    /// Maps a decoded key to a file under `root` (the store, or the parts
+    /// directory), or `None` for anything that is not a servable regular file
+    /// reachable without a symlink.
+    fn resolve(root: &Path, key: &str) -> Option<PathBuf> {
         let segments = safe_segments(key)?;
         if !servable(key) {
             return None;
         }
-        let mut path = self.store_dir.clone();
+        let mut path = root.to_path_buf();
         for (i, segment) in segments.iter().enumerate() {
             path.push(segment);
             // `symlink_metadata`, never `metadata`: a link planted in the store
@@ -470,6 +497,7 @@ impl Inner {
         &self,
         id: u64,
         head: bool,
+        root: &Path,
         key_raw: &str,
         headers: &[(String, String)],
         meta: &mut Meta,
@@ -478,7 +506,7 @@ impl Inner {
             return Self::no_such_key(id);
         };
         meta.key = key.clone();
-        let Some(path) = self.resolve(&key) else {
+        let Some(path) = Self::resolve(root, &key) else {
             return Self::no_such_key(id);
         };
         // Open before any header is sent: compaction or retention may have
@@ -600,17 +628,20 @@ impl Inner {
         let created = fs::metadata(&self.store_dir)
             .and_then(|m| m.modified())
             .unwrap_or(UNIX_EPOCH);
+        let mut buckets = format!("<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>", xml_escape(&self.bucket), iso_date(created));
+        if let Some((name, dir)) = &self.parts {
+            let created = fs::metadata(dir).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
+            buckets.push_str(&format!("<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>", xml_escape(name), iso_date(created)));
+        }
         Reply::xml(
             200,
             format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"{XMLNS}\"><Owner><ID>log-less</ID><DisplayName>log-less</DisplayName></Owner><Buckets><Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket></Buckets></ListAllMyBucketsResult>",
-                xml_escape(&self.bucket),
-                iso_date(created)
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListAllMyBucketsResult xmlns=\"{XMLNS}\"><Owner><ID>log-less</ID><DisplayName>log-less</DisplayName></Owner><Buckets>{buckets}</Buckets></ListAllMyBucketsResult>"
             ),
         )
     }
 
-    fn list_objects(&self, id: u64, raw_query: &str, meta: &mut Meta) -> Reply {
+    fn list_objects(&self, id: u64, bucket: &str, root: &Path, raw_query: &str, meta: &mut Meta) -> Reply {
         let query = parse_query(raw_query);
         let get = |name: &str| query.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
         let invalid = |msg: &str| Reply::error(id, 400, "InvalidArgument", msg);
@@ -654,7 +685,7 @@ impl Inner {
         let params = ListParams { prefix, delimiter, max_keys, marker };
         let mut walker = Walker { p: &params, out: Vec::new(), truncated: false, last_prefix: None };
         if max_keys > 0 {
-            if let Some((dir, base)) = list_base(&self.store_dir, prefix) {
+            if let Some((dir, base)) = list_base(root, prefix) {
                 walker.walk(&dir, &base);
             }
         }
@@ -662,7 +693,7 @@ impl Inner {
         let enc = |s: &str| if url_encode { url_encode_key(s) } else { s.to_string() };
         let mut xml = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"{XMLNS}\"><Name>{}</Name><Prefix>{}</Prefix>",
-            xml_escape(&self.bucket),
+            xml_escape(bucket),
             xml_escape(&enc(prefix))
         );
         if let Some(d) = delimiter {
@@ -1236,6 +1267,51 @@ mod tests {
 
     fn obj(key: &str) -> String {
         format!("/logs/{key}")
+    }
+
+    #[test]
+    fn uploaded_parts_are_a_second_read_only_bucket_apart_from_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, parts) = (tmp.path().join("store"), tmp.path().join("parts"));
+        let name = format!("{}.parquet", "ab".repeat(32));
+        fs::create_dir_all(store.join("hour=2026-01-01T00/level=info")).unwrap();
+        fs::write(store.join(K_INFO_A), patterned(500)).unwrap();
+        fs::create_dir_all(parts.join("edge-a")).unwrap();
+        fs::write(parts.join("edge-a").join(&name), patterned(700)).unwrap();
+        // An upload in flight is a dot file: never listed, never served.
+        fs::write(parts.join("edge-a/.upload-0198.tmp"), b"half").unwrap();
+        let cfg = S3ServeConfig { addr: "127.0.0.1:0".into(), ..Default::default() };
+        let server = S3Server::start_with_parts(&cfg, store.clone(), Some(parts.clone())).unwrap();
+        let a = server.local_addr();
+
+        let key = format!("edge-a/{name}");
+        let got = http(a, "GET", &format!("/parts/{key}"), &[]);
+        assert_eq!((200, patterned(700)), (got.status, got.body));
+        assert_eq!(http(a, "GET", &format!("/parts/{key}"), &[("Range", "bytes=10-19")]).body, patterned(700)[10..20].to_vec());
+        let listed = String::from_utf8(http(a, "GET", "/parts?list-type=2", &[]).body).unwrap();
+        assert_eq!((vec![key.clone()], vec!["parts".to_string()]), (tags(&listed, "Key"), tags(&listed, "Name")));
+        assert_eq!(vec![key.clone()], tags(&String::from_utf8(http(a, "GET", "/parts?list-type=2&prefix=edge-a/", &[]).body).unwrap(), "Key"));
+        assert_eq!(404, http(a, "GET", "/parts/edge-a/.upload-0198.tmp", &[]).status);
+        // Each bucket holds only its own: a store glob never sees a part, and the reverse.
+        let store_keys = tags(&String::from_utf8(http(a, "GET", "/logs?list-type=2", &[]).body).unwrap(), "Key");
+        assert_eq!(vec![K_INFO_A.to_string()], store_keys);
+        assert_eq!(404, http(a, "GET", &format!("/logs/{key}"), &[]).status);
+        assert_eq!(404, http(a, "GET", &format!("/parts/{K_INFO_A}"), &[]).status);
+        assert_eq!(404, http(a, "GET", "/parts/../store/hour=2026-01-01T00/level=info/a.parquet", &[]).status);
+        let buckets = tags(&String::from_utf8(http(a, "GET", "/", &[]).body).unwrap(), "Name");
+        assert_eq!(vec!["logs".to_string(), "parts".to_string()], buckets);
+        // Read-only, as the store is.
+        assert_eq!(405, http(a, "PUT", &format!("/parts/{key}"), &[]).status);
+        assert_eq!(405, http(a, "DELETE", &format!("/parts/{key}"), &[]).status);
+        assert_eq!(patterned(700), fs::read(parts.join(&key)).unwrap());
+        server.shutdown();
+
+        // Without a local parts directory the bucket does not exist, and it cannot share the store's name.
+        let plain = S3Server::start(&cfg, store.clone()).unwrap();
+        assert_eq!(404, http(plain.local_addr(), "GET", &format!("/parts/{key}"), &[]).status);
+        plain.shutdown();
+        let same = S3ServeConfig { parts_bucket: "logs".into(), ..cfg };
+        assert!(matches!(S3Server::start_with_parts(&same, store, Some(parts)), Err(S3ServeError::SameBucket(_))));
     }
 
     #[test]

@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# End-to-end run of the whole stack on one machine: MinIO, a central log-less (peer receiver + Parquet parts to
-# MinIO) and an edge log-less (OTLP/HTTP, Splunk HEC and the Sentry proxy, syncing to central). Sends known
-# records, waits for sync, uploads parts, then checks counts, part checksums, peer counters, logs and shutdown.
+# End-to-end run of the whole stack on one machine: a central log-less (peer receiver + Parquet parts) and an edge
+# log-less (OTLP/HTTP, Splunk HEC and the Sentry proxy, syncing to central). Parts go to central's own disk (the
+# default, PARTS_BACKEND=local, no MinIO) or to a MinIO this script starts (PARTS_BACKEND=s3). Sends known
+# records, waits for sync, uploads parts, then checks counts, part checksums, peer counters, logs and shutdown. A
+# second edge (node edge-3, upload timer on, nothing sent but parts) then has central frozen and stopped in the middle
+# of its uploads and started again (no part lost, none duplicated), and its files removed by disk pressure (retired).
 # Prints a PASS/FAIL table and exits 1 if any check failed. Everything runs on random free ports in a throwaway
 # directory, with random credentials, and is removed on exit (KEEP=1 keeps the directory).
 #
 # Usage: scripts/e2e-stack.sh            See docs/e2e-stack.md.
 # Env:   LOGLESS_BIN   (default $CARGO_TARGET_DIR/debug/logless, else ./target/debug/logless)
-#        MINIO_BIN     (/opt/homebrew/bin/minio)   MC_BIN (mc)   DUCKDB_BIN (duckdb)
+#        PARTS_BACKEND (local | s3)   BIG_PART_MB (128; local only: one part this large is uploaded to measure
+#                      throughput and central's peak RSS; 0 skips it)
+#        MINIO_BIN     (/opt/homebrew/bin/minio)   MC_BIN (mc)   (s3 only)   DUCKDB_BIN (duckdb)
 #        SENTRY_DEMO   (~/projects/logless-studio/scripts/sentry-demo)
 #        N_OTLP (3000) N_HEC (3000) SENTRY_REQUESTS (40) SYNC_TIMEOUT (90) KEEP (0)
 set -uo pipefail
@@ -23,11 +28,18 @@ N_HEC="${N_HEC:-3000}"
 SENTRY_REQUESTS="${SENTRY_REQUESTS:-40}"
 SYNC_TIMEOUT="${SYNC_TIMEOUT:-90}"
 KEEP="${KEEP:-0}"
+PARTS_BACKEND="${PARTS_BACKEND:-local}"
+BIG_PART_MB="${BIG_PART_MB:-128}"
 BUCKET="logless-parts"
 PREFIX="edges"
-NODE="edge-1"   # the edge's node id: its parts live under $PREFIX/$NODE/
+NODE="edge-1"   # the edge's node id: its parts live under $PREFIX/$NODE/ in the bucket, parts/$NODE/ on central's disk
 
-for tool in "$LOGLESS_BIN" "$MINIO_BIN" "$MC_BIN" "$DUCKDB_BIN" curl python3 openssl sqlite3 shasum; do
+case "$PARTS_BACKEND" in
+  local) TOOLS="" ;;
+  s3) TOOLS="$MINIO_BIN $MC_BIN" ;;
+  *) echo "PARTS_BACKEND must be local or s3" >&2; exit 2 ;;
+esac
+for tool in "$LOGLESS_BIN" $TOOLS "$DUCKDB_BIN" curl python3 openssl sqlite3 shasum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing: $tool" >&2; exit 2; }
 done
 
@@ -133,43 +145,69 @@ stop_within() { # pid, seconds
 }
 
 T0=$(now_ms)
-log "run dir $R, logless $("$LOGLESS_BIN" --version 2>/dev/null || echo "$LOGLESS_BIN")"
+log "run dir $R, logless $("$LOGLESS_BIN" --version 2>/dev/null || echo "$LOGLESS_BIN"), parts backend $PARTS_BACKEND"
 
-# --- MinIO -------------------------------------------------------------------------------------------------------
-MINIO_PORT=$(free_port); MINIO_CONSOLE=$(free_port)
-MINIO_USER="e2e$(rand 6)"; MINIO_SECRET="$(rand 20)"
-MINIO_ROOT_USER="$MINIO_USER" MINIO_ROOT_PASSWORD="$MINIO_SECRET" \
-  "$MINIO_BIN" server --quiet --address "127.0.0.1:$MINIO_PORT" --console-address "127.0.0.1:$MINIO_CONSOLE" \
-  "$R/minio-data" > "$R/minio.log" 2>&1 &
-MINIO_PID=$!; PIDS="$PIDS $MINIO_PID"
-wait_http "http://127.0.0.1:$MINIO_PORT/minio/health/live" 30 || { echo "MinIO did not start" >&2; cat "$R/minio.log" >&2; exit 1; }
-export MC_CONFIG_DIR="$R/mc"
-"$MC_BIN" --config-dir "$R/mc" alias set e2e "http://127.0.0.1:$MINIO_PORT" "$MINIO_USER" "$MINIO_SECRET" > /dev/null
-"$MC_BIN" --config-dir "$R/mc" mb "e2e/$BUCKET" > /dev/null
-log "minio on $MINIO_PORT, bucket $BUCKET"
-
-# --- central -----------------------------------------------------------------------------------------------------
-PEER_PORT=$(free_port); CENTRAL_ADMIN=$(free_port)
-PEER_TOKEN="$(rand 24)"; CENTRAL_TOKEN="$(rand 24)"   # PEER_TOKEN is the edge node's token
-mkdir -p "$R/central"; : > "$R/central/empty.log"
-render_config "$R/central/data" "
-peer|enabled|true
-peer|addr|\"127.0.0.1:$PEER_PORT\"
-peer|nodes|[{ id = \"$NODE\", token = \"$PEER_TOKEN\" }]
-peer.parts|enabled|true
+# --- where parts go ----------------------------------------------------------------------------------------------
+# s3: a MinIO and its bucket. local: nothing to start; central keeps parts under its data dir and serves them
+# read-only as the bucket "parts" on its S3 endpoint. The helpers below are the only place the two differ.
+PARTS_DIR="$R/central/data/parts"
+if [ "$PARTS_BACKEND" = s3 ]; then
+  MINIO_PORT=$(free_port); MINIO_CONSOLE=$(free_port)
+  MINIO_USER="e2e$(rand 6)"; MINIO_SECRET="$(rand 20)"
+  MINIO_ROOT_USER="$MINIO_USER" MINIO_ROOT_PASSWORD="$MINIO_SECRET" \
+    "$MINIO_BIN" server --quiet --address "127.0.0.1:$MINIO_PORT" --console-address "127.0.0.1:$MINIO_CONSOLE" \
+    "$R/minio-data" > "$R/minio.log" 2>&1 &
+  MINIO_PID=$!; PIDS="$PIDS $MINIO_PID"
+  wait_http "http://127.0.0.1:$MINIO_PORT/minio/health/live" 30 || { echo "MinIO did not start" >&2; cat "$R/minio.log" >&2; exit 1; }
+  export MC_CONFIG_DIR="$R/mc"
+  "$MC_BIN" --config-dir "$R/mc" alias set e2e "http://127.0.0.1:$MINIO_PORT" "$MINIO_USER" "$MINIO_SECRET" > /dev/null
+  "$MC_BIN" --config-dir "$R/mc" mb "e2e/$BUCKET" > /dev/null
+  log "minio on $MINIO_PORT, bucket $BUCKET"
+  OWN="$PREFIX/$NODE/"   # the node's key prefix
+  PARTS_CONFIG="
 peer.parts|endpoint|\"http://127.0.0.1:$MINIO_PORT\"
 peer.parts|bucket|\"$BUCKET\"
 peer.parts|prefix|\"$PREFIX\"
 peer.parts|access_key_id|\"$MINIO_USER\"
-peer.parts|secret_access_key|\"$MINIO_SECRET\"
+peer.parts|secret_access_key|\"$MINIO_SECRET\""
+  mc_keys() { "$MC_BIN" --config-dir "$R/mc" ls --json "$@" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort; }
+  node_parts() { mc_keys "e2e/$BUCKET/$PREFIX/$NODE/"; }
+  cat_part() { "$MC_BIN" --config-dir "$R/mc" cat "e2e/$BUCKET/$PREFIX/$NODE/$1"; }
+  part_size() { "$MC_BIN" --config-dir "$R/mc" stat --json "e2e/$BUCKET/$PREFIX/$NODE/$1" | jq_py 'v["size"]'; }
+  all_keys() { mc_keys --recursive "e2e/$BUCKET/"; }
+else
+  S3_PORT=$(free_port)
+  OWN="$NODE/"
+  PARTS_CONFIG="
+serve_s3|enabled|true
+serve_s3|addr|\"127.0.0.1:$S3_PORT\""
+  node_parts() { [ -d "$PARTS_DIR/$NODE" ] && (cd "$PARTS_DIR/$NODE" && find . -type f | sed 's|^\./||' | sort); }
+  cat_part() { cat "$PARTS_DIR/$NODE/$1"; }
+  part_size() { stat -f %z "$PARTS_DIR/$NODE/$1"; }
+  all_keys() { [ -d "$PARTS_DIR" ] && (cd "$PARTS_DIR" && find . -type f | sed 's|^\./||' | sort); }   # temporary files too
+fi
+
+# --- central -----------------------------------------------------------------------------------------------------
+PEER_PORT=$(free_port); CENTRAL_ADMIN=$(free_port)
+PEER_TOKEN="$(rand 24)"; CENTRAL_TOKEN="$(rand 24)"   # PEER_TOKEN is the edge node's token
+NODE3="edge-3"; PEER_TOKEN3="$(rand 24)"                # the second edge (upload timer), see "edge lifecycle" below
+mkdir -p "$R/central"; : > "$R/central/empty.log"
+render_config "$R/central/data" "
+peer|enabled|true
+peer|addr|\"127.0.0.1:$PEER_PORT\"
+peer|nodes|[{ id = \"$NODE\", token = \"$PEER_TOKEN\" }, { id = \"$NODE3\", token = \"$PEER_TOKEN3\" }]
+peer.parts|enabled|true
 peer.parts|warm_retention_secs|2
-peer.parts|cold_retention_secs|2
+peer.parts|cold_retention_secs|2$PARTS_CONFIG
 admin|enabled|true
 admin|addr|\"127.0.0.1:$CENTRAL_ADMIN\"
 admin|token|\"$CENTRAL_TOKEN\"
 " "" > "$R/central/config.toml"
-"$LOGLESS_BIN" run --config "$R/central/config.toml" --tail "$R/central/empty.log" > "$R/central/agent.log" 2>&1 &
-CENTRAL_PID=$!; PIDS="$PIDS $CENTRAL_PID"
+start_central() { # appends to the log, so a restart keeps the first run's lines
+  "$LOGLESS_BIN" run --config "$R/central/config.toml" --tail "$R/central/empty.log" >> "$R/central/agent.log" 2>&1 &
+  CENTRAL_PID=$!; PIDS="$PIDS $CENTRAL_PID"
+}
+start_central
 wait_http "http://127.0.0.1:$CENTRAL_ADMIN/" 30 || { echo "central did not start" >&2; cat "$R/central/agent.log" >&2; exit 1; }
 log "central: peer $PEER_PORT, admin $CENTRAL_ADMIN"
 
@@ -306,15 +344,15 @@ uploaded=$(part uploaded); ptotal=$(part files_total); perr=$(part error); prej=
 check "parts job done" "$( [ "$pstate" = done ] && [ "$uploaded" -ge 1 ] && [ "$uploaded" = "$ptotal" ] && [ "$prej" = 0 ] && [ "$perr" = None ] && echo 1 || echo 0)" \
   "state=$pstate files_total=$ptotal uploaded=$uploaded rejected=$prej error=$perr (edge files=$files)"
 
-# Every object in MinIO is named by its content: sha256(object) == name, and the set matches central's catalog.
-objects=$("$MC_BIN" --config-dir "$R/mc" ls --json "e2e/$BUCKET/$PREFIX/$NODE/" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort)
+# Every stored part is named by its content: sha256(part) == name, and the set matches central's catalog.
+objects=$(node_parts)
 n_obj=0; bad_obj=0
 for o in $objects; do
   n_obj=$(( n_obj + 1 ))
-  h=$("$MC_BIN" --config-dir "$R/mc" cat "e2e/$BUCKET/$PREFIX/$NODE/$o" | shasum -a 256 | cut -d' ' -f1)
+  h=$(cat_part "$o" | shasum -a 256 | cut -d' ' -f1)
   [ "$h.parquet" = "$o" ] || { bad_obj=$(( bad_obj + 1 )); log "MISMATCH $o sha256=$h"; }
 done
-check "minio parts match their sha256" "$( [ "$n_obj" -ge 1 ] && [ "$n_obj" = "$uploaded" ] && [ "$bad_obj" = 0 ] && echo 1 || echo 0)" \
+check "stored parts match their sha256" "$( [ "$n_obj" -ge 1 ] && [ "$n_obj" = "$uploaded" ] && [ "$bad_obj" = 0 ] && echo 1 || echo 0)" \
   "objects=$n_obj uploaded=$uploaded mismatched=$bad_obj"
 edge_hashes=$(find "$R/edge/data/store" -name '*.parquet' -exec shasum -a 256 {} + | cut -d' ' -f1 | sed 's/$/.parquet/' | sort)
 missing_on_edge=$(comm -23 <(echo "$objects") <(echo "$edge_hashes") | grep -c . || true)
@@ -326,21 +364,41 @@ check "central catalog lists the parts" "$(eq "$catalog" "$objects")" "peer_part
 peerpost() { # path, body, [token]  -> "<http status> <body>"
   curl -s --max-time 10 -w ' %{http_code}' -X POST -H "Authorization: Bearer ${3:-$PEER_TOKEN}" -H 'Content-Type: application/json' -d "$2" "http://127.0.0.1:$PEER_PORT$1"
 }
-all_keys() { "$MC_BIN" --config-dir "$R/mc" ls --recursive --json "e2e/$BUCKET/" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort; }
 first=$(echo "$objects" | head -1)
-sz=$("$MC_BIN" --config-dir "$R/mc" stat --json "e2e/$BUCKET/$PREFIX/$NODE/$first" | jq_py 'v["size"]')
+sz=$(part_size "$first")
 pre_foreign=$(peerpost /v1/parts/presign "{\"name\":\"$first\",\"size\":$sz,\"sha256\":\"${first%.parquet}\",\"node\":\"edge-2\"}")
 pre_trav=$(peerpost /v1/parts/presign "{\"name\":\"../edge-2/$first\",\"size\":$sz,\"sha256\":\"${first%.parquet}\"}")
 com_foreign=$(peerpost /v1/parts/commit "{\"name\":\"$first\",\"size\":$sz,\"sha256\":\"${first%.parquet}\",\"rows\":1,\"min_unix_nano\":1,\"max_unix_nano\":2,\"origin\":\"x\",\"node\":\"edge-2\"}")
-keys_outside=$(all_keys | grep -vc "^$PREFIX/$NODE/" || true)
+keys_outside=$(all_keys | grep -vc "^$OWN" || true)
 check "foreign prefix and traversal refused; nothing outside own prefix" \
   "$( [[ "$pre_foreign" == *' 403' && "$pre_trav" == *' 422' && "$com_foreign" == *' 403' && "$keys_outside" = 0 ]] && echo 1 || echo 0)" \
-  "foreign presign=${pre_foreign##* } traversal presign=${pre_trav##* } foreign commit=${com_foreign##* } objects outside $PREFIX/$NODE/=$keys_outside"
+  "foreign presign=${pre_foreign##* } traversal presign=${pre_trav##* } foreign commit=${com_foreign##* } objects outside $OWN=$keys_outside"
 listing=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" GET "/admin/v1/parts?node=$NODE&tier=warm&limit=1000")
 n_list=$(echo "$listing" | jq_py 'v["count"]')
 n_other=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" GET "/admin/v1/parts?node=edge-2" | jq_py 'v["count"]')
 check "catalog listing by node and tier" "$( [ "$n_list" = "$uploaded" ] && [ "$n_other" = 0 ] && echo 1 || echo 0)" \
   "warm parts of $NODE=$n_list (uploaded=$uploaded) parts of edge-2=$n_other"
+if [ "$PARTS_BACKEND" = local ]; then
+  # The same edge, with no bucket anywhere: the part went to central's listener, and central's status says so.
+  store=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" GET /admin/v1/sync | jq_py 'json.dumps(v["parts_store"])')
+  st() { echo "$store" | jq_py "(v or {}).get('$1', -1)"; }
+  disk_bytes=$(for o in $objects; do part_size "$o"; done | awk '{s+=$1} END {print s+0}')
+  check "central's parts store status matches its disk" \
+    "$( [ "$(st backend)" = local ] && [ "$(st uploads)" = "$uploaded" ] && [ "$(st used_bytes)" = "$disk_bytes" ] && [ "$(st reserved_bytes)" = 0 ] && [ "$(( $(st refused_budget) + $(st refused_token) + $(st refused_content) + $(st refused_size) + $(st incomplete) ))" = 0 ] && echo 1 || echo 0)" \
+    "backend=$(st backend) uploads=$(st uploads) used_bytes=$(st used_bytes) (files on disk: $disk_bytes bytes) budget_bytes=$(st budget_bytes) refusals=0"
+  # A PUT without a token, with a forged one, and to a traversal path: all refused, nothing new on disk.
+  put_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X PUT ${2:+-H "x-logless-upload-token: $2"} --data-binary 'x' "http://127.0.0.1:$PEER_PORT$1"; }
+  no_tok=$(put_code "/v1/parts/blob/$NODE/$first"); forged=$(put_code "/v1/parts/blob/$NODE/$first" "v1.9999999999.1.$(rand 32)")
+  trav=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 --path-as-is -X PUT --data-binary 'x' "http://127.0.0.1:$PEER_PORT/v1/parts/blob/../$first")
+  check "upload without a valid token is refused; nothing written" "$( [ "$no_tok" = 403 ] && [ "$forged" = 403 ] && [ "$trav" = 403 ] && [ "$(all_keys | grep -c .)" = "$uploaded" ] && echo 1 || echo 0)" \
+    "no token=$no_tok forged token=$forged traversal path=$trav files under parts/=$(all_keys | grep -c .)"
+  # Read side: the parts directory is the read-only bucket "parts" on central's S3 endpoint.
+  s3_keys=$(curl -s --max-time 10 "http://127.0.0.1:$S3_PORT/parts?list-type=2&prefix=$NODE/" | python3 -c 'import sys, re; print("\n".join(sorted(k.split("/", 1)[1] for k in re.findall(r"<Key>([^<]*)</Key>", sys.stdin.read()))))')
+  s3_sha=$(curl -s --max-time 30 "http://127.0.0.1:$S3_PORT/parts/$NODE/$first" | shasum -a 256 | cut -d' ' -f1)
+  s3_put=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X PUT --data-binary 'x' "http://127.0.0.1:$S3_PORT/parts/$NODE/$first")
+  check "parts are readable (only) through central's S3 endpoint" "$( [ "$s3_keys" = "$objects" ] && [ "$s3_sha.parquet" = "$first" ] && [ "$s3_put" = 405 ] && echo 1 || echo 0)" \
+    "bucket parts lists $(echo "$s3_keys" | grep -c .) keys under $NODE/ (disk has $n_obj); GET sha256 matches name=$([ "$s3_sha.parquet" = "$first" ] && echo yes || echo no); PUT=$s3_put"
+fi
 ret=$(peerpost /v1/parts/retire "{\"name\":\"$first\"}")
 ret_again=$(peerpost /v1/parts/retire "{\"name\":\"$first\"}")
 n_cold=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" GET "/admin/v1/parts?tier=cold" | jq_py 'v["count"]')
@@ -356,6 +414,35 @@ audit_exp=$(sqlite3 "$R/central/data/catalog.sqlite" "select count(*) from peer_
 check "retention sweep deletes expired catalogued parts and audits them" \
   "$( [ "$dry" = "$uploaded" ] && [ "$after_dry" = "$uploaded" ] && [ "$swept" = "$uploaded 0" ] && [ "$after_sweep" = 0 ] && [ "$cat_left" = 0 ] && [ "$audit_exp" = "$uploaded" ] && echo 1 || echo 0)" \
   "dry-run would_delete=$dry objects after dry run=$after_dry sweep deleted/failed='$swept' objects after=$after_sweep catalog rows=$cat_left expire audit rows=$audit_exp"
+
+# --- one large part: throughput, and central's memory while it streams (local backend) ----------------------------
+# Asks for a URL as the edge does, sends BIG_PART_MB of random bytes with the headers central named, and samples
+# central's RSS every 20 ms meanwhile. The part is never committed, so the sweep above and the counts below are
+# not affected; what is checked is that it is stored whole and that central did not hold it in memory.
+if [ "$PARTS_BACKEND" = local ] && [ "$BIG_PART_MB" -gt 0 ]; then
+  head -c $(( BIG_PART_MB * 1024 * 1024 )) /dev/urandom > "$R/big.bin"
+  big_sha=$(shasum -a 256 "$R/big.bin" | cut -d' ' -f1); big_size=$(stat -f %z "$R/big.bin")
+  pre=$(peerpost /v1/parts/presign "{\"name\":\"$big_sha.parquet\",\"size\":$big_size,\"sha256\":\"$big_sha\"}")
+  big_url=$(echo "${pre% *}" | jq_py 'v.get("url")')
+  echo "${pre% *}" | python3 -c 'import sys, json
+for k, v in (json.load(sys.stdin).get("headers") or {}).items(): print(f"header = \"{k}: {v}\"")' > "$R/big.curlrc"
+  rss_kb() { ps -o rss= -p "$CENTRAL_PID" | tr -d ' '; }
+  rss_before=$(rss_kb)
+  ( while :; do rss_kb; sleep 0.02; done > "$R/big.rss" ) & SAMPLER=$!; PIDS="$PIDS $SAMPLER"
+  big_out=$(curl -s -o "$R/big.reply" -w '%{http_code} %{time_total}' --max-time 300 -K "$R/big.curlrc" -T "$R/big.bin" "http://127.0.0.1:$PEER_PORT$big_url")
+  kill "$SAMPLER" 2>/dev/null; wait "$SAMPLER" 2>/dev/null
+  rss_peak=$(sort -n "$R/big.rss" | tail -1); rss_samples=$(grep -c . "$R/big.rss")
+  big_code=${big_out% *}; big_secs=${big_out#* }
+  big_stored=$(shasum -a 256 "$PARTS_DIR/$NODE/$big_sha.parquet" 2>/dev/null | cut -d' ' -f1)
+  big_rate=$(python3 -c "print(f'{$big_size / 1048576 / $big_secs:.0f}')")
+  rss_grow_kb=$(( rss_peak - rss_before ))
+  check "a ${BIG_PART_MB} MiB part is stored whole" "$( [ "$big_code" = 200 ] && [ "$big_stored" = "$big_sha" ] && echo 1 || echo 0)" \
+    "PUT=$big_code in ${big_secs}s = ${big_rate} MiB/s; stored sha256 matches=$([ "$big_stored" = "$big_sha" ] && echo yes || echo no) ($(cat "$R/big.reply"))"
+  # Streamed, not buffered: central's RSS may not grow by more than a sixteenth of the part while it arrives.
+  check "central streams the part (RSS growth under 1/16 of it)" "$( [ "$rss_grow_kb" -lt $(( BIG_PART_MB * 1024 / 16 )) ] && [ "$rss_samples" -ge 3 ] && echo 1 || echo 0)" \
+    "central RSS before=$(( rss_before / 1024 )) MiB peak=$(( rss_peak / 1024 )) MiB growth=$(( rss_grow_kb / 1024 )) MiB over $rss_samples samples; part=${BIG_PART_MB} MiB"
+  rm -f "$R/big.bin"
+fi
 
 # --- peer counters (live, before shutdown) -----------------------------------------------------------------------
 edge_sync=$(admin "$EDGE_ADMIN" "$EDGE_TOKEN" GET /admin/v1/sync)
@@ -389,23 +476,162 @@ PY
 )
 check "peer ack counters sane" "$(echo "$counters" | cut -f1)" "$(echo "$counters" | cut -f2-)"
 
+# --- edge lifecycle: central stopped in the middle of an upload, retire on removal ---------------------------------
+# A second edge, node edge-3, with the upload timer on ([sync_parts] interval = "10s") and min_severity 255 so it sends
+# central no records, only parts. It is given a few thousand records; when they have merged into Parquet files the timer
+# uploads them. This section freezes central (SIGSTOP) as soon as it has committed a few of them, so the edge's requests
+# hang mid-job, then stops it with SIGTERM and starts it again. Then it checks that every file reached central once.
+# Last, disk pressure on the edge removes every file it had uploaded, and each must turn cold on central (retire).
+E3_OTLP=$(free_port); E3_ADMIN=$(free_port); E3_TOKEN="$(rand 24)"
+mkdir -p "$R/edge3"; : > "$R/edge3/empty.log"
+render_config "$R/edge3/data" "
+storage|wal_segment_bytes|131072
+otlp|enabled|true
+otlp|addr|\"127.0.0.1:$E3_OTLP\"
+admin|enabled|true
+admin|addr|\"127.0.0.1:$E3_ADMIN\"
+admin|token|\"$E3_TOKEN\"
+sync_parts|interval|\"10s\"
+" "
+[[destinations]]
+type = \"logless\"
+url = \"http://127.0.0.1:$PEER_PORT\"
+token = \"$PEER_TOKEN3\"
+min_severity = 255
+fidelity = 100
+anomaly_boost = false
+" > "$R/edge3/config.toml"
+"$LOGLESS_BIN" run --config "$R/edge3/config.toml" --tail "$R/edge3/empty.log" > "$R/edge3/agent.log" 2>&1 &
+E3_PID=$!; PIDS="$PIDS $E3_PID"
+wait_http "http://127.0.0.1:$E3_ADMIN/" 30 || { echo "edge-3 did not start" >&2; cat "$R/edge3/agent.log" >&2; exit 1; }
+for f in "$R"/payloads/otlp-00[0-5].json; do
+  curl -s -o /dev/null --max-time 15 -H 'Content-Type: application/json' --data-binary "@$f" "http://127.0.0.1:$E3_OTLP/v1/logs"
+done
+e3() { admin "$E3_ADMIN" "$E3_TOKEN" "$@"; }
+e3_parts() { e3 GET /admin/v1/sync | jq_py "v['status']['edge_parts']['$1']"; }
+e3_files() { find "$R/edge3/data/store" -name '*.parquet' 2>/dev/null | wc -l | tr -d ' '; }
+cat3() { sqlite3 "$R/central/data/catalog.sqlite" "$1" 2>/dev/null; }
+if [ "$PARTS_BACKEND" = s3 ]; then
+  node3_objects() { mc_keys "e2e/$BUCKET/$PREFIX/$NODE3/"; }
+else
+  node3_objects() { [ -d "$PARTS_DIR/$NODE3" ] && (cd "$PARTS_DIR/$NODE3" && find . -type f | sed 's|^\./||' | sort); }
+fi
+
+# Freeze central the moment it has committed K parts of edge-3 (a python loop, so the poll is a millisecond, not a fork).
+K_FREEZE=2
+froze=$(CAT="$R/central/data/catalog.sqlite" PID="$CENTRAL_PID" K="$K_FREEZE" NODE3="$NODE3" python3 - <<'PY'
+import os, signal, sqlite3, time
+deadline = time.time() + 90
+while time.time() < deadline:
+    try:
+        db = sqlite3.connect("file:" + os.environ["CAT"] + "?mode=ro", uri=True, timeout=1)
+        n = db.execute("select count(*) from peer_parts where node = ?", (os.environ["NODE3"],)).fetchone()[0]
+        db.close()
+    except sqlite3.Error:
+        n = 0
+    if n >= int(os.environ["K"]):
+        os.kill(int(os.environ["PID"]), signal.SIGSTOP)
+        db = sqlite3.connect("file:" + os.environ["CAT"] + "?mode=ro", uri=True, timeout=1)
+        frozen = db.execute("select count(*) from peer_parts where node = ?", (os.environ["NODE3"],)).fetchone()[0]
+        print(frozen)
+        break
+    time.sleep(0.001)
+else:
+    print(-1)
+PY
+)
+if [ "$froze" -ge 0 ] 2>/dev/null; then
+  log "central frozen with $froze edge-3 parts committed"
+  disk_frozen=$(node3_objects | grep -vc '\.upload-' || true)   # stored (PUT done), committed or not
+  # The edge's requests hang. Its backlog and its pins are each published every 5 s, so wait for the two to agree.
+  while_down_backlog=-1; while_down_pinned=-2; while_down_gaveup=-1
+  for _ in $(seq 1 20); do
+    sleep 1
+    while_down_backlog=$(e3_parts backlog_parts); while_down_pinned=$(e3_parts pinned_parts); while_down_gaveup=$(e3_parts gave_up_parts)
+    [ "$while_down_backlog" -ge 1 ] && [ "$while_down_pinned" = "$while_down_backlog" ] && break
+  done
+  ( sleep 0.3; kill -CONT "$CENTRAL_PID" 2>/dev/null ) &
+  if stop_within "$CENTRAL_PID" 30; then stopped_ok=1; else stopped_ok=0; fi
+  disk_stopped=$(node3_objects | grep -vc '\.upload-' || true)   # a request in flight at the freeze may finish while central shuts down
+  log "central stopped (${STOP_MS} ms) with $disk_stopped parts stored; starting it again"
+  start_central
+  wait_http "http://127.0.0.1:$CENTRAL_ADMIN/" 30 || { echo "central did not restart" >&2; tail -20 "$R/central/agent.log" >&2; exit 1; }
+else
+  froze=0; stopped_ok=0; disk_frozen=0; disk_stopped=0; while_down_backlog=-1; while_down_pinned=-2; while_down_gaveup=-1
+fi
+
+# Wait until the edge has nothing unconfirmed and its file count has stopped moving.
+n_files=-1; backlog=-1; stable=0
+deadline=$(( $(date +%s) + 120 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  nf=$(e3_files); backlog=$(e3_parts backlog_parts)
+  if [ "$nf" -ge 1 ] && [ "$backlog" = 0 ] && [ "$nf" = "$n_files" ]; then stable=$(( stable + 1 )); [ "$stable" -ge 3 ] && break; else stable=0; fi
+  n_files=$nf
+  sleep 2
+done
+check "central stopped in the middle of the edge's uploads" "$( [ "$stopped_ok" = 1 ] && [ "$froze" -ge 1 ] && [ "$froze" -lt "$n_files" ] && echo 1 || echo 0)" \
+  "central had committed $froze of the edge's $n_files files when it was frozen; exited ${STOP_MS:-?} ms after SIGTERM; restarted"
+check "edge pinned its backlog while central was down" "$( [ "$while_down_backlog" -ge 1 ] && [ "$while_down_pinned" = "$while_down_backlog" ] && [ "$while_down_gaveup" = 0 ] && echo 1 || echo 0)" \
+  "backlog_parts=$while_down_backlog pinned_parts=$while_down_pinned gave_up_parts=$while_down_gaveup"
+edge3_hashes=$(find "$R/edge3/data/store" -name '*.parquet' -exec shasum -a 256 {} + | cut -d' ' -f1 | sed 's/$/.parquet/' | sort)
+cat3_names=$(cat3 "select name from peer_parts where node = '$NODE3' order by name")
+disk3=$(node3_objects)
+n_dist=$(echo "$cat3_names" | sort -u | grep -c . || true)
+tmp3=$(echo "$disk3" | grep -c '\.upload-' || true)
+state3_names=$(python3 -c 'import sys, json; print("\n".join(sorted(json.loads(l)["name"] for l in open(sys.argv[1]) if l.strip())))' "$R/edge3/data/parts-uploaded.jsonl")
+check "no part lost, none duplicated after central restarted" \
+  "$( [ "$stable" -ge 3 ] && [ "$cat3_names" = "$edge3_hashes" ] && [ "$disk3" = "$edge3_hashes" ] && [ "$(echo "$cat3_names" | grep -c .)" = "$n_files" ] && [ "$n_dist" = "$n_files" ] && [ "$tmp3" = 0 ] && [ "$state3_names" = "$edge3_hashes" ] && echo 1 || echo 0)" \
+  "edge files=$n_files; central catalog rows=$(echo "$cat3_names" | grep -c .) distinct=$n_dist; objects stored=$(echo "$disk3" | grep -c .) (temporary: $tmp3); edge state lines=$(echo "$state3_names" | grep -c .); names equal the edge files' sha256: $([ "$cat3_names" = "$edge3_hashes" ] && [ "$disk3" = "$edge3_hashes" ] && echo yes || echo no)"
+if [ "$PARTS_BACKEND" = local ]; then
+  store3=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" GET /admin/v1/sync | jq_py 'json.dumps(v["parts_store"])')
+  up3=$(echo "$store3" | jq_py 'v["uploads"]'); pre3=$(echo "$store3" | jq_py 'v["already_present"]')
+  # Central's counters restarted with it. A part already stored when it exited (PUT done, commit perhaps not) is found
+  # present by presign and only committed, so the bytes that arrive after the restart are exactly the parts not stored then.
+  check "after the restart only the parts not yet stored arrived, once each" \
+    "$( [ "$up3" = $(( n_files - disk_stopped )) ] && echo 1 || echo 0)" \
+    "uploads since the restart=$up3 (already_present=$pre3); files=$n_files, stored when central exited=$disk_stopped (at the freeze: $disk_frozen, committed: $froze)"
+fi
+
+# Disk pressure on the edge removes the files it had uploaded; the retire pass tells central, which marks each cold.
+pol=$(curl -s --max-time 10 -D "$R/e3.hdr" -H "Authorization: Bearer $E3_TOKEN" "http://127.0.0.1:$E3_ADMIN/admin/v1/policies")
+E3_VERSION=$(echo "$pol" | jq_py 'v["version"]')
+next=$(echo "$pol" | jq_py 'json.dumps({**v["effective"], "storage": {**v["effective"]["storage"], "disk_budget_bytes": 2048}})')
+prev=$(e3 POST /admin/v1/policies/preview "{\"policies\":$next}")
+tok=$(echo "$prev" | jq_py 'json.dumps(v["impact_token"])')
+put=$(curl -s --max-time 20 -o "$R/e3.put" -w '%{http_code}' -X PUT -H "Authorization: Bearer $E3_TOKEN" -H "If-Match: $E3_VERSION" -H 'Content-Type: application/json' \
+  -d "{\"policies\":$next,\"actor\":\"e2e\",\"confirm_destructive\":true,\"impact_token\":$tok}" "http://127.0.0.1:$E3_ADMIN/admin/v1/policies")
+retired=0; cold=0; left=-1
+deadline=$(( $(date +%s) + 90 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  left=$(e3_files); cold=$(cat3 "select count(*) from peer_parts where node = '$NODE3' and tier = 'cold'")
+  [ "$left" = 0 ] && [ "$cold" = "$n_files" ] && break
+  sleep 1
+done
+warm=$(cat3 "select count(*) from peer_parts where node = '$NODE3' and tier = 'warm'")
+retired=$(e3_parts retired); pending=$(e3_parts retire_pending); gaveup=$(e3_parts gave_up_parts)
+state_left=$(python3 -c 'import sys; print(sum(1 for l in open(sys.argv[1]) if l.strip()))' "$R/edge3/data/parts-uploaded.jsonl")
+check "files removed by disk pressure are retired: central marks each cold" \
+  "$( [ "$put" = 200 ] && [ "$left" = 0 ] && [ "$cold" = "$n_files" ] && [ "$warm" = 0 ] && [ "$retired" = "$n_files" ] && [ "$pending" = 0 ] && [ "$state_left" = 0 ] && [ "$gaveup" = 0 ] && [ "$(node3_objects | grep -c .)" = "$n_files" ] && echo 1 || echo 0)" \
+  "policy PUT=$put; edge files left=$left; central cold=$cold warm=$warm of $n_files; edge retired=$retired pending=$pending state lines left=$state_left; unconfirmed files given up=$gaveup; central still holds $(node3_objects | grep -c .) objects"
+
 # --- shutdown ----------------------------------------------------------------------------------------------------
-# Edge first (its sender drains into a live central), then central, then MinIO. Each must exit within 10 s of SIGTERM.
-for name in edge central minio; do
-  case $name in edge) pid=$EDGE_PID ;; central) pid=$CENTRAL_PID ;; minio) pid=$MINIO_PID ;; esac
+# Edge first (its sender drains into a live central), then central, then MinIO if there is one. Each must exit within
+# 10 s of SIGTERM.
+for name in edge edge3 central $([ "$PARTS_BACKEND" = s3 ] && echo minio); do
+  case $name in edge) pid=$EDGE_PID ;; edge3) pid=$E3_PID ;; central) pid=$CENTRAL_PID ;; minio) pid=$MINIO_PID ;; esac
   if stop_within "$pid" 10; then
     check "$name exits on SIGTERM within 10 s" 1 "${STOP_MS} ms"
   else
     check "$name exits on SIGTERM within 10 s" 0 "still running after ${STOP_MS} ms"
   fi
 done
-for name in edge central; do
+for name in edge edge3 central; do
   # tracing colours the level when it likes; strip escapes before looking for the ERROR level.
   sed -E $'s/\x1b\\[[0-9;]*m//g' "$R/$name/agent.log" > "$R/$name/agent.plain.log"
   n=$(grep -c ' ERROR ' "$R/$name/agent.plain.log" || true)
   check "no ERROR lines in $name log" "$(eq "$n" 0)" "$n ERROR lines$( [ "$n" != 0 ] && echo ": $(grep -m1 ' ERROR ' "$R/$name/agent.plain.log" | cut -c1-200)")"
 done
-for name in edge central; do
+for name in edge edge3 central; do
   grep -q 'shutdown signal received' "$R/$name/agent.log"; got_signal=$?
   check "$name logged a drained shutdown" "$(eq $got_signal 0)" "$(grep -c 'stopped' "$R/$name/agent.log") 'stopped' lines"
 done

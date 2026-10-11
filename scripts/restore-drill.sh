@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Restore drill: ingest on an edge, upload its Parquet parts to MinIO, destroy the edge's data directory, and
-# rebuild it with `logless restore` from the bucket alone. Compares row counts, per-template counts and the
-# template dictionary keys before and after, and runs two damage cases (a flipped byte in one stored part, one
-# part deleted) that the restore must detect, by name, with exit status 1.
+# Restore drill: ingest on an edge, upload its Parquet parts to central, destroy the edge's data directory, and
+# rebuild it with `logless restore` from the uploaded parts alone. Parts are on central's own disk (the default,
+# PARTS_BACKEND=local, no MinIO) or in a MinIO this script starts (PARTS_BACKEND=s3). Compares row counts,
+# per-template counts and the template dictionary keys before and after, and runs two damage cases (a flipped
+# byte in one stored part, one part deleted) that the restore must detect, by name, with exit status 1.
 #
 # Usage: scripts/restore-drill.sh        See docs/restore.md and docs/evidence/restore-drill.md.
-# Env:   LOGLESS_BIN (default $CARGO_TARGET_DIR/debug/logless)  MINIO_BIN (/opt/homebrew/bin/minio)  MC_BIN (mc)
-#        DUCKDB_BIN (duckdb)  N_RECORDS (6000)  N_TAIL (500)  SYNC_TIMEOUT (90)  KEEP (0)
+# Env:   LOGLESS_BIN (default $CARGO_TARGET_DIR/debug/logless)  PARTS_BACKEND (local | s3)
+#        MINIO_BIN (/opt/homebrew/bin/minio)  MC_BIN (mc)  (s3 only)  DUCKDB_BIN (duckdb)  N_RECORDS (6000)  N_TAIL (500)  SYNC_TIMEOUT (90)  KEEP (0)
 # Everything runs on random free ports in a throwaway directory with random credentials and is removed on exit.
 set -uo pipefail
 
@@ -19,11 +20,17 @@ N_RECORDS="${N_RECORDS:-6000}"
 N_TAIL="${N_TAIL:-500}"
 SYNC_TIMEOUT="${SYNC_TIMEOUT:-90}"
 KEEP="${KEEP:-0}"
+PARTS_BACKEND="${PARTS_BACKEND:-local}"
 BUCKET="logless-parts"
 PREFIX="edges"
-NODE="edge1"   # parts live under <prefix>/<node>/ since node-owned prefixes (ADR 0001)
+NODE="edge1"   # parts live under <prefix>/<node>/ in the bucket, parts/<node>/ on central's disk (ADR 0001, 0003)
 
-for tool in "$LOGLESS_BIN" "$MINIO_BIN" "$MC_BIN" "$DUCKDB_BIN" curl python3 openssl sqlite3 shasum; do
+case "$PARTS_BACKEND" in
+  local) TOOLS="" ;;
+  s3) TOOLS="$MINIO_BIN $MC_BIN" ;;
+  *) echo "PARTS_BACKEND must be local or s3" >&2; exit 2 ;;
+esac
+for tool in "$LOGLESS_BIN" $TOOLS "$DUCKDB_BIN" curl python3 openssl sqlite3 shasum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing: $tool" >&2; exit 2; }
 done
 
@@ -119,22 +126,46 @@ stop_within() { # pid, seconds
 }
 
 T0=$(now_ms)
-log "run dir $R, logless $("$LOGLESS_BIN" --version 2>/dev/null || echo "$LOGLESS_BIN")"
+log "run dir $R, logless $("$LOGLESS_BIN" --version 2>/dev/null || echo "$LOGLESS_BIN"), parts backend $PARTS_BACKEND"
 
-# --- MinIO -------------------------------------------------------------------------------------------------------
-MINIO_PORT=$(free_port); MINIO_CONSOLE=$(free_port)
-MINIO_USER="drill$(rand 6)"; MINIO_SECRET="$(rand 20)"
-MINIO_ROOT_USER="$MINIO_USER" MINIO_ROOT_PASSWORD="$MINIO_SECRET" \
-  "$MINIO_BIN" server --quiet --address "127.0.0.1:$MINIO_PORT" --console-address "127.0.0.1:$MINIO_CONSOLE" \
-  "$R/minio-data" > "$R/minio.log" 2>&1 &
-MINIO_PID=$!; PIDS="$PIDS $MINIO_PID"
-wait_http "http://127.0.0.1:$MINIO_PORT/minio/health/live" 30 || { echo "MinIO did not start" >&2; cat "$R/minio.log" >&2; exit 1; }
-MCA=("$MC_BIN" --config-dir "$R/mc")
-"${MCA[@]}" alias set drill "http://127.0.0.1:$MINIO_PORT" "$MINIO_USER" "$MINIO_SECRET" > /dev/null
-"${MCA[@]}" mb "drill/$BUCKET" > /dev/null
-log "minio on $MINIO_PORT, bucket $BUCKET"
+# --- where parts go ----------------------------------------------------------------------------------------------
+# s3: a MinIO and its bucket. local: central's own parts directory, nothing to start. The helpers below (list, read,
+# overwrite and delete a stored part, and where a restore reads from) are the only place the two differ.
+NODE_DIR="$R/central/data/parts/$NODE"
+if [ "$PARTS_BACKEND" = s3 ]; then
+  MINIO_PORT=$(free_port); MINIO_CONSOLE=$(free_port)
+  MINIO_USER="drill$(rand 6)"; MINIO_SECRET="$(rand 20)"
+  MINIO_ROOT_USER="$MINIO_USER" MINIO_ROOT_PASSWORD="$MINIO_SECRET" \
+    "$MINIO_BIN" server --quiet --address "127.0.0.1:$MINIO_PORT" --console-address "127.0.0.1:$MINIO_CONSOLE" \
+    "$R/minio-data" > "$R/minio.log" 2>&1 &
+  MINIO_PID=$!; PIDS="$PIDS $MINIO_PID"
+  wait_http "http://127.0.0.1:$MINIO_PORT/minio/health/live" 30 || { echo "MinIO did not start" >&2; cat "$R/minio.log" >&2; exit 1; }
+  MCA=("$MC_BIN" --config-dir "$R/mc")
+  "${MCA[@]}" alias set drill "http://127.0.0.1:$MINIO_PORT" "$MINIO_USER" "$MINIO_SECRET" > /dev/null
+  "${MCA[@]}" mb "drill/$BUCKET" > /dev/null
+  log "minio on $MINIO_PORT, bucket $BUCKET"
+  PARTS_CONFIG="
+peer.parts|endpoint|\"http://127.0.0.1:$MINIO_PORT\"
+peer.parts|bucket|\"$BUCKET\"
+peer.parts|prefix|\"$PREFIX\"
+peer.parts|access_key_id|\"$MINIO_USER\"
+peer.parts|secret_access_key|\"$MINIO_SECRET\""
+  export LOGLESS_S3_ACCESS_KEY_ID="$MINIO_USER" LOGLESS_S3_SECRET_ACCESS_KEY="$MINIO_SECRET"
+  RESTORE_FROM=(--from "s3://$BUCKET/$PREFIX/$NODE" --endpoint "http://127.0.0.1:$MINIO_PORT")
+  node_parts() { "${MCA[@]}" ls --json "drill/$BUCKET/$PREFIX/$NODE/" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort; }
+  cat_part() { "${MCA[@]}" cat "drill/$BUCKET/$PREFIX/$NODE/$1"; }
+  put_part() { "${MCA[@]}" cp --quiet "$1" "drill/$BUCKET/$PREFIX/$NODE/$2" > /dev/null; }   # file, name
+  rm_part() { "${MCA[@]}" rm --quiet "drill/$BUCKET/$PREFIX/$NODE/$1" > /dev/null; }
+else
+  PARTS_CONFIG=""
+  RESTORE_FROM=(--from "$NODE_DIR")
+  node_parts() { [ -d "$NODE_DIR" ] && (cd "$NODE_DIR" && find . -type f | sed 's|^\./||' | sort); }
+  cat_part() { cat "$NODE_DIR/$1"; }
+  put_part() { cp "$1" "$NODE_DIR/$2"; }
+  rm_part() { rm "$NODE_DIR/$1"; }
+fi
 
-# --- central (inventory + presign) -------------------------------------------------------------------------------
+# --- central (inventory, and where the parts go) -----------------------------------------------------------------
 PEER_PORT=$(free_port); CENTRAL_ADMIN=$(free_port)
 PEER_TOKEN="$(rand 24)"; CENTRAL_TOKEN="$(rand 24)"
 mkdir -p "$R/central"; : > "$R/central/empty.log"
@@ -142,12 +173,7 @@ render_config "$R/central/data" "
 peer|enabled|true
 peer|addr|\"127.0.0.1:$PEER_PORT\"
 peer|nodes|[{ id = \"$NODE\", token = \"$PEER_TOKEN\" }]
-peer.parts|enabled|true
-peer.parts|endpoint|\"http://127.0.0.1:$MINIO_PORT\"
-peer.parts|bucket|\"$BUCKET\"
-peer.parts|prefix|\"$PREFIX\"
-peer.parts|access_key_id|\"$MINIO_USER\"
-peer.parts|secret_access_key|\"$MINIO_SECRET\"
+peer.parts|enabled|true$PARTS_CONFIG
 admin|enabled|true
 admin|addr|\"127.0.0.1:$CENTRAL_ADMIN\"
 admin|token|\"$CENTRAL_TOKEN\"
@@ -285,11 +311,11 @@ EDGE_BYTES=$(find "$EDGE_STORE" -name '*.parquet' -exec stat -f %z {} + | awk '{
 check "before: every accepted record is in a part" "$(eq "$BEFORE_ROWS" "$N_RECORDS")" "edge parquet rows=$BEFORE_ROWS accepted=$N_RECORDS files=$EDGE_FILES bytes=$EDGE_BYTES"
 check "before: templates were mined" "$( [ "$N_TPL" -ge 3 ] && echo 1 || echo 0)" "template ids=$N_TPL (template,service) pairs=$N_PAIR"
 
-# --- objects in MinIO match the edge's files ---------------------------------------------------------------------
-OBJECTS=$("${MCA[@]}" ls --json "drill/$BUCKET/$PREFIX/$NODE/" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort)
+# --- the stored parts match the edge's files ---------------------------------------------------------------------
+OBJECTS=$(node_parts)
 N_OBJ=$(echo "$OBJECTS" | grep -c . || true)
 EDGE_HASHES=$(find "$EDGE_STORE" -name '*.parquet' -exec shasum -a 256 {} + | cut -d' ' -f1 | sed 's/$/.parquet/' | sort)
-check "bucket holds exactly the edge's files (by sha256)" "$(eq "$OBJECTS" "$EDGE_HASHES")" "objects=$N_OBJ edge files=$EDGE_FILES"
+check "central holds exactly the edge's files (by sha256)" "$(eq "$OBJECTS" "$EDGE_HASHES")" "objects=$N_OBJ edge files=$EDGE_FILES"
 
 # --- tail phase: records accepted after the last upload, then SIGKILL ------------------------------------------
 send_batches 1000000 "$N_TAIL" tail
@@ -302,17 +328,16 @@ log "edge killed with SIGKILL after $N_TAIL acknowledged records that were never
 # --- keep the inventory (central's peer_parts), destroy the edge -------------------------------------------------
 sqlite3 "$R/central/data/catalog.sqlite" ".backup '$R/inventory.sqlite'"
 INV_N=$(sqlite3 "$R/inventory.sqlite" "select count(*) from peer_parts"); INV_ROWS=$(sqlite3 "$R/inventory.sqlite" "select sum(rows) from peer_parts")
-check "inventory (central peer_parts) matches the bucket" "$( [ "$INV_N" = "$N_OBJ" ] && [ "$INV_ROWS" = "$BEFORE_ROWS" ] && echo 1 || echo 0)" "peer_parts rows=$INV_N, sum(rows)=$INV_ROWS"
+check "inventory (central peer_parts) matches the stored parts" "$( [ "$INV_N" = "$N_OBJ" ] && [ "$INV_ROWS" = "$BEFORE_ROWS" ] && echo 1 || echo 0)" "peer_parts rows=$INV_N, sum(rows)=$INV_ROWS"
 rm -rf "$R/edge/data"
 check "edge data directory destroyed" "$(eq "$([ -e "$R/edge/data" ] && echo present || echo gone)" gone)" "removed $R/edge/data"
 
 # --- restore -----------------------------------------------------------------------------------------------------
-export LOGLESS_S3_ACCESS_KEY_ID="$MINIO_USER" LOGLESS_S3_SECRET_ACCESS_KEY="$MINIO_SECRET"
 run_restore() { # dir name
   local t0 t1
   t0=$(now_ms)
-  "$LOGLESS_BIN" restore --from "s3://$BUCKET/$PREFIX/$NODE" --endpoint "http://127.0.0.1:$MINIO_PORT" --to "$1" \
-    --inventory "$R/inventory.sqlite" --verify --report-json "$1.json" > "$1.out" 2>&1
+  "$LOGLESS_BIN" restore "${RESTORE_FROM[@]}" --to "$1" \
+    --inventory "$R/inventory.sqlite" --node "$NODE" --verify --report-json "$1.json" > "$1.out" 2>&1
   RC=$?; t1=$(now_ms); RESTORE_MS=$(( t1 - t0 ))
   cp "$1.out" "$R/$2.out" 2>/dev/null
 }
@@ -339,34 +364,34 @@ check "RPO: records acknowledged after the last upload are not in the restore" "
 # --- case 2: one stored part has a flipped byte -------------------------------------------------------------------
 VICTIM=$(sqlite3 "$R/inventory.sqlite" "select name from peer_parts order by rows desc limit 1")
 VICTIM_ROWS=$(sqlite3 "$R/inventory.sqlite" "select rows from peer_parts where name = '$VICTIM'")
-"${MCA[@]}" cat "drill/$BUCKET/$PREFIX/$NODE/$VICTIM" > "$R/victim.orig"
+cat_part "$VICTIM" > "$R/victim.orig"
 python3 -c '
 import sys
 b = bytearray(open(sys.argv[1], "rb").read()); b[len(b) // 2] ^= 0xFF
 open(sys.argv[2], "wb").write(b)' "$R/victim.orig" "$R/victim.flipped"
-"${MCA[@]}" cp --quiet "$R/victim.flipped" "drill/$BUCKET/$PREFIX/$NODE/$VICTIM" > /dev/null
+put_part "$R/victim.flipped" "$VICTIM"
 run_restore "$R/restored2" case2
 check "case 2 (flipped byte) exits 1" "$(eq $RC 1)" "wall ${RESTORE_MS} ms; $(tail -1 "$R/case2.out" | cut -c1-120)"
 check "case 2: the damaged part is named, nothing else is" "$( [ "$(rfield case2 hash_mismatch)" = 1 ] && grep -q "  $VICTIM: sha256" "$R/case2.out" && [ "$(rfield case2 missing)" = 0 ] && echo 1 || echo 0)" \
   "hash_mismatch=$(rfield case2 hash_mismatch) victim=${VICTIM:0:16}…"
 check "case 2: the other parts restored, the damaged one was not installed" "$( [ "$(rfield case2 restored_parts)" = $(( EDGE_FILES - 1 )) ] && [ "$(rfield case2 rows)" = $(( BEFORE_ROWS - VICTIM_ROWS )) ] && [ ! -e "$(find "$R/restored2/store" -name "$VICTIM" | head -1)" ] && echo 1 || echo 0)" \
   "restored parts=$(rfield case2 restored_parts) rows=$(rfield case2 rows) (edge $EDGE_FILES parts, $BEFORE_ROWS rows; victim had $VICTIM_ROWS rows)"
-"${MCA[@]}" cp --quiet "$R/victim.orig" "drill/$BUCKET/$PREFIX/$NODE/$VICTIM" > /dev/null
+put_part "$R/victim.orig" "$VICTIM"
 
-# --- case 3: one part deleted from the bucket ---------------------------------------------------------------------
+# --- case 3: one stored part deleted -------------------------------------------------------------------------------
 GONE=$(sqlite3 "$R/inventory.sqlite" "select name from peer_parts where name != '$VICTIM' order by rows asc limit 1")
 GONE_ROWS=$(sqlite3 "$R/inventory.sqlite" "select rows from peer_parts where name = '$GONE'")
-"${MCA[@]}" rm --quiet "drill/$BUCKET/$PREFIX/$NODE/$GONE" > /dev/null
+rm_part "$GONE"
 run_restore "$R/restored3" case3
 check "case 3 (part deleted) exits 1" "$(eq $RC 1)" "wall ${RESTORE_MS} ms; $(tail -1 "$R/case3.out" | cut -c1-120)"
 check "case 3: the missing part is named, nothing else is" "$( [ "$(rfield case3 missing)" = 1 ] && grep -q "  $GONE: in the inventory" "$R/case3.out" && [ "$(rfield case3 hash_mismatch)" = 0 ] && echo 1 || echo 0)" \
   "missing=$(rfield case3 missing) gone=${GONE:0:16}…"
 check "case 3: every other part restored" "$( [ "$(rfield case3 restored_parts)" = $(( EDGE_FILES - 1 )) ] && [ "$(rfield case3 rows)" = $(( BEFORE_ROWS - GONE_ROWS )) ] && echo 1 || echo 0)" \
   "restored parts=$(rfield case3 restored_parts) rows=$(rfield case3 rows) (missing part had $GONE_ROWS rows)"
-"${MCA[@]}" cp --quiet "$R/victim.orig" "drill/$BUCKET/$PREFIX/$NODE/$VICTIM" > /dev/null
+put_part "$R/victim.orig" "$VICTIM"
 
 # --- case 4: a restore into a directory that already holds a store is refused --------------------------------------
-"$LOGLESS_BIN" restore --from "s3://$BUCKET/$PREFIX/$NODE" --endpoint "http://127.0.0.1:$MINIO_PORT" --to "$R/restored1" > "$R/case4.out" 2>&1
+"$LOGLESS_BIN" restore "${RESTORE_FROM[@]}" --to "$R/restored1" > "$R/case4.out" 2>&1
 check "case 4: restoring over an existing store is refused" "$(eq $? 1)" "$(head -1 "$R/case4.out" | cut -c1-140)"
 
 # --- report ------------------------------------------------------------------------------------------------------

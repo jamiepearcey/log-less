@@ -8,7 +8,8 @@
 //! |---|---|
 //! | `GET /.well-known/logless` | the capability document: version, instance id, formats, limits, clock |
 //! | `POST /v1/ingest` | newline-delimited JSON, one [`LogRecord`] per line, optionally gzipped |
-//! | `POST /v1/parts/presign`, `/v1/parts/commit` | Parquet part upload to object storage, when `[peer.parts]` is set (`crate::parts`) |
+//! | `POST /v1/parts/presign`, `/v1/parts/commit`, `/v1/parts/retire` | Parquet part upload, when `[peer.parts]` is set (`crate::parts`) |
+//! | `PUT /v1/parts/blob/<node>/<name>` | the part itself, when central stores parts on its own disk; streamed, never buffered |
 //!
 //! Plain OTLP also works against an instance's OTLP receiver and stays the fallback for a sender that
 //! is not log-less. This native path exists because OTLP cannot carry what a log-less hop needs:
@@ -128,7 +129,7 @@ pub struct PeerConfig {
     /// Advertised in the capability document: whether this instance also serves its store over S3.
     #[serde(default)]
     pub advertise_s3: bool,
-    /// `[peer.parts]`: object storage edges upload finished Parquet parts to (`crate::parts`).
+    /// `[peer.parts]`: where edges upload finished Parquet parts, this instance's disk or a bucket (`crate::parts`).
     #[serde(default)]
     pub parts: crate::parts::PartsConfig,
 }
@@ -221,6 +222,8 @@ pub enum PeerError {
     Http(#[from] httpd::HttpError),
     #[error("[[peer.nodes]] is wrong: {0}")]
     BadNode(String),
+    #[error("part upload cannot start: {0}")]
+    BadParts(String),
     #[error("the peer dedupe log could not be opened: {0}")]
     Dedupe(std::io::Error),
 }
@@ -242,8 +245,8 @@ pub struct Capabilities {
     pub s3: bool,
     /// Answers a filtered scan. Not built yet; present so a client can ask without a version check.
     pub query: bool,
-    /// Presigns uploads of finished Parquet parts (`crate::parts`): true only when `[peer.parts]` is
-    /// enabled and complete.
+    /// Takes uploads of finished Parquet parts (`crate::parts`): true only when `[peer.parts]` is
+    /// enabled and complete. Where a part goes is in each presign answer, not here.
     pub parts: bool,
     /// The peer's clock, unix milliseconds, so a sender can report skew.
     pub clock_ms: u64,
@@ -658,7 +661,7 @@ struct PeerHandler {
     stats: Arc<PeerStats>,
     sink: Box<dyn Fn(Vec<LogRecord>) -> Admitted + Send + Sync>,
     acks: Option<Arc<WalAcks>>,
-    parts: Option<crate::parts::PartsCentral>,
+    parts: Option<Arc<crate::parts::PartsCentral>>,
 }
 
 impl PeerHandler {
@@ -908,6 +911,19 @@ impl Handler for PeerHandler {
         refused
     }
 
+    /// A part sent to this instance's own disk. The bearer token is not asked for: the upload token in the
+    /// request names the node, the part and its size, and only this process could have signed it. The body
+    /// is handed over still on the wire, so a part is never held in memory.
+    fn stream(&self, head: &Incoming, len: u64, body: &mut dyn std::io::Read) -> Option<Reply> {
+        let target = head.path.strip_prefix(crate::parts::BLOB_PREFIX).filter(|_| head.method == Method::Put)?;
+        self.stats.requests.fetch_add(1, Ordering::Relaxed);
+        let Some(parts) = &self.parts else {
+            return Some(error_reply(404, "not_found", "this peer does not accept parts"));
+        };
+        let token = head.header(crate::parts::UPLOAD_TOKEN_HEADER).filter(|_| head.header_count(crate::parts::UPLOAD_TOKEN_HEADER) == 1);
+        Some(parts.upload(target, token, len, body))
+    }
+
     fn reject(&self, reason: Reject) -> Reply {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         match reason {
@@ -990,6 +1006,7 @@ pub struct Receiver {
     server: BoundedServer,
     stats: Arc<PeerStats>,
     instance: String,
+    parts: Option<Arc<crate::parts::PartsCentral>>,
 }
 
 impl Receiver {
@@ -1036,7 +1053,19 @@ impl Receiver {
                 None
             }
             (true, Some(path)) => match crate::parts::PartsCentral::new(config.parts.clone(), path) {
-                Ok(p) => Some(p),
+                Ok(p) => {
+                    let leftovers = p.recover();
+                    if leftovers > 0 {
+                        tracing::info!(leftovers, "removed temporary files of part uploads cut off by a restart");
+                    }
+                    match p.store_status() {
+                        Some(store) => tracing::info!(backend = "local", dir = %store.dir, budget_bytes = store.budget_bytes, used_bytes = store.used_bytes, "part upload is on, parts are stored on this instance's disk"),
+                        None => tracing::info!(backend = "s3", bucket = %config.parts.bucket, "part upload is on, parts are stored in the bucket"),
+                    }
+                    Some(Arc::new(p))
+                }
+                // The local backend needs nothing filled in, so a refusal is a mistake to fix, not a table half written.
+                Err(reason) if config.parts.backend() == crate::parts::Backend::Local => return Err(PeerError::BadParts(reason)),
                 Err(reason) => {
                     tracing::warn!(%reason, "part upload is off");
                     None
@@ -1046,9 +1075,10 @@ impl Receiver {
         let mut seen = std::collections::HashSet::new();
         for n in &config.nodes {
             if !crate::parts::valid_node(&n.id) {
-                return Err(PeerError::BadNode(format!("node id {:?} must be 1 to 64 of A-Za-z0-9._- and not . or ..", n.id)));
+                return Err(PeerError::BadNode(format!("node id {:?} must be 1 to 64 of A-Za-z0-9._- and not start with a dot", n.id)));
             }
-            if n.token.is_empty() || !seen.insert(n.id.as_str()) || config.nodes.iter().filter(|o| o.token == n.token).count() > 1 || config.tokens.contains(&n.token) {
+            // Case-insensitively: on a case-insensitive filesystem ids that differ only in case are one parts directory.
+            if n.token.is_empty() || !seen.insert(n.id.to_ascii_lowercase()) || config.nodes.iter().filter(|o| o.token == n.token).count() > 1 || config.tokens.contains(&n.token) {
                 return Err(PeerError::BadNode(format!("node {:?} needs its own non-empty token, and ids are unique", n.id)));
             }
         }
@@ -1069,13 +1099,14 @@ impl Receiver {
             stats: Arc::clone(&stats),
             sink: Box::new(sink),
             acks,
-            parts,
+            parts: parts.clone(),
         });
         // One thread per connection, so `workers` sets how many senders are served at once; the head
         // and body must arrive within `REQUEST_TIMEOUT`, so a client that stalls frees its slot.
         let head = HeadLimits {
             max_connections: (config.workers * CONNECTIONS_PER_WORKER).max(MIN_CONNECTIONS),
             request_timeout: REQUEST_TIMEOUT,
+            min_stream_bytes_per_sec: config.parts.min_upload_bytes_per_sec.max(1),
             gzip: true,
             ..HeadLimits::default()
         };
@@ -1086,7 +1117,13 @@ impl Receiver {
             head,
             handler,
         )?;
-        Ok(Self { server, stats, instance })
+        Ok(Self { server, stats, instance, parts })
+    }
+
+    /// The part store this receiver serves, for the admin API (its sweep and status must see the same
+    /// disk budget). `None` when `[peer.parts]` is off.
+    pub fn parts_handle(&self) -> Option<Arc<crate::parts::PartsCentral>> {
+        self.parts.clone()
     }
 
     pub fn local_addr(&self) -> SocketAddr {

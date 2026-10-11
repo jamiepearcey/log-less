@@ -159,6 +159,9 @@ pub struct AdminService {
     parts: crate::parts::PartsConfig,
     /// The peer receiver's counters, when this process accepts records from other instances.
     peer: OnceLock<Arc<crate::peer::PeerStats>>,
+    /// The part store the peer receiver serves, when it serves one: the sweep and the status use it, so
+    /// they see the same disk budget the uploads do.
+    parts_store: OnceLock<Arc<crate::parts::PartsCentral>>,
 }
 
 type Resp = (u16, Value);
@@ -331,6 +334,7 @@ impl AdminService {
             sync: OnceLock::new(),
             parts: config.peer.parts.clone(),
             peer: OnceLock::new(),
+            parts_store: OnceLock::new(),
         })
     }
 
@@ -362,6 +366,11 @@ impl AdminService {
         let _ = self.peer.set(stats);
     }
 
+    /// Hands the service the peer receiver's part store (`Receiver::parts_handle`).
+    pub fn set_parts(&self, store: Arc<crate::parts::PartsCentral>) {
+        let _ = self.parts_store.set(store);
+    }
+
     fn sync_control(&self) -> Result<&Arc<crate::sync::SyncControl>, Resp> {
         self.sync.get().ok_or_else(|| err(404, "sync_unavailable", "peer sync is not running in this process"))
     }
@@ -381,7 +390,9 @@ impl AdminService {
         };
         // What this instance receives: the WAL waits and 503s show a receiver whose disk is behind.
         let receiver = self.peer.get().map(|p| p.snapshot());
-        (200, json!({ "source": source, "instance_id": control.instance(), "status": control.status(), "receiver": receiver }))
+        // Where uploaded parts are kept when that is this instance's own disk: bytes used, the budget, refusals.
+        let parts_store = self.parts_store.get().and_then(|p| p.store_status());
+        (200, json!({ "source": source, "instance_id": control.instance(), "status": control.status(), "receiver": receiver, "parts_store": parts_store }))
     }
 
     /// `PUT /admin/v1/sync`: set the peer. Applies to the running sender at once and is kept in the data
@@ -589,9 +600,12 @@ impl AdminService {
                 Err(e) => return err(400, "bad_request", format!("the body is not {{\"dry_run\": bool}}: {e}")),
             }
         };
-        let central = match crate::parts::PartsCentral::new(self.parts.clone(), self.catalog_path.clone()) {
-            Ok(c) => c,
-            Err(m) => return err(409, "parts_disabled", m),
+        let central = match self.parts_store.get() {
+            Some(shared) => Arc::clone(shared),
+            None => match crate::parts::PartsCentral::new(self.parts.clone(), self.catalog_path.clone()) {
+                Ok(c) => Arc::new(c),
+                Err(m) => return err(409, "parts_disabled", m),
+            },
         };
         match central.sweep((self.clock)().saturating_mul(1_000), req.dry_run) {
             Ok(report) => (200, json!(report)),
@@ -1858,7 +1872,7 @@ mod tests {
         // The pass exactly as maintenance_pass runs it: policy re-read each time.
         let pass = |catalog: &mut Catalog| {
             let rt = r.handle.runtime();
-            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, now)
+            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, now, &Default::default())
         };
 
         // Dry check under the file defaults: only debug is due (1d), info keeps 7d.
@@ -1911,7 +1925,7 @@ mod tests {
             .unwrap();
         let pass = |catalog: &mut Catalog| {
             let rt = r.handle.runtime();
-            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, 0)
+            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, 0, &Default::default())
         };
         assert_eq!(pass(&mut catalog).pressure, Pressure::Normal);
 

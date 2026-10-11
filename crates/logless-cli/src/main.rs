@@ -186,11 +186,12 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         tolerance: u64,
     },
-    /// Rebuild a store (Parquet parts, catalog, template dictionary) from the object store alone, verifying
-    /// every part. Exits 1 if any part is damaged, unreadable, unfetchable or missing from the inventory.
+    /// Rebuild a store (Parquet parts, catalog, template dictionary) from an edge's uploaded parts alone,
+    /// verifying every part. Exits 1 if any part is damaged, unreadable, unfetchable or missing from the inventory.
     ///
-    /// The source is `s3://bucket/prefix` (with `--endpoint`; credentials from LOGLESS_S3_ACCESS_KEY_ID and
-    /// LOGLESS_S3_SECRET_ACCESS_KEY) or a directory of `<sha256>.parquet` files. See docs/restore.md.
+    /// The source is a directory of `<sha256>.parquet` files (a node's directory under central's parts
+    /// directory, `<data_dir>/parts/<node>`) or `s3://bucket/prefix/node` (with `--endpoint`; credentials
+    /// from LOGLESS_S3_ACCESS_KEY_ID and LOGLESS_S3_SECRET_ACCESS_KEY). See docs/restore.md.
     Restore {
         #[arg(long)]
         from: String,
@@ -206,6 +207,9 @@ enum Command {
         /// that are missing from the bucket and to check sizes and row counts.
         #[arg(long)]
         inventory: Option<PathBuf>,
+        /// Take only this node's parts from the inventory. Needed when central catalogues more than one node.
+        #[arg(long)]
+        node: Option<String>,
         /// The edge's config, for its level buckets (default buckets otherwise). Only the buckets are used.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -333,6 +337,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 admin: admin_api::AdminConfig::default(),
                 sentry: sentry::SentryConfig::default(),
                 peer: logless_core::peer::PeerConfig::default(),
+                sync_parts: Default::default(),
                 decision: logless_core::decision::DecisionConfig::default(),
                 tail: Vec::new(),
                 destinations: Vec::new(),
@@ -575,14 +580,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        Command::Restore { from, to, endpoint, region, inventory, config, verify, force, report_json } => {
+        Command::Restore { from, to, endpoint, region, inventory, node, config, verify, force, report_json } => {
             use logless_core::restore as rs;
             let buckets = match &config {
                 Some(path) => load(path)?.retention,
                 None => LevelBuckets::default(),
             };
             let inventory = match &inventory {
-                Some(path) => Some(rs::read_inventory(path)?),
+                Some(path) => Some(rs::read_inventory(path, node.as_deref())?),
                 None => None,
             };
             let source: Box<dyn rs::PartSource> = if let Some(rest) = from.strip_prefix("s3://") {
@@ -847,7 +852,7 @@ fn serve(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(signal, Arc::clone(&stop))?;
     }
-    let server = s3_serve::S3Server::start(&config.serve_s3, config.store_dir())?;
+    let server = s3_serve::S3Server::start_with_parts(&config.serve_s3, config.store_dir(), config.peer.parts.local_dir(&config.storage.data_dir))?;
     tracing::info!(addr = %server.local_addr(), bucket = %config.serve_s3.bucket, "s3 serve listening (read-only)");
     while !stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(200));
@@ -1130,6 +1135,8 @@ fn run(
         let known_pairs = Catalog::open(&catalog_path(config)).and_then(|c| c.load_template_services()).unwrap_or_default();
         std::thread::Builder::new().name("logless-sync".into()).spawn(move || sync::run(control, sync_rx, &spool_dir, &never, known, known_pairs))?
     };
+    // The part upload timer and the retire pass; both idle unless a peer is set (and the timer unless `[sync_parts] interval` is).
+    let parts_thread = logless_core::parts_edge::spawn(Arc::clone(&sync_control), config.sync_parts.clone(), config.store_dir(), Arc::clone(&sync_stop))?;
 
     // One variable with one meaning, not two flags: the maintainer must both
     // outlive the writer (so its final pass can merge the last segment) and
@@ -1148,6 +1155,7 @@ fn run(
         let drain = Arc::clone(&drain);
         let config = config.clone();
         let policy = Arc::clone(&policy);
+        let sync_control = Arc::clone(&sync_control);
         Some(
             std::thread::Builder::new()
                 .name("logless-maint".into())
@@ -1169,6 +1177,7 @@ fn run(
                             &drain,
                             &active,
                             &pressure,
+                            &sync_control,
                             writer_done,
                         );
                         if writer_done {
@@ -1233,7 +1242,7 @@ fn run(
     let mut hec_summary: Option<hec::StatsSnapshot> = None;
 
     let mut s3_server = if config.serve_s3.enabled {
-        let server = s3_serve::S3Server::start(&config.serve_s3, config.store_dir())?;
+        let server = s3_serve::S3Server::start_with_parts(&config.serve_s3, config.store_dir(), config.peer.parts.local_dir(&config.storage.data_dir))?;
         tracing::info!(addr = %server.local_addr(), "s3 serve listening (read-only)");
         Some(server)
     } else {
@@ -1316,6 +1325,9 @@ fn run(
         service.set_sync(Arc::clone(&sync_control));
         if let Some(r) = &peer_receiver {
             service.set_peer_stats(r.stats_handle());
+            if let Some(parts) = r.parts_handle() {
+                service.set_parts(parts);
+            }
         }
         let server = AdminServer::start(&config.admin, service)?;
         tracing::info!(addr = %server.local_addr(), "admin api listening");
@@ -1865,6 +1877,7 @@ fn run(
     // The writer held the only tap: the sender drains what is left and ends once told to.
     sync_stop.store(true, Ordering::Release);
     let _ = sync_thread.join();
+    let _ = parts_thread.join();
     let sync_status = sync_control.status();
     if sync_status.state != "off" {
         tracing::info!(
@@ -2198,6 +2211,7 @@ fn maintenance_pass(
     drain: &Arc<Mutex<Drain>>,
     active_segment: &AtomicU64,
     pressure: &AtomicU8,
+    sync_control: &Arc<sync::SyncControl>,
     writer_done: bool,
 ) {
     // Re-read every pass: this is what makes retention and budget changes made
@@ -2269,6 +2283,9 @@ fn maintenance_pass(
         Err(e) => tracing::error!(error = %e, "merge failed"),
     }
 
+    // After merge and compaction, so the files they just wrote are judged as they are now. Empty unless the
+    // upload timer is on: then a closed file central has not confirmed is held back from the deletes below.
+    let pins = logless_core::parts_edge::pins_for_pass(sync_control, &config.sync_parts, &config.store_dir(), rt.disk_budget_bytes);
     let outcome = budget::expire_and_relieve(
         &config.store_dir(),
         &config.wal_dir(),
@@ -2277,7 +2294,9 @@ fn maintenance_pass(
         rt.disk_budget_bytes,
         &rt.watermarks,
         now_unix_secs(),
+        &pins,
     );
+    logless_core::parts_edge::note_gave_up(sync_control, outcome.gave_up);
     if !outcome.expiry.expired.is_empty() {
         tracing::info!(
             partitions = outcome.expiry.expired.len(),

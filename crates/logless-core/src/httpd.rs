@@ -168,6 +168,18 @@ pub trait Handler: Send + Sync + 'static {
     fn preflight(&self, _request: &Incoming) -> Option<Reply> {
         None
     }
+
+    /// Called after `preflight` let the head through, with the body still on
+    /// the wire: `len` is the declared `Content-Length` and `body` yields at
+    /// most that many bytes, read from the socket as the handler asks for
+    /// them, so a body larger than memory can go straight to disk. `Some`
+    /// answers the request; `None`, returned without reading, has the body
+    /// buffered under `Limits` and passed to `handle` as usual. Never called
+    /// for a chunked body. `Limits::max_body_bytes` does not apply to a body
+    /// taken here: the handler must judge `len` before it reads.
+    fn stream(&self, _head: &Incoming, _len: u64, _body: &mut dyn Read) -> Option<Reply> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -36,7 +36,10 @@ Sentry proxy example uses; set `--serve-s3-addr` if both run.
 [serve_s3]
 enabled = false          # off unless asked for
 addr = "127.0.0.1:9000"
-bucket = "logs"          # the only bucket name served
+bucket = "logs"          # the store's bucket
+parts_bucket = "parts"   # a second read-only bucket: the parts edges uploaded to this instance's disk
+                         # (`[peer.parts]` on the local backend, docs/peer-sync.md), as <node>/<sha256>.parquet.
+                         # Served only when that backend is on; any other bucket name is NoSuchBucket
 workers = 8              # connections served at once = workers x 16, at least 64
 access_key = "..."       # or LOGLESS_S3_ACCESS_KEY
 secret_key = "..."       # or LOGLESS_S3_SECRET_KEY

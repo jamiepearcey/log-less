@@ -1065,6 +1065,7 @@ dependencies = [
  "crossbeam-channel",
  "flate2",
  "fluke-hpack",
+ "getrandom 0.3.4",
  "hmac",
  "humantime-serde",
  "parquet",

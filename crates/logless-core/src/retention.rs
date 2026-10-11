@@ -21,6 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::LevelBuckets;
+use crate::parts_edge::PinSet;
 use crate::partition::{parse_partition_dirs, PartitionKey};
 
 #[derive(Debug, Default, PartialEq)]
@@ -33,6 +34,9 @@ pub struct RetentionReport {
     /// Paths we failed to remove. Retention is best-effort per partition — one
     /// stuck directory must not stop the rest expiring.
     pub errors: Vec<(PathBuf, String)>,
+    /// Files past retention that were kept because they are pinned (`parts_edge`): central has not
+    /// confirmed them yet.
+    pub pinned_kept: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -51,6 +55,18 @@ pub fn enforce(
     buckets: &LevelBuckets,
     now_unix_secs: u64,
     dry_run: bool,
+) -> RetentionReport {
+    enforce_pinned(store_dir, buckets, now_unix_secs, dry_run, &PinSet::default())
+}
+
+/// [`enforce`], except that a pinned file is never deleted: its partition keeps just those files and is
+/// expired once they are unpinned (uploaded, or past the pin limit).
+pub fn enforce_pinned(
+    store_dir: &Path,
+    buckets: &LevelBuckets,
+    now_unix_secs: u64,
+    dry_run: bool,
+    pins: &PinSet,
 ) -> RetentionReport {
     let mut report = RetentionReport::default();
 
@@ -114,8 +130,16 @@ pub fn enforce(
             }
 
             let path = level_entry.path();
-            let bytes = dir_size(&path);
-            if !dry_run {
+            let mut bytes = dir_size(&path);
+            if pins.pinned.iter().any(|p| p.starts_with(&path)) {
+                // Delete what is not pinned, one file at a time, and leave the directory.
+                let (freed, kept) = remove_unpinned(&path, pins, dry_run, &mut report.errors);
+                report.pinned_kept += kept;
+                bytes = freed;
+                if bytes == 0 {
+                    continue;
+                }
+            } else if !dry_run {
                 if let Err(e) = fs::remove_dir_all(&path) {
                     report.errors.push((path, e.to_string()));
                     continue;
@@ -138,6 +162,28 @@ pub fn enforce(
 
     report.expired.sort_by(|a, b| a.key.cmp(&b.key));
     report
+}
+
+/// Removes the files of a partition directory that are not pinned. Returns the bytes freed and the pinned files kept.
+fn remove_unpinned(dir: &Path, pins: &PinSet, dry_run: bool, errors: &mut Vec<(PathBuf, String)>) -> (u64, usize) {
+    let (mut freed, mut kept) = (0, 0);
+    let Ok(entries) = fs::read_dir(dir) else { return (0, 0) };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if pins.contains(&path) {
+            kept += 1;
+            continue;
+        }
+        let bytes = match entry.file_type() {
+            Ok(t) if t.is_dir() => dir_size(&path),
+            _ => entry.metadata().map(|m| m.len()).unwrap_or(0),
+        };
+        let removed = dry_run || if path.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) }.map_err(|e| errors.push((path.clone(), e.to_string()))).is_ok();
+        if removed {
+            freed += bytes;
+        }
+    }
+    (freed, kept)
 }
 
 fn dir_size(path: &Path) -> u64 {
@@ -265,5 +311,35 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let report = enforce(&tmp.path().join("absent"), &LevelBuckets::default(), 0, false);
         assert_eq!(report, RetentionReport::default());
+    }
+
+    #[test]
+    fn a_pinned_file_outlives_its_partitions_expiry_and_the_rest_of_the_partition_goes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path();
+        let both = write_partition(store, 100, "debug", 10);
+        fs::write(both.join("000002.parquet"), vec![0u8; 7]).unwrap();
+        let only = write_partition(store, 101, "debug", 5);
+        let now = 105 * SECS_PER_HOUR + 2 * 24 * 3600;
+        let mut pins = PinSet::default();
+        pins.pinned.insert(both.join("000002.parquet"));
+        pins.pinned.insert(only.join("000001.parquet"));
+
+        // A dry run predicts the same.
+        let dry = enforce_pinned(store, &LevelBuckets::default(), now, true, &pins);
+        assert_eq!((10, 2), (dry.bytes_reclaimed, dry.pinned_kept));
+        assert!(both.join("000001.parquet").exists());
+
+        let report = enforce_pinned(store, &LevelBuckets::default(), now, false, &pins);
+        assert_eq!(10, report.bytes_reclaimed, "only the unpinned file was freed");
+        assert_eq!(1, report.expired.len(), "the partition holding only a pinned file is not expired");
+        assert_eq!(2, report.pinned_kept);
+        assert!(!both.join("000001.parquet").exists() && both.join("000002.parquet").exists());
+        assert!(only.join("000001.parquet").exists());
+
+        // Once unpinned (uploaded, or past the limit) the next pass takes them.
+        let report = enforce_pinned(store, &LevelBuckets::default(), now, false, &PinSet::default());
+        assert_eq!(12, report.bytes_reclaimed);
+        assert!(!both.exists() && !only.exists());
     }
 }

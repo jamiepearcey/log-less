@@ -25,7 +25,9 @@ did for those comes from reading it (marked "read"). Real-client checks for thos
 | Peer tokens (`[peer].tokens`) | config file, console | Write access to the central's store, and read of its capabilities. |
 | Admin token (`LOGLESS_ADMIN_TOKEN` or `[admin].token`) | env, config, console backend | Changes retention (deletes data), budgets, the sync target (where logs are sent). |
 | S3 key pair (`[serve_s3]`, `LOGLESS_S3_*`) | config, env, console, DuckDB sessions | Read of the whole store. |
-| `[peer.parts]` object-storage secret | central config | Write to the object-storage bucket. Only ever used to sign short-lived URLs. |
+| `[peer.parts]` object-storage secret (S3 backend) | central config | Write to the object-storage bucket. Only ever used to sign short-lived URLs. |
+| Uploaded parts (`<data_dir>/parts`, local backend) | central disk | The same logs as the store, per edge node. Written only by the upload path; read through S3 serve's `parts` bucket. |
+| Upload-token key (local backend) | central process memory, never on disk | Signs upload tokens. With it, a part can be written under any node's directory (still only bytes that hash to their name). |
 | Sync target token | `sync-token` (mode 0600) in the data dir | Write access to the next hop. |
 | Availability of ingest | the process | Admin, S3 and peer listeners share a process with ingest: memory or threads lost to a listener are lost to ingest. |
 
@@ -33,6 +35,8 @@ did for those comes from reading it (marked "read"). Real-client checks for thos
 
 ```
  apps ──OTLP/HEC/Sentry/files──▶ EDGE log-less ──peer ingest (bearer)──▶ CENTRAL log-less ──presigned PUT──▶ object storage
+                                    │  ▲           ──part PUT (upload token)──▶   │  ▲          (S3 backend only; on the local
+                                    │  │                                          │  │           backend parts stop at central)
                                     │  ▲                                    │  ▲
                               admin API (bearer, loopback)           S3 serve (SigV4)
                                     │  │                                    │
@@ -115,6 +119,59 @@ Defect fixes: `peer.rs` `Receiver::start` (was `httpd::Server::start`, HEAD line
 | CRLF line endings, blank lines | accepted (a control, not an attack) | `peer::tests::crlf_line_endings_and_blank_lines_are_fine` |
 | Forged `logless.origin` / `logless.hops`, replayed event ids | belongs to hop and dedupe handling, not reviewed here | existing `a_record_that_came_back_to_its_origin...`, `a_retried_batch_is_recognised...` |
 | Cross-site POST to the parts endpoints with no `Content-Type`, or a form or text type (tokenless, loopback, parts enabled) | 415 from the head, the same rule as ingest (`refuse_head`; `peer.rs` preflight now passes the parts paths through it). The edge sender already sent `application/json` | `parts::tests::a_parts_request_a_page_could_send_without_a_preflight_is_refused_unread` (fixed: a typeless presign was answered 200 with a signed URL) |
+
+### Part upload to central's own disk (`PUT /v1/parts/blob/<node>/<name>`, local backend)
+
+Added on `wf/parts-local` (ADR 0003). This is the one request on any listener whose body is larger than memory should
+hold, and the one that writes a file named by the client. It is authorised by an upload token central signed at
+presign, not by the bearer token. Every row is new code with a new test; all were run and passed
+(`cargo test -p logless-core -- parts:: bounded_http:: s3_serve:: restore::`).
+
+| Abuse case | Defence | Test |
+|---|---|---|
+| A part held in memory (512 MiB by default, several at once) | the body is handed to the handler still on the wire (`Handler::stream`, `bounded_http::BodyReader`) and copied to a temporary file in 256 KiB pieces; the 4 MiB body cap of the listener still applies to every other request | `parts::tests::a_part_larger_than_the_request_cap_is_streamed_to_disk_in_pieces` (9 MiB through a 4 MiB cap), `bounded_http::tests::a_streamed_body_is_read_past_the_body_cap_never_past_its_length_and_not_while_it_stalls`; a 128 MiB upload with central's RSS sampled is in `docs/evidence/parts-local-backend.md` |
+| No token, a mangled token, two token headers | 403 `bad_token` from the head; body unread | `parts::tests::a_local_upload_with_the_wrong_bytes_or_the_wrong_length_stores_nothing` |
+| Expired token | 403 `token_expired` | `parts::tests::an_upload_token_is_good_for_one_node_one_name_one_size_and_a_while` |
+| Token replayed for another name, for another node's directory, with its size or expiry edited, or signed by another central (or this one before a restart) | 403 `bad_token`: the HMAC covers node, name, size and expiry, compared in constant time before the expiry is looked at | same test |
+| Token replayed for its own part | allowed until it expires: the same bytes to the same place, stored once (`already_present`). Other bytes are refused; while one copy is still arriving, the others are 409 `upload_in_progress` and reserve nothing | `parts::tests::a_duplicate_local_upload_is_checked_and_changes_nothing` |
+| The right size, other bytes | read to the end, 422 `bad_content`, temporary file removed, not present, commit refused 409, nothing catalogued | `parts::tests::a_local_upload_with_the_wrong_bytes_or_the_wrong_length_stores_nothing` |
+| `Content-Length` over `max_part_bytes` (1 TiB declared), or other than the size the token was issued for | 413 `too_large` / 400 `size_mismatch` from the head; body unread | same test |
+| Body shorter than `Content-Length` (client hangs up), body longer than it | 400 `incomplete_body`, nothing kept; bytes past `Content-Length` are never read | same test |
+| Body that stalls, or drips to hold a connection | each read must progress within the listener's 30 s, and the whole body within 30 s plus its length at `min_upload_bytes_per_sec` (16 KiB/s by default); then 408 `upload_stalled`, nothing kept | `bounded_http::tests::a_streamed_body_is_read_past_the_body_cap_never_past_its_length_and_not_while_it_stalls`, `bounded_http::tests::the_slowest_average_rate_of_a_streamed_body_is_the_listeners_setting` (the listener's rule, with a 300 ms limit; the peer's own 30 s is not waited for by a test) |
+| Traversal and foreign directories in the path: `../edge-b/<name>`, `edge-a/../edge-b/<name>`, `%2F` and `%2e` spellings, `//`, a trailing segment, an upper-case name, no node | the path is not decoded; node and name are each validated (`valid_node`, `valid_name`) before any path is built; 403/404/422 and no file anywhere | `parts::tests::a_foreign_node_or_a_traversal_never_reaches_another_directory_on_centrals_disk` (13 paths, with a valid token) |
+| A node asking for a URL under another node, or a shared ingest token asking for one | 403 `foreign_prefix` / `no_node` at presign, as on S3 (ADR 0001); a node's part is not "present" for another node | same test, `parts::tests::an_upload_token_is_good_for_one_node_one_name_one_size_and_a_while` |
+| Filling central's disk | `disk_budget_bytes` (64 GiB by default) over installed parts plus uploads in flight: 507 at presign and again at the PUT, before the body is read; counted in `parts_store.refused_budget` | `parts::tests::the_disk_budget_refuses_with_507_counts_it_and_frees_with_a_delete` |
+| A crash mid-upload, or between the rename and the commit | a part is absent or whole, never partial: temporary files are removed at the next start; a renamed part is present and the retry commits it | `parts::tests::a_crash_between_the_rename_and_the_commit_leaves_a_part_that_is_absent_or_committable` (the crash is a stopped listener and a planted temporary file, not a killed process) |
+| Cross-site PUT from a web page | needs the `x-logless-upload-token` header, which a page cannot send without a CORS preflight this listener never answers; and the token | not covered by a test of its own (the no-token rows above are the same refusal) |
+| Reading parts back | not on this listener at all. S3 serve's `parts` bucket, read-only, same credentials, same traversal and symlink rules as the store; temporary files are dot files and are neither listed nor served | `s3_serve::tests::uploaded_parts_are_a_second_read_only_bucket_apart_from_the_store` |
+
+### Edge pinning and retire (`[sync_parts]`)
+
+Added on `wf/parts-ack`. Edge-side only; central's endpoints are unchanged, so a node still cannot retire another node's
+part (`parts::tests::a_node_can_only_presign_commit_and_retire_under_its_own_prefix`). New code, new tests, all run.
+
+| Abuse case | Defence | Test |
+|---|---|---|
+| Pinning fills the edge's disk (central down for a long time) | the pinned bytes are at most `pin_bytes` and a quarter of `disk_budget_bytes`, and nothing older than `pin_age`; past that, reclaim and retention delete as before and the loss is counted | `parts::tests::an_old_unconfirmed_file_is_not_pinned_and_the_limit_never_passes_a_quarter_of_the_budget`, `parts::tests::central_down_pins_to_the_limit_reclaim_past_it_is_counted_and_central_back_gets_the_rest`, `budget::tests::reclaim_never_picks_a_pinned_file_even_when_it_is_the_cheapest_and_oldest` |
+| A deployment that never asked for the timer holds files back | pinning is on only when `[sync_parts] interval` is set and a peer is configured | `parts::tests::nothing_is_pinned_while_the_timer_is_off_or_no_peer_is_set` |
+| A wrong or unmounted store directory makes every uploaded part look removed, and central marks them all cold | a store directory that does not exist yields no retires; one that exists and is empty does retire, and that is true: the node holds none of those files | `parts_edge::tests::a_missing_store_directory_retires_nothing_and_a_removed_file_is_pending` (the empty-but-present directory is not tested) |
+| A retire lost to an outage or a crash | the pending retire is the state line with no file, so it is rebuilt from disk after a restart; a duplicate is a 404, treated as done | `parts::tests::a_retire_central_never_heard_is_still_pending_after_a_restart_and_is_sent_then` |
+| A retire that central will never accept blocks the rest | 400 and 422 are dropped with a warning; other failures back off but do not skip ahead | same test; `parts::retire_remote` |
+| Two upload jobs at once (timer and operator) | one job at a time per edge; the second start is refused | `parts::tests::the_timer_never_overlaps_a_running_upload_and_runs_again_only_when_due` |
+
+Left open, and known:
+
+* **Uploads are not capped per node.** A node with a valid token can hold one connection per upload for as long as the
+  rule above allows (about 9 hours for 512 MiB at the default minimum rate), up to the listener's connection cap, which
+  ingest from every other node shares. A node token is already write access to central's store. Only one upload of a
+  given part is accepted at a time (409 `upload_in_progress` for the others, no reservation), so one token replayed on
+  many connections reserves the budget once; a node that presigns many different names can still reserve one
+  part-size per name, up to the connection cap (`parts::tests::a_second_upload_of_a_part_already_arriving_reserves_nothing_and_is_told_to_retry`).
+* **A node can use the whole disk budget**, and parts it uploads but never commits are not cleaned up (the sweep reads
+  only the catalog). They show as `parts_store.used_bytes` above the catalog's total.
+* **No scrub.** A byte that changes on central's disk after the upload is found by `logless restore`, not by central.
+* **A token is a bearer credential for one upload** until it expires (900 s by default). It is returned in the presign
+  answer's body, to the authenticated node, and sent in a header.
 
 ## S3 serve (`crates/logless-core/src/s3_serve.rs`)
 

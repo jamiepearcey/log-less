@@ -50,6 +50,10 @@ pub struct Config {
     /// Off by default. To send TO another instance, add a `[[destinations]]` of `type = "logless"`.
     #[serde(default)]
     pub peer: crate::peer::PeerConfig,
+    /// The edge side of Parquet part upload: a timer for the upload job, and holding unconfirmed files back
+    /// from retention and reclaim. Off until `interval` is set (`docs/peer-sync.md`).
+    #[serde(default)]
+    pub sync_parts: crate::parts_edge::EdgePartsConfig,
     /// An optional decision model that suggests which templates are the same failure (`docs/decision-model.md`). Off unless `url` is set.
     #[serde(default)]
     pub decision: crate::decision::DecisionConfig,
@@ -374,6 +378,7 @@ impl Config {
                 expected: SCHEMA_VERSION,
             });
         }
+        self.sync_parts.check().map_err(|message| ConfigError::Policy { path: "sync_parts.interval".into(), message })?;
         // Re-run bucket invariants: a config deserialised from TOML bypasses
         // LevelBuckets::new.
         LevelBuckets::new(self.retention.buckets.clone())?;
@@ -429,6 +434,7 @@ mod tests {
             admin: crate::admin_api::AdminConfig::default(),
             sentry: crate::sentry::SentryConfig::default(),
             peer: crate::peer::PeerConfig::default(),
+            sync_parts: Default::default(),
             decision: crate::decision::DecisionConfig::default(),
             tail: Vec::new(),
             destinations: Vec::new(),
