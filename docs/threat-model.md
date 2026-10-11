@@ -145,6 +145,20 @@ presign, not by the bearer token. Every row is new code with a new test; all wer
 | Cross-site PUT from a web page | needs the `x-logless-upload-token` header, which a page cannot send without a CORS preflight this listener never answers; and the token | not covered by a test of its own (the no-token rows above are the same refusal) |
 | Reading parts back | not on this listener at all. S3 serve's `parts` bucket, read-only, same credentials, same traversal and symlink rules as the store; temporary files are dot files and are neither listed nor served | `s3_serve::tests::uploaded_parts_are_a_second_read_only_bucket_apart_from_the_store` |
 
+### Edge pinning and retire (`[sync_parts]`)
+
+Added on `wf/parts-ack`. Edge-side only; central's endpoints are unchanged, so a node still cannot retire another node's
+part (`parts::tests::a_node_can_only_presign_commit_and_retire_under_its_own_prefix`). New code, new tests, all run.
+
+| Abuse case | Defence | Test |
+|---|---|---|
+| Pinning fills the edge's disk (central down for a long time) | the pinned bytes are at most `pin_bytes` and a quarter of `disk_budget_bytes`, and nothing older than `pin_age`; past that, reclaim and retention delete as before and the loss is counted | `parts::tests::an_old_unconfirmed_file_is_not_pinned_and_the_limit_never_passes_a_quarter_of_the_budget`, `parts::tests::central_down_pins_to_the_limit_reclaim_past_it_is_counted_and_central_back_gets_the_rest`, `budget::tests::reclaim_never_picks_a_pinned_file_even_when_it_is_the_cheapest_and_oldest` |
+| A deployment that never asked for the timer holds files back | pinning is on only when `[sync_parts] interval` is set and a peer is configured | `parts::tests::nothing_is_pinned_while_the_timer_is_off_or_no_peer_is_set` |
+| A wrong or unmounted store directory makes every uploaded part look removed, and central marks them all cold | a store directory that does not exist yields no retires; one that exists and is empty does retire, and that is true: the node holds none of those files | `parts_edge::tests::a_missing_store_directory_retires_nothing_and_a_removed_file_is_pending` (the empty-but-present directory is not tested) |
+| A retire lost to an outage or a crash | the pending retire is the state line with no file, so it is rebuilt from disk after a restart; a duplicate is a 404, treated as done | `parts::tests::a_retire_central_never_heard_is_still_pending_after_a_restart_and_is_sent_then` |
+| A retire that central will never accept blocks the rest | 400 and 422 are dropped with a warning; other failures back off but do not skip ahead | same test; `parts::retire_remote` |
+| Two upload jobs at once (timer and operator) | one job at a time per edge; the second start is refused | `parts::tests::the_timer_never_overlaps_a_running_upload_and_runs_again_only_when_due` |
+
 Left open, and known:
 
 * **Uploads are not capped per node.** A node with a valid token can hold one connection per upload for as long as the

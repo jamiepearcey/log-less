@@ -328,7 +328,7 @@ URL, streams the file to it and commits. Progress is `parts` in `GET /admin/v1/s
   it without hashing it again. Losing that file costs a HEAD per part, not an upload.
 * **Retries.** A failed PUT or a central 5xx is retried with backoff (six attempts); a URL or upload token that expired
   or was refused (403) is presigned again at once. Out of attempts, the job stops with an error and the next run carries on.
-* **Edge-triggered.** The edge pushes; central cannot ask for a range. It reads committed files only, so the last few
+* **Edge-triggered.** The edge pushes; central cannot ask for a range (the timer is the edge asking itself). It reads committed files only, so the last few
   minutes (not yet merged from the WAL) are not included, and a file compacted after upload is a new part with the same
   rows: a reader of the parts dedupes on event id, as with records.
 
@@ -353,7 +353,59 @@ On central's admin API (bearer token as the rest of `/admin/v1`):
   `delete_failed`. Needs `[peer.parts]` enabled (409 `parts_disabled` otherwise).
 * `GET /admin/v1/parts/audit?limit=` lists tier moves and expiries, newest first (`peer_parts_audit` in the catalog).
 
-Not built: the edge calling `retire` on its own when its retention removes a file, and a timer for the sweep.
+Not built: a timer for the central sweep. The edge side of this lifecycle (timer, pinning, retire) is next.
+
+### The edge: keeping parts until central has them, telling it when they are gone, and a timer
+
+```toml
+# On the edge. All of it is off until interval is set.
+[sync_parts]
+interval = "5m"            # run the upload job every 5 minutes; "0s" (the default) is off; otherwise at least 10s
+pin_bytes = 1073741824     # hold back from deletion at most this many bytes of files central has not confirmed (1 GiB, the default)
+pin_age = "7days"          # and none older than this (the default)
+```
+
+**The timer.** With `interval` set, a thread starts the same upload job `POST /admin/v1/sync/parts` starts, over every
+file central has not confirmed, whatever its age (a manual upload is limited to 31 days; the timer's is not). It
+needs a peer set, and a peer that says `parts: true`, like the manual job. There is one upload job at a time on an edge,
+whoever starts it: a tick that finds a manual job running does nothing and counts it in `skipped_busy`, and a manual
+request during the timer's run gets the usual 409. The first run is at start, the next `interval` after each start.
+*Default off*, because turning it on moves bytes off the machine, needs a node token the operator has to have set up,
+and (below) holds files back from the deletes that protect the disk. None of that should begin because someone upgraded.
+
+**Pinning.** A closed Parquet file with no line in `parts-uploaded.jsonl` is the only copy of its rows. Retention and
+disk-pressure reclaim skip such files: retention deletes the other files of an expired partition and leaves the
+pinned ones (the partition goes when they are uploaded or unpinned); reclaim leaves them out of its candidates. The
+pinned set is the newest unconfirmed files that fit in `pin_bytes` and are younger than `pin_age` (by when the file
+was written), recomputed every maintenance pass (5 s), and never more than a quarter of `storage.disk_budget_bytes`,
+so pinning cannot be what fills the disk. Past those limits the edge behaves as it always did and **counts what it
+deleted**: files, rows and bytes, in `edge_parts.gave_up_*`, in a warning log line with the same numbers, and in
+`parts-gaveup.jsonl` in the data dir, which is summed at start so the totals survive a restart. Pinning is on exactly
+when the timer is on and a peer is set: without a timer nothing is going to upload what it holds. `logless retention`
+run by hand is an explicit deletion and ignores pins. The policy preview (`/admin/v1/policies/preview`) does not
+know about pins and may predict more deletion than the next pass will do.
+
+**Retire.** A line in `parts-uploaded.jsonl` whose file is gone from the store is a pending retire, whatever removed the
+file (retention, reclaim, compaction, an operator). Every 10 s the edge sends `POST /v1/parts/retire {name}` for each,
+in order, and forgets the line once central answered 200, or 404 `no_such_part` (cold already, or never warm), or
+400/422 (never going to be accepted, logged). The queue is the state file itself, so a restart forgets nothing; a
+crash between the answer and forgetting sends one more retire, which central answers 404. Any other answer, or no
+answer, stops the pass, records `retire_error`, and backs off 1 s doubling to 5 min; the lines stay. If two uploaded
+files had the same content, the part stays warm until both are gone. Central turns the part `cold` and audits it, and
+keeps the object: it is now the only copy.
+
+**Compaction.** Compaction replaces several small files with one merged file. The merged file is new content with a new
+name, so it is an unconfirmed file: pinned, and uploaded by the next run. The files it replaced, if they had been
+uploaded, are retired. Central briefly holds the same rows twice (the old parts, cold, and the merged one, warm) until
+the old parts expire; readers of the parts dedupe on event id, as they must for a file compacted after upload anyway.
+Nothing is left warm on central for a file that no longer exists on the edge.
+
+**Status.** `edge_parts` in `GET /admin/v1/sync` on the edge (there is no separate metrics endpoint in log-less): the
+timer (`interval_secs`, `last_run_ms`, `last_run_state`, `last_run_uploaded`, `last_run_error`, `next_run_ms`, `runs`,
+`skipped_busy`), the backlog (`backlog_parts`, `backlog_bytes`: unconfirmed files, refreshed every 5 s), the pins
+(`pin_enabled`, `pin_limit_bytes`, `pin_age_secs`, `pinned_parts`, `pinned_bytes`, `unpinned_parts`, `unpinned_bytes`:
+unconfirmed files reclaim may take), what was given up (`gave_up_parts`, `gave_up_rows`, `gave_up_bytes`) and the
+retires (`retire_pending`, `retired`, `retire_error`).
 
 ### Damage to a stored part: what is and is not checked
 

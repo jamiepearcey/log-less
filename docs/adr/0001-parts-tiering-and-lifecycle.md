@@ -70,6 +70,6 @@ part's key space, who controls its lifecycle (central or the edge), and what ret
 * Expiring a warm part does not touch the node's copy, and the node's upload state file would not upload it again.
   Warm retention is therefore a statement that central no longer needs the object while a copy still exists on the
   node; set it to 0 until nodes report cold.
-* Not built in this slice: the edge does not yet call `retire` by itself when its own retention removes a file
-  (the endpoint and catalog exist and are tested), and nothing runs the sweep on a timer; an operator or cron calls
-  the admin endpoint. Both are deliberate follow-ups, not gaps in the decision.
+* The edge calls `retire` by itself when a file it uploaded leaves its store, holds files central has not confirmed back
+  from retention and reclaim up to a limit, and can run the upload on a timer (`docs/peer-sync.md`, "The edge").
+  Still not built: a timer for the central sweep; an operator or cron calls the admin endpoint.

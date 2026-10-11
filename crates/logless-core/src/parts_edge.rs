@@ -448,3 +448,28 @@ pub fn gave_up_of(before: &[crate::catalog::FileEntry]) -> GaveUp {
 pub fn uploaded_names(state_dir: &Path) -> HashMap<String, String> {
     parts::load_state_lines(state_dir).into_iter().map(|l| (l.path, l.name)).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_store_directory_retires_nothing_and_a_removed_file_is_pending() {
+        let data = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        let line = |path: &str, name: &str| serde_json::json!({"path": path, "size": 1, "name": name}).to_string();
+        std::fs::write(store.path().join("a.parquet"), b"x").unwrap();
+        std::fs::write(data.path().join(parts::STATE_FILE), [line("a.parquet", "n1"), line("b.parquet", "n2"), line("c.parquet", "n1")].join("\n") + "\n").unwrap();
+        // b is gone: pending. c is gone but its content is still held as a: forgotten without telling central.
+        let p = pending_retires(store.path(), data.path());
+        assert_eq!(
+            vec![("b.parquet", "n2", true), ("c.parquet", "n1", false)],
+            p.iter().map(|p| (p.path.as_str(), p.name.as_str(), p.tell_central)).collect::<Vec<_>>()
+        );
+        // The store directory itself missing says nothing about the files.
+        assert!(pending_retires(&store.path().join("absent"), data.path()).is_empty());
+        // Dropping lines keeps the others, in order.
+        parts::drop_state(data.path(), &["b.parquet".into()]).unwrap();
+        assert_eq!(vec!["a.parquet", "c.parquet"], parts::load_state_lines(data.path()).iter().map(|l| l.path.as_str()).collect::<Vec<_>>());
+    }
+}

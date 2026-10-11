@@ -2,7 +2,7 @@
 
 `scripts/e2e-stack.sh` starts the whole stack on one machine, sends it known traffic and checks what came out. Parts go
 to central's own disk by default (`PARTS_BACKEND=local`, no MinIO) or to a MinIO the script starts (`PARTS_BACKEND=s3`).
-It runs in about 15 to 20 seconds, prints a PASS/FAIL table, and exits 0 only if every check passed. Every run starts with nothing: random
+It runs in about 50 to 60 seconds, prints a PASS/FAIL table, and exits 0 only if every check passed. Every run starts with nothing: random
 free ports on 127.0.0.1, a new directory from `mktemp -d`, and random peer token, HEC token, MinIO credentials (s3) and admin
 tokens (`openssl rand`). A trap stops every process the script started and removes the directory, on success, on
 failure and on Ctrl-C. It kills only the PIDs it started.
@@ -38,7 +38,11 @@ KEEP=1 scripts/e2e-stack.sh              # keep the run directory (configs, agen
   central with `fidelity = 100`, `min_severity = 0` and `anomaly_boost = false`. The Sentry proxy has no upstream
   (`forward_events = false`, `transaction_sample_rate = 0.0`, `spool = false`): it is a local recorder here.
 
-Both agents run with `--tail` on an empty file, which keeps them running until SIGTERM.
+* **edge-3**: a second edge for the lifecycle checks, with its own node (`edge-3`) and token on central, the upload
+  timer on (`[sync_parts] interval = "10s"`) and `min_severity = 255`, so it sends central no records, only parts. It
+  is given the first 3000 OTLP records.
+
+All agents run with `--tail` on an empty file, which keeps them running until SIGTERM.
 
 ## What it sends
 
@@ -71,8 +75,13 @@ Both agents run with `--tail` on an empty file, which keeps them running until S
 | a 128 MiB part is stored whole (local) | a presign for `BIG_PART_MB` of random bytes, then a PUT with the headers central named, is 200, and the stored file hashes to its name. Time and MiB/s are shown. The part is not committed |
 | central streams the part (local) | central's RSS, sampled every 20 ms during that PUT, grew by less than a sixteenth of the part |
 | peer ack counters sane | central `receiver.accepted == edge sent_records - duplicates == central ingest.written`; `records == accepted + duplicates + loops`; `1 <= wal_waits <= requests`; `wal_wait_us_max` under `ack_wait_ms`; zero loops, unauthorized, bad requests, unsaved dedupe ids, WAL timeouts and shutdown 503s; edge state `ok`, no `last_error`, and nothing dropped, rejected, sampled out or rolled up |
-| exits on SIGTERM within 10 s | edge, then central, then MinIO (s3) each exit within 10 s of SIGTERM (time shown) |
-| no ERROR lines | neither agent log has a line at level ERROR |
+| central stopped in the middle of the edge's uploads | once central has committed 2 of edge-3's parts, the script freezes it (SIGSTOP), so the edge's requests hang, then SIGTERMs it and starts it again on the same ports. Passes if that was after at least 1 and before all of the edge's files |
+| edge pinned its backlog while central was down | `edge_parts.backlog_parts >= 1`, `pinned_parts == backlog_parts` and `gave_up_parts == 0` while central is frozen |
+| no part lost, none duplicated after central restarted | when the edge's backlog is 0 and its file count has stopped moving: central's `peer_parts` rows for edge-3, the objects stored for it and the edge's `parts-uploaded.jsonl` names are each exactly the sha256 names of the edge's files, once each, with no temporary upload file left |
+| after the restart only the parts not yet stored arrived, once each (local) | central's `parts_store.uploads` (counted since its restart) equals the edge's files minus the parts already stored when central exited; one stored but not committed is found present and only committed |
+| files removed by disk pressure are retired | `disk_budget_bytes` of edge-3 is set to 2048 through the policy API; its maintenance reclaim removes every file; within the wait, central has all of them `cold` and none `warm`, the edge reports `retired` = files, `retire_pending` 0, an empty state file and nothing given up, and central still holds every object |
+| exits on SIGTERM within 10 s | edge, edge-3, then central, then MinIO (s3) each exit within 10 s of SIGTERM (time shown) |
+| no ERROR lines | no agent log has a line at level ERROR |
 | logged a drained shutdown | each agent logged `shutdown signal received; draining` |
 | verify (accounting invariant) | `logless verify` passes on both stores (after `logless merge` of what was left in the WAL) |
 | central otlp / hec records == sent | rows and distinct event ids for that service on central equal what was sent |
@@ -86,7 +95,7 @@ Counts are taken with `duckdb` over each store's Parquet files after both agents
 ## What it does not cover
 
 OTLP gRPC, S3 serve beyond the one parts read above, the disk budget (unit-tested, not exercised here), TLS, a real Sentry upstream, `fidelity` below 100 (rollups with real counts), anomaly boosts,
-restarts and faults mid-sync (those are `sync_soak` and `scripts/chaos.sh`), and anything on a non-loopback address.
+restarts and faults mid-sync of the record path (those are `sync_soak` and `scripts/chaos.sh`; the parts path's restart is the lifecycle section above), and anything on a non-loopback address.
 Ports are found by binding port 0 and closing it, so another process could take one between that and the agent
 binding it; the run then fails at start and should simply be rerun.
 
