@@ -24,6 +24,7 @@ pub mod mask;
 pub mod merge;
 pub mod otlp;
 pub mod parts;
+pub mod parts_edge;
 pub mod peer;
 pub mod queue;
 pub mod restore;

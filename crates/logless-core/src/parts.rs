@@ -49,6 +49,9 @@
 //! skips what is done without hashing it again. A failed PUT is retried with backoff, and an expired
 //! or refused URL is presigned again. The job runs only against a peer whose capability document
 //! says `parts: true`.
+//!
+//! `parts_edge` runs that job on a timer, holds unconfirmed files back from retention and reclaim, and
+//! retires the ones the edge later loses: every line of [`STATE_FILE`] whose file is gone.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
@@ -1133,26 +1136,77 @@ impl Default for Tuning {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct StateLine {
-    path: String,
-    size: u64,
-    name: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StateLine {
+    pub(crate) path: String,
+    pub(crate) size: u64,
+    pub(crate) name: String,
+}
+
+/// Held while the state file is appended to or rewritten, so a retire pass dropping lines cannot lose a line
+/// the upload job appends meanwhile.
+static STATE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Every file a run already committed, torn lines skipped.
+pub(crate) fn load_state_lines(state_dir: &Path) -> Vec<StateLine> {
+    let Ok(text) = std::fs::read_to_string(state_dir.join(STATE_FILE)) else { return Vec::new() };
+    // A torn last line (a crash mid-append) is skipped: that file is uploaded again, which is idempotent.
+    text.lines().filter_map(|l| serde_json::from_str::<StateLine>(l).ok()).collect()
 }
 
 /// `(path relative to the store, size)` of every file a run already committed.
-fn load_state(state_dir: &Path) -> HashMap<String, u64> {
-    let Ok(text) = std::fs::read_to_string(state_dir.join(STATE_FILE)) else { return HashMap::new() };
-    // A torn last line (a crash mid-append) is skipped: that file is uploaded again, which is idempotent.
-    text.lines().filter_map(|l| serde_json::from_str::<StateLine>(l).ok()).map(|l| (l.path, l.size)).collect()
+pub(crate) fn load_state(state_dir: &Path) -> HashMap<String, u64> {
+    load_state_lines(state_dir).into_iter().map(|l| (l.path, l.size)).collect()
 }
 
 fn append_state(state_dir: &Path, line: &StateLine) -> std::io::Result<()> {
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(state_dir.join(STATE_FILE))?;
     let mut bytes = serde_json::to_vec(line).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
     file.write_all(&bytes)?;
     file.sync_data()
+}
+
+/// Forgets the lines for `paths` (files whose removal central has been told of): the rest of the file is
+/// written to a temporary file, synced and renamed over it.
+pub(crate) fn drop_state(state_dir: &Path, paths: &[String]) -> std::io::Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let _guard = STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let keep: Vec<StateLine> = load_state_lines(state_dir).into_iter().filter(|l| !paths.contains(&l.path)).collect();
+    let tmp = state_dir.join(format!("{STATE_FILE}.tmp"));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        for line in &keep {
+            let mut bytes = serde_json::to_vec(line).map_err(std::io::Error::other)?;
+            bytes.push(b'\n');
+            file.write_all(&bytes)?;
+        }
+        file.sync_all()?;
+    }
+    std::fs::rename(tmp, state_dir.join(STATE_FILE))
+}
+
+/// Tells central this node no longer holds `name` (`POST /v1/parts/retire`). `Ok` means central has recorded it
+/// or has nothing to record (no warm part of that name: cold already, or never committed); `Err` is worth
+/// retrying later (unreachable, busy, a token it refuses).
+pub(crate) fn retire_remote(target: &SyncTarget, name: &str) -> Result<(), String> {
+    let cancel = AtomicBool::new(false);
+    let agent = || -> ureq::Agent { ureq::Agent::config_builder().timeout_global(Some(CONTROL_TIMEOUT)).http_status_as_error(false).build().into() };
+    let uploader = Uploader { target, control: agent(), storage: agent(), tuning: Tuning::default(), cancel: &cancel };
+    match uploader.post(RETIRE_PATH, &RetireRequest { name: name.into(), node: None }) {
+        Ok((200, _)) => Ok(()),
+        Ok((404, v)) if v["error"] == "no_such_part" => Ok(()),
+        // A name central will never take; keeping it would block every retire behind it.
+        Ok((status @ (400 | 422), v)) => {
+            tracing::warn!(name, status, message = v["message"].as_str().unwrap_or(""), "central refused a retire for good; dropping it");
+            Ok(())
+        }
+        Ok((status, v)) => Err(format!("The peer answered HTTP {status} to a retire. {}", v["message"].as_str().unwrap_or("")).trim().to_string()),
+        Err(m) => Err(m),
+    }
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<(String, u64)> {
@@ -2798,5 +2852,317 @@ mod tests {
         assert_eq!(0, cat.peer_part_count().unwrap());
         let conn = rusqlite::Connection::open(&path).unwrap();
         assert_eq!(1, conn.query_row("SELECT COUNT(*) FROM peer_parts_flat_legacy", [], |r| r.get::<_, i64>(0)).unwrap());
+    }
+
+    // ---- the edge lifecycle: pin, upload on a timer, retire ------------------------------------
+
+    use crate::parts_edge::{self, Driver, EdgePartsConfig};
+
+    /// An edge whose files are also in a catalog (retention and reclaim read it), written `age_mins * i` minutes ago.
+    struct Life {
+        control: Arc<SyncControl>,
+        data: tempfile::TempDir,
+        store: tempfile::TempDir,
+        catalog: crate::catalog::Catalog,
+        paths: Vec<PathBuf>,
+    }
+
+    fn life_edge(url: &str, hours: &[u64]) -> Life {
+        let data = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        write_files(store.path(), hours);
+        let mut catalog = crate::catalog::Catalog::open_in_memory().unwrap();
+        let mut paths = crate::store::list_parquet_files(store.path());
+        // Oldest data first, as `hours` is; the file names carry random ids, so order by the hour directory.
+        paths.sort_by_key(|p| p.parent().and_then(|d| d.parent()).map(|d| d.to_path_buf()));
+        let now = std::time::SystemTime::now();
+        for (i, path) in paths.iter().enumerate() {
+            let stats = crate::store::read_file_stats(path).unwrap();
+            let key = crate::partition::PartitionKey { epoch_hour: hours[i], bucket: "info".into() };
+            catalog.commit_merge(i as u64 + 1, uuid::Uuid::from_u128(i as u128 + 1), &[crate::catalog::FileEntry { path: path.clone(), key, stats }], &[], 0).unwrap();
+            // Written (paths.len() - i) minutes ago: a strict order for "newest first".
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_modified(now - Duration::from_secs(60 * (paths.len() - i) as u64)).unwrap();
+        }
+        let target = SyncTarget { url: url.into(), token: Some("tok-a".into()), min_severity: 0, fidelity: 100, anomaly_boost: false };
+        let control = SyncControl::new("edge".into(), SyncStore::new(data.path()), Some(target));
+        control.set_store_dir(store.path().to_path_buf());
+        Life { control, data, store, catalog, paths }
+    }
+
+    fn target_for(url: &str) -> SyncTarget {
+        SyncTarget { url: url.into(), token: Some("tok-a".into()), min_severity: 0, fidelity: 100, anomaly_boost: false }
+    }
+
+    /// A URL nothing listens on: central is down.
+    fn dead_url() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    }
+
+    fn timer(interval_secs: u64, pin_bytes: u64) -> EdgePartsConfig {
+        EdgePartsConfig { interval: Duration::from_secs(interval_secs), pin_bytes, pin_age: Duration::from_secs(7 * 24 * 3_600) }
+    }
+
+    fn wait_job(control: &SyncControl) {
+        let started = Instant::now();
+        while control.status().parts.is_none_or(|p| p.state == "running") {
+            assert!(started.elapsed() < Duration::from_secs(20), "the job did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn tiers(c: &Local) -> BTreeMap<String, String> {
+        let cat = crate::catalog::Catalog::open(&c.catalog).unwrap();
+        cat.list_peer_parts(&crate::catalog::PartsFilter { limit: 1000, ..Default::default() }).unwrap().into_iter().map(|p| (p.name, p.tier)).collect()
+    }
+
+    fn pass(e: &mut Life, budget: u64, now_secs: u64, config: &EdgePartsConfig) -> crate::budget::PassOutcome {
+        let pins = parts_edge::pins_for_pass(&e.control, config, e.store.path(), budget);
+        let wal = e.data.path().join("wal");
+        let out = crate::budget::expire_and_relieve(e.store.path(), &wal, &mut e.catalog, &crate::config::LevelBuckets::default(), budget, &crate::budget::Watermarks::default(), now_secs, &pins);
+        parts_edge::note_gave_up(&e.control, out.gave_up);
+        out
+    }
+
+    #[test]
+    fn central_down_pins_to_the_limit_reclaim_past_it_is_counted_and_central_back_gets_the_rest() {
+        let c = local(512 * 1024 * 1024, 0);
+        let real = format!("http://{}", c.receiver.local_addr());
+        let hours: Vec<u64> = (1000..1010).collect();
+        let mut e = life_edge(&dead_url(), &hours);
+        let sizes: Vec<u64> = e.paths.iter().map(|p| std::fs::metadata(p).unwrap().len()).collect();
+        let rows: Vec<u64> = e.paths.iter().map(|p| crate::store::read_file_stats(p).unwrap().rows).collect();
+        // Pin the two newest files; the disk budget is four times that, the most a pin may take.
+        let pin_bytes = sizes[8] + sizes[9];
+        let config = timer(10, pin_bytes);
+        let budget = 4 * pin_bytes;
+        let mut driver = Driver::new(Arc::clone(&e.control), config.clone(), e.store.path().to_path_buf(), FAST);
+        let t0 = crate::now_unix_nanos() / 1_000_000;
+
+        // Central is down: the timer's run fails, nothing is confirmed, the backlog is all ten.
+        driver.step(t0);
+        wait_job(&e.control);
+        driver.due_now();
+        driver.step(t0 + 1);
+        let s = e.control.status();
+        assert_eq!(Some("error"), s.parts.as_ref().map(|p| p.state.as_str()), "{s:?}");
+        assert_eq!((1, 10, sizes.iter().sum::<u64>()), (s.edge_parts.runs, s.edge_parts.backlog_parts, s.edge_parts.backlog_bytes), "{:?}", s.edge_parts);
+        assert_eq!((Some("error".to_string()), Some(t0 + 10_000)), (s.edge_parts.last_run_state, s.edge_parts.next_run_ms));
+
+        // Disk pressure: reclaim wants the oldest. The two newest are pinned and survive; the rest go, oldest first, and are counted.
+        let out = pass(&mut e, budget, 1_011 * 3_600, &config);
+        let gone: Vec<usize> = (0..10).filter(|i| !e.paths[*i].exists()).collect();
+        assert!(!gone.is_empty() && gone.iter().all(|i| *i < 8), "{gone:?}");
+        assert_eq!(gone, (0..gone.len()).collect::<Vec<_>>(), "oldest first");
+        assert!(e.paths[8].exists() && e.paths[9].exists(), "the pinned files survive");
+        let (lost_bytes, lost_rows) = (gone.iter().map(|i| sizes[*i]).sum::<u64>(), gone.iter().map(|i| rows[*i]).sum::<u64>());
+        assert_eq!((gone.len() as u64, lost_rows, lost_bytes), (out.gave_up.parts, out.gave_up.rows, out.gave_up.bytes), "{:?}", out.gave_up);
+        let s = e.control.status().edge_parts;
+        assert_eq!((true, pin_bytes, 2, sizes[8] + sizes[9], 8), (s.pin_enabled, s.pin_limit_bytes, s.pinned_parts, s.pinned_bytes, s.unpinned_parts), "{s:?}");
+        assert_eq!((gone.len() as u64, lost_rows, lost_bytes), (s.gave_up_parts, s.gave_up_rows, s.gave_up_bytes), "{s:?}");
+        // The count outlives a restart.
+        assert_eq!(out.gave_up, parts_edge::load_gave_up(e.data.path()));
+        assert_eq!(0, out.reclaim.unwrap().unwrap().files_dropped.iter().filter(|p| **p == e.paths[8] || **p == e.paths[9]).count());
+
+        // Central is back: the next timer run uploads and commits every file still here, pinned or not.
+        let left = 10 - gone.len();
+        e.control.set_target(Some(target_for(&real)));
+        driver.step(t0 + 10_000);
+        wait_job(&e.control);
+        driver.due_now();
+        driver.step(t0 + 10_001);
+        let s = e.control.status();
+        assert_eq!(("done", left as u64), (s.parts.as_ref().unwrap().state.as_str(), s.parts.as_ref().unwrap().uploaded), "{s:?}");
+        assert_eq!((2, 0, left as u64), (s.edge_parts.runs, s.edge_parts.backlog_parts, s.edge_parts.last_run_uploaded), "{:?}", s.edge_parts);
+        assert_eq!(left, tiers(&c).len());
+        assert!(tiers(&c).values().all(|t| t == "warm"));
+        assert_eq!(left, files_in(&c.parts).len());
+        assert_eq!(left, parts_edge::uploaded_names(e.data.path()).len());
+
+        // Nothing is unconfirmed now, so retention deletes the lot; each deleted file is retired and its part turns cold.
+        let out = pass(&mut e, budget, 10_000_000, &config);
+        let remaining: u64 = (0..10).filter(|i| !gone.contains(i)).map(|i| sizes[i]).sum();
+        assert_eq!((remaining, 0), (out.expiry.bytes_reclaimed, out.gave_up.parts), "{:?}", out.expiry);
+        assert!(e.paths.iter().all(|p| !p.exists()));
+        driver.due_now();
+        driver.step(t0 + 10_002);
+        let s = e.control.status().edge_parts;
+        assert_eq!((left as u64, 0, None), (s.retired, s.retire_pending, s.retire_error.clone()), "{s:?}");
+        assert!(tiers(&c).values().all(|t| t == "cold"), "{:?}", tiers(&c));
+        assert!(parts_edge::uploaded_names(e.data.path()).is_empty(), "retired lines are forgotten");
+        // The cold parts are still on central's disk: that is the point.
+        assert_eq!(left, files_in(&c.parts).len());
+        c.receiver.shutdown();
+    }
+
+    #[test]
+    fn nothing_is_pinned_while_the_timer_is_off_or_no_peer_is_set() {
+        let mut e = life_edge(&dead_url(), &[1000, 1001, 1002]);
+        let size: u64 = e.paths.iter().map(|p| std::fs::metadata(p).unwrap().len()).sum();
+        let off = EdgePartsConfig::default();
+        assert!(!off.timer_on());
+        let pins = parts_edge::pins_for_pass(&e.control, &off, e.store.path(), 4 * size);
+        assert!(pins.is_empty() && pins.unconfirmed.is_empty());
+        // Retention then deletes unconfirmed files exactly as it did before pinning existed.
+        let out = pass(&mut e, 4 * size, 10_000_000, &off);
+        assert_eq!((3, 0), (out.expiry.expired.len(), out.gave_up.parts as usize));
+        let e = life_edge(&dead_url(), &[1000]);
+        e.control.set_target(None);
+        let pins = parts_edge::pins_for_pass(&e.control, &timer(60, 1 << 30), e.store.path(), 0);
+        assert!(pins.is_empty(), "no peer: nobody to upload, so nothing is held back");
+    }
+
+    #[test]
+    fn an_old_unconfirmed_file_is_not_pinned_and_the_limit_never_passes_a_quarter_of_the_budget() {
+        let e = life_edge(&dead_url(), &[1000, 1001, 1002]);
+        let size = std::fs::metadata(&e.paths[0]).unwrap().len();
+        // Files are 3, 2 and 1 minutes old; an age limit of 150 s keeps the two newest.
+        let by_age = EdgePartsConfig { pin_age: Duration::from_secs(150), ..timer(60, 1 << 30) };
+        let pins = parts_edge::pins_for_pass(&e.control, &by_age, e.store.path(), 0);
+        let mut pinned: Vec<_> = pins.pinned.iter().cloned().collect();
+        pinned.sort();
+        let mut want = vec![e.paths[1].clone(), e.paths[2].clone()];
+        want.sort();
+        assert_eq!(want, pinned);
+        assert_eq!(3, pins.unconfirmed.len());
+        // A budget of 8 files' bytes allows 2 pinned, whatever pin_bytes says.
+        let pins = parts_edge::pins_for_pass(&e.control, &timer(60, 1 << 30), e.store.path(), 8 * size);
+        assert_eq!(2, pins.pinned.len(), "{:?}", e.control.status().edge_parts);
+        assert_eq!(2 * size, e.control.status().edge_parts.pin_limit_bytes);
+    }
+
+    #[test]
+    fn a_file_removed_after_upload_is_retired_so_central_marks_it_cold_and_the_rest_stay_warm() {
+        let c = local(512 * 1024 * 1024, 0);
+        let e = life_edge(&format!("http://{}", c.receiver.local_addr()), &[1000, 1001, 1002]);
+        let mut driver = Driver::new(Arc::clone(&e.control), timer(10, 1 << 30), e.store.path().to_path_buf(), FAST);
+        let t0 = crate::now_unix_nanos() / 1_000_000;
+        driver.step(t0);
+        wait_job(&e.control);
+        assert_eq!(3, tiers(&c).len());
+        let names = parts_edge::uploaded_names(e.data.path());
+        let relative = |p: &PathBuf| p.strip_prefix(e.store.path()).unwrap().to_string_lossy().into_owned();
+        let gone_name = names[&relative(&e.paths[0])].clone();
+
+        std::fs::remove_file(&e.paths[0]).unwrap();
+        assert_eq!(1, parts_edge::pending_retires(e.store.path(), e.data.path()).len());
+        driver.due_now();
+        driver.step(t0 + 1);
+        let t = tiers(&c);
+        assert_eq!(Some(&"cold".to_string()), t.get(&gone_name), "{t:?}");
+        assert_eq!(2, t.values().filter(|v| *v == "warm").count(), "{t:?}");
+        assert!(parts_edge::pending_retires(e.store.path(), e.data.path()).is_empty());
+        // Central keeps the cold part; a second pass has nothing to say.
+        assert_eq!(3, files_in(&c.parts).len());
+        let s = e.control.status().edge_parts;
+        assert_eq!((1, 0), (s.retired, s.retire_pending), "{s:?}");
+        let cat = crate::catalog::Catalog::open(&c.catalog).unwrap();
+        assert_eq!(1, cat.peer_parts_audit(10).unwrap().len(), "central audited the move to cold");
+        c.receiver.shutdown();
+    }
+
+    #[test]
+    fn a_retire_central_never_heard_is_still_pending_after_a_restart_and_is_sent_then() {
+        let c = local(512 * 1024 * 1024, 0);
+        let real = format!("http://{}", c.receiver.local_addr());
+        let e = life_edge(&real, &[1000, 1001]);
+        let mut driver = Driver::new(Arc::clone(&e.control), timer(10, 1 << 30), e.store.path().to_path_buf(), FAST);
+        let t0 = crate::now_unix_nanos() / 1_000_000;
+        driver.step(t0);
+        wait_job(&e.control);
+        let names = parts_edge::uploaded_names(e.data.path());
+        let name = names[&e.paths[1].strip_prefix(e.store.path()).unwrap().to_string_lossy().into_owned()].clone();
+
+        // The file goes while central is unreachable: the retire fails and is kept, with an error to show.
+        std::fs::remove_file(&e.paths[1]).unwrap();
+        e.control.set_target(Some(target_for(&dead_url())));
+        driver.due_now();
+        driver.step(t0 + 1);
+        let s = e.control.status().edge_parts;
+        assert_eq!((0, 1), (s.retired, s.retire_pending), "{s:?}");
+        assert!(s.retire_error.is_some());
+        assert_eq!(Some(&"warm".to_string()), tiers(&c).get(&name));
+        // Backoff: an immediate second look does not try again.
+        driver.due_now();
+        driver.step(t0 + 2);
+
+        // Restart: a new process has only the data dir. The pending retire is rebuilt from it and goes out.
+        let control = SyncControl::new("edge".into(), SyncStore::new(e.data.path()), Some(target_for(&real)));
+        control.set_store_dir(e.store.path().to_path_buf());
+        assert_eq!(1, parts_edge::pending_retires(e.store.path(), e.data.path()).len());
+        let mut driver = Driver::new(Arc::clone(&control), timer(10, 1 << 30), e.store.path().to_path_buf(), FAST);
+        driver.step(t0 + 3);
+        let s = control.status().edge_parts;
+        assert_eq!((1, 0, None), (s.retired, s.retire_pending, s.retire_error.clone()), "{s:?}");
+        assert_eq!(Some(&"cold".to_string()), tiers(&c).get(&name));
+        assert!(parts_edge::pending_retires(e.store.path(), e.data.path()).is_empty());
+        wait_job(&control);
+        c.receiver.shutdown();
+    }
+
+    #[test]
+    fn compaction_of_uploaded_files_retires_the_old_parts_and_uploads_the_merged_one() {
+        let c = local(512 * 1024 * 1024, 0);
+        let mut e = life_edge(&format!("http://{}", c.receiver.local_addr()), &[1000, 1000, 1000, 1000]);
+        let mut driver = Driver::new(Arc::clone(&e.control), timer(10, 1 << 30), e.store.path().to_path_buf(), FAST);
+        let t0 = crate::now_unix_nanos() / 1_000_000;
+        driver.step(t0);
+        wait_job(&e.control);
+        let before = tiers(&c);
+        assert_eq!(4, before.len());
+
+        let config = crate::compact::CompactConfig { min_files: 2, ..Default::default() };
+        let report = crate::compact::compact(e.store.path(), &mut e.catalog, &config, None).unwrap();
+        assert_eq!((1, 4, 80), (report.partitions_compacted, report.files_replaced, report.rows), "{report:?}");
+        let merged = crate::store::list_parquet_files(e.store.path());
+        assert_eq!(1, merged.len());
+        // The merged file is a new, unconfirmed file: pinned until it is uploaded.
+        let pins = parts_edge::pins_for_pass(&e.control, &timer(10, 1 << 30), e.store.path(), 0);
+        assert_eq!((1, 1), (pins.pinned.len(), pins.unconfirmed.len()));
+        assert_eq!(4, parts_edge::pending_retires(e.store.path(), e.data.path()).len());
+
+        driver.due_now();
+        driver.step(t0 + 10_000);
+        wait_job(&e.control);
+        driver.due_now();
+        driver.step(t0 + 10_001);
+        let after = tiers(&c);
+        assert_eq!(5, after.len(), "{after:?}");
+        let warm: Vec<_> = after.iter().filter(|(_, t)| *t == "warm").collect();
+        let cold: Vec<_> = after.iter().filter(|(_, t)| *t == "cold").map(|(n, _)| n.clone()).collect();
+        assert_eq!(1, warm.len(), "{after:?}");
+        assert!(!before.contains_key(warm[0].0), "the merged part is new");
+        assert_eq!(before.keys().cloned().collect::<Vec<_>>(), cold, "every replaced part is retired, none stranded warm");
+        let catalog = crate::catalog::Catalog::open(&c.catalog).unwrap();
+        let rows: u64 = catalog.list_peer_parts(&crate::catalog::PartsFilter { tier: Some("warm".into()), limit: 10, ..Default::default() }).unwrap().iter().map(|p| p.rows).sum();
+        assert_eq!(80, rows);
+        assert_eq!(1, parts_edge::uploaded_names(e.data.path()).len());
+        c.receiver.shutdown();
+    }
+
+    #[test]
+    fn the_timer_never_overlaps_a_running_upload_and_runs_again_only_when_due() {
+        // A peer that accepts connections and never answers: the manual job sits in its probe.
+        let hang = TcpListener::bind("127.0.0.1:0").unwrap();
+        let e = life_edge(&format!("http://{}", hang.local_addr().unwrap()), &[1000]);
+        e.control.start_parts_with(0, HOUR_MS, FAST).unwrap();
+        let mut driver = Driver::new(Arc::clone(&e.control), timer(10, 1 << 30), e.store.path().to_path_buf(), FAST);
+        let t0 = crate::now_unix_nanos() / 1_000_000;
+        driver.step(t0);
+        let s = e.control.status().edge_parts;
+        assert_eq!((0, 1, Some(t0 + 10_000)), (s.runs, s.skipped_busy, s.next_run_ms), "{s:?}");
+        assert!(e.control.start_parts_all(FAST).is_err(), "a second job is refused whoever asks");
+        e.control.cancel_parts();
+        // Not due again until the interval has passed.
+        driver.step(t0 + 9_999);
+        assert_eq!(1, e.control.status().edge_parts.skipped_busy);
+        driver.step(t0 + 10_000);
+        assert_eq!(2, e.control.status().edge_parts.skipped_busy);
+        // The interval must be 0 (off) or at least 10 s.
+        assert!(timer(5, 1).check().is_err() && timer(10, 1).check().is_ok() && EdgePartsConfig::default().check().is_ok());
+        let parsed: crate::config::Config = toml::from_str("[storage]\ndata_dir = \"/tmp/x\"\n[sync_parts]\ninterval = \"2m\"\npin_bytes = 5\npin_age = \"1d\"\n").unwrap();
+        assert_eq!((120, 5, 86_400), (parsed.sync_parts.interval.as_secs(), parsed.sync_parts.pin_bytes, parsed.sync_parts.pin_age.as_secs()));
+        assert!(toml::from_str::<crate::config::Config>("[storage]\ndata_dir = \"/tmp/x\"\n[sync_parts]\ninterval = \"1s\"\n").unwrap().validate().is_err());
     }
 }

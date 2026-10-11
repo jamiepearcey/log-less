@@ -203,6 +203,8 @@ pub struct SyncStatus {
     pub backfill: Option<BackfillStatus>,
     /// A manual upload of a range's Parquet parts (`parts`).
     pub parts: Option<crate::parts::PartsJobStatus>,
+    /// The part lifecycle on this edge: timer, backlog, pins, retires (`parts_edge`).
+    pub edge_parts: crate::parts_edge::EdgePartsStatus,
 }
 
 /// A manual fetch of a range: everything in it, sent at full detail.
@@ -486,6 +488,16 @@ impl SyncControl {
         if to_ms - from_ms > 31 * 24 * 3_600_000 {
             return Err("An upload covers at most 31 days at a time.".into());
         }
+        self.launch_parts(from_ms, to_ms, tuning)
+    }
+
+    /// The timer's job (`parts_edge`): every committed file central has not confirmed, whatever its age.
+    /// Refused while any other upload runs, so two jobs never overlap.
+    pub(crate) fn start_parts_all(self: &Arc<Self>, tuning: crate::parts::Tuning) -> Result<(), String> {
+        self.launch_parts(0, crate::parts_edge::ALL_TIME_END_MS, tuning)
+    }
+
+    fn launch_parts(self: &Arc<Self>, from_ms: u64, to_ms: u64, tuning: crate::parts::Tuning) -> Result<(), String> {
         let Some(target) = self.target() else {
             return Err("Set a peer and turn sync on before uploading parts.".into());
         };
@@ -514,6 +526,10 @@ impl SyncControl {
 
     pub fn cancel_parts(&self) {
         self.parts_cancel.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn update_edge_parts(&self, f: impl FnOnce(&mut crate::parts_edge::EdgePartsStatus)) {
+        self.update(|s| f(&mut s.edge_parts));
     }
 
     pub(crate) fn update_parts(&self, f: impl FnOnce(&mut crate::parts::PartsJobStatus)) {

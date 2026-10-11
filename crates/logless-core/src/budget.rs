@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::catalog::{Catalog, CatalogError, FileEntry};
 use crate::config::LevelBuckets;
 use crate::partition::PartitionKey;
+use crate::parts_edge::{gave_up_of, GaveUp, PinSet};
 use crate::retention::{self, RetentionReport};
 use crate::wal;
 
@@ -114,6 +115,8 @@ pub struct ReclaimReport {
     pub rows_lost: u64,
     /// True if we ran out of things to delete before reaching the target.
     pub exhausted: bool,
+    /// Files left alone because they are pinned (`parts_edge`): central has not confirmed them.
+    pub pinned_kept: usize,
 }
 
 /// Free space by dropping individual files early, cheapest data first.
@@ -136,10 +139,25 @@ pub fn reclaim(
     wm: &Watermarks,
     dry_run: bool,
 ) -> Result<ReclaimReport, CatalogError> {
-    let files = catalog.list_files()?;
-    let report = reclaim_files(files, store_dir, buckets, usage, wm, |path| {
+    reclaim_pinned(store_dir, catalog, buckets, usage, wm, dry_run, &PinSet::default())
+}
+
+/// [`reclaim`], never choosing a pinned file. When only pinned files are left the report is `exhausted`: the pin
+/// limit is capped at a quarter of the disk budget, so this cannot be most of the disk.
+pub fn reclaim_pinned(
+    store_dir: &Path,
+    catalog: &mut Catalog,
+    buckets: &LevelBuckets,
+    usage: DiskUsage,
+    wm: &Watermarks,
+    dry_run: bool,
+    pins: &PinSet,
+) -> Result<ReclaimReport, CatalogError> {
+    let (pinned, files): (Vec<_>, Vec<_>) = catalog.list_files()?.into_iter().partition(|f| pins.contains(&f.path));
+    let mut report = reclaim_files(files, store_dir, buckets, usage, wm, |path| {
         dry_run || std::fs::remove_file(path).is_ok()
     });
+    report.pinned_kept = pinned.len();
     if !dry_run && !report.files_dropped.is_empty() {
         catalog.forget_missing_files()?;
     }
@@ -215,6 +233,9 @@ pub struct PassOutcome {
     pub pressure: Pressure,
     /// `None` when pressure was normal and nothing was attempted.
     pub reclaim: Option<Result<ReclaimReport, CatalogError>>,
+    /// Closed files central had not confirmed that retention or reclaim deleted anyway, because they were past
+    /// the pin limit (`parts_edge`). Zero when nothing is pinned.
+    pub gave_up: GaveUp,
 }
 
 /// The expiry-and-relief half of a maintenance pass, with every policy value
@@ -228,8 +249,15 @@ pub fn expire_and_relieve(
     budget_bytes: u64,
     wm: &Watermarks,
     now_unix_secs: u64,
+    pins: &PinSet,
 ) -> PassOutcome {
-    let expiry = retention::enforce(store_dir, buckets, now_unix_secs, false);
+    // The unconfirmed files as the catalog knows them now, to count the ones this pass deletes.
+    let unconfirmed: Vec<FileEntry> = if pins.unconfirmed.is_empty() {
+        Vec::new()
+    } else {
+        catalog.list_files().unwrap_or_default().into_iter().filter(|f| pins.unconfirmed.contains(&f.path)).collect()
+    };
+    let expiry = retention::enforce_pinned(store_dir, buckets, now_unix_secs, false, pins);
     if !expiry.expired.is_empty() {
         if let Err(e) = catalog.forget_missing_files() {
             tracing::error!(error = %e, "catalog cleanup after retention failed");
@@ -238,8 +266,9 @@ pub fn expire_and_relieve(
     let usage = DiskUsage::measure(wal_dir, catalog, budget_bytes);
     let pressure = usage.pressure(wm);
     let reclaim = (pressure != Pressure::Normal)
-        .then(|| reclaim(store_dir, catalog, buckets, usage, wm, false));
-    PassOutcome { expiry, usage, pressure, reclaim }
+        .then(|| reclaim_pinned(store_dir, catalog, buckets, usage, wm, false, pins));
+    let gave_up = gave_up_of(&unconfirmed);
+    PassOutcome { expiry, usage, pressure, reclaim, gave_up }
 }
 
 #[cfg(test)]
@@ -553,5 +582,30 @@ mod tests {
         let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), true).unwrap();
         assert!(!report.files_dropped.is_empty());
         assert_eq!(cat.list_files().unwrap().len(), 1, "dry run must not delete");
+    }
+
+    #[test]
+    fn reclaim_never_picks_a_pinned_file_even_when_it_is_the_cheapest_and_oldest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let old = seed(&store, &mut cat, 100, "debug", 50);
+        seed(&store, &mut cat, 101, "debug", 50);
+        let oldest_path = cat.list_files().unwrap().into_iter().min_by_key(|f| f.stats.min_observed_nanos).unwrap().path;
+        let usage = DiskUsage { wal_bytes: 0, store_bytes: 2 * old.bytes, budget_bytes: 2 * old.bytes };
+        let mut pins = PinSet::default();
+        pins.pinned.insert(oldest_path.clone());
+
+        let report = reclaim_pinned(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false, &pins).unwrap();
+        assert!(oldest_path.exists(), "the pinned file is the oldest and cheapest, and stays");
+        assert_eq!((1, 1), (report.files_dropped.len(), report.pinned_kept));
+        assert_eq!(old.rows, report.rows_lost);
+        // Only the pinned file is left and it is over target: said so, not forced.
+        let usage = DiskUsage { wal_bytes: 0, store_bytes: old.bytes, budget_bytes: old.bytes };
+        let report = reclaim_pinned(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false, &pins).unwrap();
+        assert!(report.files_dropped.is_empty() && report.exhausted && oldest_path.exists());
+        // Unpinned, it goes.
+        let report = reclaim_pinned(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false, &PinSet::default()).unwrap();
+        assert_eq!(1, report.files_dropped.len());
     }
 }

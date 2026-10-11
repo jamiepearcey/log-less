@@ -1872,7 +1872,7 @@ mod tests {
         // The pass exactly as maintenance_pass runs it: policy re-read each time.
         let pass = |catalog: &mut Catalog| {
             let rt = r.handle.runtime();
-            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, now)
+            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, now, &Default::default())
         };
 
         // Dry check under the file defaults: only debug is due (1d), info keeps 7d.
@@ -1925,7 +1925,7 @@ mod tests {
             .unwrap();
         let pass = |catalog: &mut Catalog| {
             let rt = r.handle.runtime();
-            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, 0)
+            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, 0, &Default::default())
         };
         assert_eq!(pass(&mut catalog).pressure, Pressure::Normal);
 
