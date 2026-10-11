@@ -23,6 +23,7 @@ pub mod httpd;
 pub mod mask;
 pub mod merge;
 pub mod otlp;
+pub mod parts;
 pub mod peer;
 pub mod queue;
 pub mod scan;

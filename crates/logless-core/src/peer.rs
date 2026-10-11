@@ -8,6 +8,7 @@
 //! |---|---|
 //! | `GET /.well-known/logless` | the capability document: version, instance id, formats, limits, clock |
 //! | `POST /v1/ingest` | newline-delimited JSON, one [`LogRecord`] per line, optionally gzipped |
+//! | `POST /v1/parts/presign`, `/v1/parts/commit` | Parquet part upload to object storage, when `[peer.parts]` is set (`crate::parts`) |
 //!
 //! Plain OTLP also works against an instance's OTLP receiver and stays the fallback for a sender that
 //! is not log-less. This native path exists because OTLP cannot carry what a log-less hop needs:
@@ -34,7 +35,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -77,6 +78,9 @@ pub struct PeerConfig {
     /// Advertised in the capability document: whether this instance also serves its store over S3.
     #[serde(default)]
     pub advertise_s3: bool,
+    /// `[peer.parts]`: object storage edges upload finished Parquet parts to (`crate::parts`).
+    #[serde(default)]
+    pub parts: crate::parts::PartsConfig,
 }
 
 fn default_addr() -> String {
@@ -106,6 +110,7 @@ impl Default for PeerConfig {
             max_decompressed_bytes: default_max_decompressed(),
             dedupe_window: default_dedupe_window(),
             advertise_s3: false,
+            parts: crate::parts::PartsConfig::default(),
         }
     }
 }
@@ -135,7 +140,8 @@ pub struct Capabilities {
     pub s3: bool,
     /// Answers a filtered scan. Not built yet; present so a client can ask without a version check.
     pub query: bool,
-    /// Accepts finished Parquet parts. Not built yet.
+    /// Presigns uploads of finished Parquet parts (`crate::parts`): true only when `[peer.parts]` is
+    /// enabled and complete.
     pub parts: bool,
     /// The peer's clock, unix milliseconds, so a sender can report skew.
     pub clock_ms: u64,
@@ -252,6 +258,7 @@ struct PeerHandler {
     dedupe: DedupeWindow,
     stats: Arc<PeerStats>,
     sink: Box<dyn Fn(Vec<LogRecord>) -> Admitted + Send + Sync>,
+    parts: Option<crate::parts::PartsCentral>,
 }
 
 impl PeerHandler {
@@ -292,7 +299,7 @@ impl PeerHandler {
             max_hops: MAX_HOPS,
             s3: self.config.advertise_s3,
             query: false,
-            parts: false,
+            parts: self.parts.is_some(),
             clock_ms: crate::now_unix_nanos() / 1_000_000,
         }
     }
@@ -375,6 +382,17 @@ impl Handler for PeerHandler {
                 }
             }
             (Method::Post, INGEST_PATH) => self.ingest(&request),
+            (Method::Post, path @ (crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH)) => {
+                self.stats.requests.fetch_add(1, Ordering::Relaxed);
+                if let Err(denied) = self.authorized(&request) {
+                    return denied;
+                }
+                match &self.parts {
+                    Some(parts) if path == crate::parts::PRESIGN_PATH => parts.presign(&request.body),
+                    Some(parts) => parts.commit(&request.body),
+                    None => error_reply(404, "not_found", "this peer does not accept parts"),
+                }
+            }
             (Method::Get, INGEST_PATH) => error_reply(405, "method_not_allowed", "POST records here"),
             (Method::Post, CAPABILITY_PATH) => error_reply(405, "method_not_allowed", "GET only"),
             _ => error_reply(404, "not_found", "no such path"),
@@ -468,6 +486,30 @@ impl Receiver {
     where
         F: Fn(Vec<LogRecord>) -> Admitted + Send + Sync + 'static,
     {
+        Self::start_with_catalog(config, instance, None, sink)
+    }
+
+    /// As [`Receiver::start`], and serves part upload when `[peer.parts]` is enabled and complete;
+    /// committed parts are recorded in the catalog at `catalog`. An incomplete `[peer.parts]` is logged
+    /// (never its secret) and not advertised.
+    pub fn start_with_catalog<F>(config: &PeerConfig, instance: String, catalog: Option<PathBuf>, sink: F) -> Result<Self, PeerError>
+    where
+        F: Fn(Vec<LogRecord>) -> Admitted + Send + Sync + 'static,
+    {
+        let parts = match (config.parts.enabled, catalog) {
+            (false, _) => None,
+            (true, None) => {
+                tracing::warn!("[peer.parts] is enabled but this process has no catalog; part upload is off");
+                None
+            }
+            (true, Some(path)) => match crate::parts::PartsCentral::new(config.parts.clone(), path) {
+                Ok(p) => Some(p),
+                Err(reason) => {
+                    tracing::warn!(%reason, "part upload is off");
+                    None
+                }
+            },
+        };
         if config.tokens.is_empty() && !is_loopback(&config.addr) {
             return Err(PeerError::OpenOnPublicAddress { addr: config.addr.clone() });
         }
@@ -478,6 +520,7 @@ impl Receiver {
             dedupe: DedupeWindow::new(config.dedupe_window),
             stats: Arc::clone(&stats),
             sink: Box::new(sink),
+            parts,
         });
         let server = httpd::Server::start(
             &config.addr,

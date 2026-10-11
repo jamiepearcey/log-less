@@ -1,4 +1,5 @@
-//! SigV4 header-auth verification for the read-only S3 endpoint.
+//! SigV4 header-auth verification for the read-only S3 endpoint, and query-string presigning for
+//! Parquet part upload (`parts`).
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -80,6 +81,41 @@ pub fn verify(
         (true, false) => Err(AuthError::BadSignature),
         (false, _) => Err(AuthError::UnknownKey),
     }
+}
+
+/// A presigned (query-string auth) URL path and query for `method` on `raw_path`, signing `host` only
+/// with an unsigned payload, valid `expires_secs` from `now_unix_secs`. `raw_path` is already
+/// percent-encoded the way it will be sent. Returns `path?query`; the caller prefixes scheme and host.
+pub fn presign(
+    creds: &Credentials,
+    method: &str,
+    host: &str,
+    raw_path: &str,
+    region: &str,
+    now_unix_secs: u64,
+    expires_secs: u64,
+) -> String {
+    let amz_date = format_iso_basic(now_unix_secs);
+    let date = &amz_date[..8];
+    let mut credential = String::new();
+    aws_encode(format!("{}/{date}/{region}/s3/aws4_request", creds.access_key).as_bytes(), &mut credential);
+    let query = format!(
+        "X-Amz-Algorithm={ALGORITHM}&X-Amz-Credential={credential}&X-Amz-Date={amz_date}&X-Amz-Expires={expires_secs}&X-Amz-SignedHeaders=host"
+    );
+    let headers = [("host".to_string(), host.to_string())];
+    let canonical = canonical_request(method, raw_path, &query, &headers, &["host".to_string()], "UNSIGNED-PAYLOAD")
+        .expect("the query and headers built here are well formed");
+    let d = signature_for(&creds.secret_key, &amz_date, date, region, &canonical);
+    let signature = hex_encode(&hmac(&d.key, d.string_to_sign.as_bytes()));
+    let path = if raw_path.is_empty() { "/" } else { raw_path };
+    format!("{path}?{query}&X-Amz-Signature={signature}")
+}
+
+/// Percent-encodes one path segment as SigV4 expects (unreserved characters kept).
+pub fn encode_segment(segment: &str) -> String {
+    let mut out = String::new();
+    aws_encode(segment.as_bytes(), &mut out);
+    out
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -447,6 +483,17 @@ mod tests {
             ),
         ];
         assert_eq!(verify(&creds(), "GET", "/test.txt", "", &headers, T0), Ok(()));
+    }
+
+    #[test]
+    fn presign_matches_the_aws_documented_example() {
+        // "Authenticating Requests: Using Query Parameters", GET examplebucket/test.txt for 86400 s.
+        let url = presign(&creds(), "GET", "examplebucket.s3.amazonaws.com", "/test.txt", "us-east-1", T0, 86_400);
+        assert!(
+            url.ends_with("&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"),
+            "{url}"
+        );
+        assert!(url.starts_with("/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&"));
     }
 
     #[test]

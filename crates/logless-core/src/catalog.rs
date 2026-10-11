@@ -165,6 +165,20 @@ impl Catalog {
                 service     TEXT    NOT NULL,
                 promoted_at INTEGER NOT NULL
             );
+
+            -- Parquet parts edges uploaded to object storage (`crate::parts`),
+            -- central side. Named by content hash, so a row is never updated.
+            -- Not recoverable from the local store; the bucket listing is its
+            -- source of truth.
+            CREATE TABLE IF NOT EXISTS peer_parts (
+                name          TEXT PRIMARY KEY,
+                size          INTEGER NOT NULL,
+                rows          INTEGER NOT NULL,
+                min_observed  INTEGER NOT NULL,
+                max_observed  INTEGER NOT NULL,
+                origin        TEXT    NOT NULL,
+                committed_ms  INTEGER NOT NULL
+            );
             "#,
         )?;
         // Minted once, with the templates table it qualifies. A lost catalog
@@ -336,6 +350,23 @@ impl Catalog {
                 None => true,
             })
             .collect())
+    }
+
+    /// Records a part an edge uploaded. Returns false when the name was already recorded: a repeated
+    /// commit is a no-op. Waits briefly for the writer, which shares this file.
+    pub fn record_peer_part(&self, part: &crate::parts::CommittedPart, committed_ms: u64) -> Result<bool, CatalogError> {
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO peer_parts (name, size, rows, min_observed, max_observed, origin, committed_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![part.name, part.size as i64, part.rows as i64, part.min_unix_nano as i64, part.max_unix_nano as i64, part.origin, committed_ms as i64],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn peer_part_count(&self) -> Result<u64, CatalogError> {
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM peer_parts", [], |r| r.get(0))?;
+        Ok(n as u64)
     }
 
     pub fn file_count(&self) -> Result<u64, CatalogError> {

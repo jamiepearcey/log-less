@@ -28,8 +28,9 @@ to the running sender with no restart. The console's Admin > Sync screen drives 
 
 `GET /.well-known/logless` returns what the peer is and offers: version, instance id, wire formats, auth, size limit,
 `max_hops`, whether it serves its store over S3, and its clock (so a sender reports skew). It needs the token when the
-peer has tokens, so an unauthenticated probe learns nothing about the build. `query` and `parts` are in the document and
-are `false`: scan pushdown and Parquet-part upload are not built (see below).
+peer has tokens, so an unauthenticated probe learns nothing about the build. `parts` is `true` when the peer presigns
+Parquet part uploads (see "Uploading Parquet parts"). `query` is in the document and is `false`: scan pushdown is not
+built (see below).
 
 ## What flows
 
@@ -118,9 +119,53 @@ already holds, so overlapping a range is safe and only costs bandwidth. Records 
 `logless.supplement = backfill`. It reads committed files, so the last few minutes (not yet merged from the WAL) may be
 missing. The agent pushes: a peer behind another network can be sent a range, but cannot ask for one.
 
+## Uploading Parquet parts
+
+The cold path: an edge copies whole committed Parquet files to the central instance's object storage, without cloud
+keys of its own and without the bytes passing through central. S3-compatible storage only.
+
+```toml
+# On the central instance
+[peer.parts]
+enabled = true
+endpoint = "https://s3.eu-west-2.amazonaws.com"   # http(s)://host[:port]; objects are addressed path-style
+bucket = "logless-parts"
+prefix = "edges"                                  # key prefix, may be empty
+region = "eu-west-2"
+access_key_id = "..."
+secret_access_key = "..."                         # never logged, serialized or returned
+max_part_bytes = 536870912                        # 512 MiB, the default
+url_ttl_secs = 900                                # how long an upload URL works, the default
+```
+
+The capability document says `parts: true` only when this is enabled and complete; an incomplete table is logged (not
+the secret) and the endpoints answer 404. Both endpoints take the same bearer token and body limits as `/v1/ingest`.
+
+| Step | Request | Central does |
+|---|---|---|
+| 1 | `POST /v1/parts/presign {name, size, sha256}` | checks the name is `<64 hex sha256>.parquet` and matches `sha256`, and that `size` is 1 to `max_part_bytes` (422 otherwise); HEADs `<prefix>/<name>`; answers `already_present: true` if an object of that name and size exists, else a presigned PUT `url` valid `url_ttl_secs` and its `expires_at_ms` |
+| 2 | `PUT <url>` (edge to object storage) | nothing: the file goes straight to the bucket |
+| 3 | `POST /v1/parts/commit {name, size, sha256, rows, min_unix_nano, max_unix_nano, origin}` | HEADs the object and needs that size (409 if it is not there), records it in the catalog's `peer_parts` table, answers `{recorded}`; a repeated commit records nothing |
+
+Parts are named by their content, so every step is idempotent: the same file is the same object.
+
+On the edge, `POST /admin/v1/sync/parts {"from_ms", "to_ms"}` starts an upload of the committed files that overlap the
+range, in the background (at most 31 days, one at a time, 409 otherwise; `POST /admin/v1/sync/parts/cancel` stops it).
+It runs only when the peer's capability document says `parts: true`. For each file it computes the sha256, asks for a
+URL, streams the file to it and commits. Progress is `parts` in `GET /admin/v1/sync`: `state`, `files_total`,
+`uploaded`, `skipped` (committed by an earlier run), `already_present` (central had it; committed without uploading),
+`rejected` (refused by central, such as too large), `bytes`, `error`.
+
+* **Resumable.** Each committed file is a line in `parts-uploaded.jsonl` in the data dir, so a rerun or a restart skips
+  it without hashing it again. Losing that file costs a HEAD per part, not an upload.
+* **Retries.** A failed PUT or a central 5xx is retried with backoff (six attempts); a URL that expired or was refused
+  (403) is presigned again at once. Out of attempts, the job stops with an error and the next run carries on.
+* **Edge-triggered.** The edge pushes; central cannot ask for a range. It reads committed files only, so the last few
+  minutes (not yet merged from the WAL) are not included, and a file compacted after upload is a new part with the same
+  rows: a reader of the bucket dedupes on event id, as with records.
+
 ## Not built yet
 
-* **Parquet part upload** (the bulk, cold path with short-lived upload URLs so the edge needs no cloud keys).
 * **Query pushdown** (a filtered scan or partial aggregate answered by the instance). Measure first: the S3 path's bytes
   per query, with `scripts/s3-count-proxy.py` in the console repo, decide whether it pays, and keep the edge under the
   2 to 3 MB budget in `docs/platform-thesis.md` section 15, or ship it as a separate `logless-query` binary.

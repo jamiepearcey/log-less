@@ -482,6 +482,35 @@ impl AdminService {
         }
     }
 
+    /// `POST /admin/v1/sync/parts`: upload the committed Parquet files overlapping a time range to the
+    /// peer's object storage, in the background. Returns the sync document, whose `parts` field shows
+    /// progress.
+    pub fn sync_parts(&self, body: &[u8]) -> Resp {
+        let control = match self.sync_control() {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+        let req: BackfillBody = match serde_json::from_slice(body) {
+            Ok(b) => b,
+            Err(e) => return err(400, "bad_request", format!("the body is not a range ({{\"from_ms\", \"to_ms\"}}): {e}")),
+        };
+        match control.start_parts(req.from_ms, req.to_ms) {
+            Ok(()) => self.sync_get(),
+            Err(m) => (409, json!({"error": "parts_refused", "message": m})),
+        }
+    }
+
+    /// `POST /admin/v1/sync/parts/cancel`.
+    pub fn sync_parts_cancel(&self) -> Resp {
+        match self.sync_control() {
+            Ok(c) => {
+                c.cancel_parts();
+                self.sync_get()
+            }
+            Err(r) => r,
+        }
+    }
+
     /// `POST /admin/v1/sync/test`: asks a peer (the one given, or the current one) what it is.
     pub fn sync_test(&self, body: &[u8]) -> Resp {
         let control = match self.sync_control() {
@@ -1001,6 +1030,8 @@ impl Handler for Api {
             (Method::Post, "/admin/v1/sync/test") => reply(s.sync_test(&req.body)),
             (Method::Post, "/admin/v1/sync/backfill") => reply(s.sync_backfill(&req.body)),
             (Method::Post, "/admin/v1/sync/backfill/cancel") => reply(s.sync_backfill_cancel()),
+            (Method::Post, "/admin/v1/sync/parts") => reply(s.sync_parts(&req.body)),
+            (Method::Post, "/admin/v1/sync/parts/cancel") => reply(s.sync_parts_cancel()),
             (Method::Get, "/admin/v1/policies/history") => match query_limit(req.query) {
                 Ok(n) => reply(s.history(n)),
                 Err(r) => reply(r),
@@ -1017,7 +1048,9 @@ impl Handler for Api {
                 | "/admin/v1/templates/merge-suggestions"
                 | "/admin/v1/sync/test"
                 | "/admin/v1/sync/backfill"
-                | "/admin/v1/sync/backfill/cancel",
+                | "/admin/v1/sync/backfill/cancel"
+                | "/admin/v1/sync/parts"
+                | "/admin/v1/sync/parts/cancel",
             ) => reply(err(405, "method_not_allowed", "wrong method for this path")),
             _ => reply(err(404, "not_found", "no such admin endpoint")),
         }
@@ -2140,6 +2173,31 @@ mod tests {
         assert_eq!(400, r.call("POST", "/admin/v1/sync/backfill", &[], Some(json!({"from_ms": 1}))).0);
         assert_eq!(200, r.call("POST", "/admin/v1/sync/backfill/cancel", &[], None).0);
         assert_eq!(405, r.call("GET", "/admin/v1/sync/backfill", &[], None).0);
+    }
+
+    #[test]
+    fn a_part_upload_needs_a_peer_a_valid_range_one_at_a_time_and_can_be_cancelled() {
+        let r = rig_with_sync();
+        let (status, v) = r.call("POST", "/admin/v1/sync/parts", &[], Some(json!({"from_ms": 0, "to_ms": 10})));
+        assert_eq!(409, status);
+        assert!(v["message"].as_str().unwrap().contains("Set a peer"), "{v}");
+        r.service.sync.get().unwrap().set_store_dir(r.config.store_dir());
+        // A peer that takes the connection and never answers keeps the first job busy probing it.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        r.call("PUT", "/admin/v1/sync", &[], Some(json!({"enabled": true, "url": format!("http://{}", silent.local_addr().unwrap())})));
+        assert_eq!(409, r.call("POST", "/admin/v1/sync/parts", &[], Some(json!({"from_ms": 10, "to_ms": 10}))).0);
+        let (status, v) = r.call("POST", "/admin/v1/sync/parts", &[], Some(json!({"from_ms": 0, "to_ms": 40u64 * 24 * 3_600_000})));
+        assert_eq!(409, status);
+        assert!(v["message"].as_str().unwrap().contains("31 days"), "{v}");
+        assert_eq!(400, r.call("POST", "/admin/v1/sync/parts", &[], Some(json!({"from_ms": 1}))).0);
+        let (status, v) = r.call("POST", "/admin/v1/sync/parts", &[], Some(json!({"from_ms": 0, "to_ms": 3_600_000})));
+        assert_eq!(200, status, "{v}");
+        assert_eq!("running", v["status"]["parts"]["state"], "{v}");
+        let (status, v) = r.call("POST", "/admin/v1/sync/parts", &[], Some(json!({"from_ms": 0, "to_ms": 3_600_000})));
+        assert_eq!(409, status);
+        assert!(v["message"].as_str().unwrap().contains("already running"), "{v}");
+        assert_eq!(200, r.call("POST", "/admin/v1/sync/parts/cancel", &[], None).0);
+        assert_eq!(405, r.call("GET", "/admin/v1/sync/parts", &[], None).0);
     }
 
     /// A decision model that answers "same" when both templates mention redis, over real HTTP.

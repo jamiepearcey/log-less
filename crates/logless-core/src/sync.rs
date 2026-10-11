@@ -136,6 +136,11 @@ impl SyncStore {
     pub fn has_token(&self) -> bool {
         self.load().is_some_and(|(_, t)| t.is_some())
     }
+
+    /// The data dir these files live in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -193,6 +198,8 @@ pub struct SyncStatus {
     /// The most recent anomalies, newest first.
     pub anomalies: Vec<Anomaly>,
     pub backfill: Option<BackfillStatus>,
+    /// A manual upload of a range's Parquet parts (`parts`).
+    pub parts: Option<crate::parts::PartsJobStatus>,
 }
 
 /// A manual fetch of a range: everything in it, sent at full detail.
@@ -225,6 +232,7 @@ pub struct SyncControl {
     /// The sender's intake, so a fetch can feed it (set by `channel`).
     intake: OnceLock<Sender<Item>>,
     backfill_cancel: AtomicBool,
+    parts_cancel: Arc<AtomicBool>,
 }
 
 /// What the tap hands the sender.
@@ -248,6 +256,7 @@ impl SyncControl {
             store_dir: OnceLock::new(),
             intake: OnceLock::new(),
             backfill_cancel: AtomicBool::new(false),
+            parts_cancel: Arc::new(AtomicBool::new(false)),
         });
         control.set_target(initial);
         control
@@ -458,6 +467,58 @@ impl SyncControl {
 
     pub fn cancel_backfill(&self) {
         self.backfill_cancel.store(true, Ordering::Release);
+    }
+
+    /// Starts uploading the committed Parquet files that overlap `[from_ms, to_ms)` to the peer's object
+    /// storage (`parts`), on a background thread. Needs a peer whose capability document says
+    /// `parts: true`; files an earlier run committed are skipped.
+    pub fn start_parts(self: &Arc<Self>, from_ms: u64, to_ms: u64) -> Result<(), String> {
+        self.start_parts_with(from_ms, to_ms, crate::parts::Tuning::default())
+    }
+
+    pub(crate) fn start_parts_with(self: &Arc<Self>, from_ms: u64, to_ms: u64, tuning: crate::parts::Tuning) -> Result<(), String> {
+        if to_ms <= from_ms {
+            return Err("The end of the range must be after its start.".into());
+        }
+        if to_ms - from_ms > 31 * 24 * 3_600_000 {
+            return Err("An upload covers at most 31 days at a time.".into());
+        }
+        let Some(target) = self.target() else {
+            return Err("Set a peer and turn sync on before uploading parts.".into());
+        };
+        let Some(dir) = self.store_dir.get().cloned() else {
+            return Err("This process cannot read its store for an upload.".into());
+        };
+        {
+            let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+            if status.parts.as_ref().is_some_and(|p| p.state == "running") {
+                return Err("An upload is already running. Cancel it or wait for it to finish.".into());
+            }
+            status.parts = Some(crate::parts::PartsJobStatus::starting(from_ms, to_ms));
+        }
+        self.parts_cancel.store(false, Ordering::Release);
+        let control = Arc::clone(self);
+        let cancel = Arc::clone(&self.parts_cancel);
+        std::thread::Builder::new()
+            .name("logless-parts".into())
+            .spawn(move || {
+                let state_dir = control.store.dir().to_path_buf();
+                crate::parts::run_job(&control, &target, &dir, &state_dir, from_ms, to_ms, tuning, &cancel);
+            })
+            .map_err(|e| format!("could not start the upload: {e}"))?;
+        Ok(())
+    }
+
+    pub fn cancel_parts(&self) {
+        self.parts_cancel.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn update_parts(&self, f: impl FnOnce(&mut crate::parts::PartsJobStatus)) {
+        self.update(|s| {
+            if let Some(p) = s.parts.as_mut() {
+                f(p);
+            }
+        });
     }
 }
 
