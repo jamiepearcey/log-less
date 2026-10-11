@@ -845,7 +845,10 @@ fn a_receiver_whose_wal_never_syncs_never_moves_the_senders_cursor() {
     let node = start_node("edge", edge_dir.path(), Some(dying.target()));
     let (mut ids, mut next) = (HashSet::new(), 0);
     offer_records(&node, 2, 25, &mut ids, &mut next);
-    wait_until("the sender to have been refused twice", Duration::from_secs(30), || dying.receiver().stats().wal_timeouts >= 2);
+    // The receiver counts a timeout before its 503 reaches the sender, so wait for both sides to have counted it.
+    wait_until("the sender to have been refused twice", Duration::from_secs(30), || {
+        dying.receiver().stats().wal_timeouts >= 2 && node.control.status().busy_answers >= 2
+    });
     let before_crash = node.control.status();
     assert_eq!(0, before_crash.sent_records, "no 200 for a batch the WAL never synced: {before_crash:?}");
     assert!(before_crash.backlog_bytes > 0, "the cursor did not move: the batch is still pending");

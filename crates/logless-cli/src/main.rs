@@ -1002,7 +1002,7 @@ fn run(
                     // number a HEC ack is judged against and a peer request
                     // waits on, so it must mean "on disk", not "appended".
                     if w.maybe_sync()? {
-                        synced.publish(w.records_written);
+                        synced.publish(w.synced_records());
                     }
                     if stop.load(Ordering::Relaxed) && batch.is_empty() {
                         let tail = consumer.drain();
