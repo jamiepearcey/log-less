@@ -930,13 +930,18 @@ fn serve(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(signal, Arc::clone(&stop))?;
     }
-    let server = s3_serve::S3Server::start_with_parts(&config.serve_s3, config.store_dir(), config.peer.parts.local_dir(&config.storage.data_dir))?;
+    // The same readers as under `logless run`: the store's own key pair, the `[[principals]]` readers, and
+    // the temporary credentials of broker tokens, checked under the key in the data dir (`docs/auth.md`).
+    let verifier = logless_core::auth::Verifier::from_config(config, Arc::new(config.tenancy()?), Arc::new(config::RouteStats::default()))?;
+    let _auth_refresh = verifier.start_refresh();
+    let server = s3_serve::S3Server::start_with_auth(&config.serve_s3, config.store_dir(), config.peer.parts.local_dir(&config.storage.data_dir), Arc::clone(&verifier))?;
     tracing::info!(addr = %server.local_addr(), bucket = %config.serve_s3.bucket, "s3 serve listening (read-only)");
     while !stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(200));
     }
     let s = server.stats();
     server.shutdown();
+    verifier.stop_refresh();
     tracing::info!(
         requests = s.requests,
         range_requests = s.range_requests,
@@ -1365,7 +1370,7 @@ fn run(
     let mut hec_summary: Option<hec::StatsSnapshot> = None;
 
     let mut s3_server = if config.serve_s3.enabled {
-        let server = s3_serve::S3Server::start_with_parts(&config.serve_s3, config.store_dir(), config.peer.parts.local_dir(&config.storage.data_dir))?;
+        let server = s3_serve::S3Server::start_with_auth(&config.serve_s3, config.store_dir(), config.peer.parts.local_dir(&config.storage.data_dir), Arc::clone(&verifier))?;
         tracing::info!(addr = %server.local_addr(), "s3 serve listening (read-only)");
         Some(server)
     } else {
@@ -2728,6 +2733,22 @@ mod tests {
         let hex = "0123456789abcdef0123456789abcdef";
         let r = parse_line(&format!("INFO\ttrace_id={hex} msg x"));
         assert_eq!(r.trace_id.unwrap(), u128::from_str_radix(hex, 16).unwrap().to_be_bytes());
+    }
+
+    #[test]
+    fn a_line_on_stdin_or_in_a_tailed_file_cannot_name_a_tenant_or_an_index() {
+        // Both sources go through `parse_line`, which makes a `request_id` attribute and no other: what a
+        // line says about `logless.tenant` stays text in its body. Only a listener sets that attribute,
+        // from the principal (`auth::Verifier::admit`), so these records are the instance's own tenant.
+        for line in [
+            "INFO\tlogless.tenant=acme logless.index=payments service=api hello",
+            "logless.tenant=acme",
+            "ERROR\ttenant=acme request_id=logless.tenant session_id=acme",
+            "{\"logless.tenant\":\"acme\",\"attributes\":[{\"key\":\"logless.tenant\",\"value\":\"acme\"}]}",
+        ] {
+            let r = parse_line(line);
+            assert!(r.attributes.iter().all(|a| a.key == "request_id"), "{line}: {:?}", r.attributes);
+        }
     }
 
     #[test]

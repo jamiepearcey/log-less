@@ -210,6 +210,10 @@ fn each_kind_of_credential_on_each_route_is_let_in_or_refused() {
             let auth = bearer(c);
             status(peer, "GET", crate::parts::REPLICA_CATALOG_PATH, &auth.iter().map(|a| ("Authorization", a.as_str())).collect::<Vec<_>>(), b"")
         })),
+        ("peer POST /v1/auth/s3-credentials", Op::S3Credentials, Box::new(|c| {
+            let auth = bearer(c);
+            status(peer, "POST", crate::peer::S3_CREDENTIALS_PATH, &auth.iter().map(|a| ("Authorization", a.as_str())).collect::<Vec<_>>(), b"")
+        })),
         ("hec POST /services/collector", Op::Ingest, Box::new(|c| {
             let auth = c.map(|c| format!("Splunk {c}"));
             status(rig.hec.local_addr(), "POST", "/services/collector", &auth.iter().map(|a| ("Authorization", a.as_str())).collect::<Vec<_>>(), hec_event)
@@ -246,7 +250,7 @@ fn each_kind_of_credential_on_each_route_is_let_in_or_refused() {
             checked += 1;
         }
     }
-    assert_eq!(8 * 14, checked);
+    assert_eq!(9 * 14, checked);
 
     // Everything that was let in to an ingest route was stored under its principal's tenant: the four
     // ingest and node credentials are all acme's.
@@ -436,4 +440,107 @@ fn a_listener_with_nothing_configured_is_open_on_loopback_as_before_and_closed_a
     assert!(matches!(crate::admin_api::AdminServer::start_with_auth(&admin, admin_service(tmp.path()), Arc::clone(&with_principal)).err(), Some(crate::admin_api::AdminError::MissingToken)));
     let with_admin = Builder::new(Arc::new(Tenancy::default())).principals(&[principal("ops", Kind::Admin, None, K_ADMIN)]).unwrap().build();
     crate::admin_api::AdminServer::start_with_auth(&admin, admin_service(tmp.path()), with_admin).unwrap().shutdown();
+}
+
+#[test]
+fn a_broker_token_is_traded_for_s3_credentials_of_its_own_tenant_and_nobody_elses() {
+    let rig = rig();
+    let peer = rig.peer.local_addr();
+    let trade = |token: &str, body: &[u8]| {
+        let auth = format!("Bearer {token}");
+        let (status, text) = exchange(peer, &request("POST", crate::peer::S3_CREDENTIALS_PATH, &[("Authorization", &auth), ("Content-Type", "application/json")], body), WAIT);
+        let json = text.split_once("\r\n\r\n").and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b).ok()).unwrap_or_default();
+        (status, json, text)
+    };
+    let now = crate::now_unix_secs();
+
+    // A person of tenant acme, whose token has ten minutes left: the credentials are acme's, end with the
+    // token (the instance would give an hour), and the reply is not to be cached.
+    let mut claims = claims("user", "acme", "x", now);
+    claims.as_object_mut().unwrap().remove("name");
+    claims["sub"] = "alice@example.test".into();
+    claims["exp"] = (now + 600).into();
+    claims["indexes"] = serde_json::json!(["payments"]);
+    let alice = rig.signer.sign(&claims);
+    let (code, json, text) = trade(&alice, b"");
+    assert_eq!(200, code, "{text}");
+    assert_eq!((json["tenant"].as_str(), json["indexes"].clone(), json["expires_unix_secs"].as_u64()), (Some("acme"), serde_json::json!(["payments"]), Some(now + 600)));
+    assert!(json["access_key_id"].as_str().unwrap().starts_with(TEMP_KEY_PREFIX) && json["expires_at"].as_str().unwrap().ends_with('Z'));
+    assert!(text.to_ascii_lowercase().contains("cache-control: no-store"), "{text}");
+    let (who, creds) = rig.verifier.s3_session(json["session_token"].as_str().unwrap(), now).unwrap();
+    assert_eq!((who.id.as_str(), who.tenant.as_str(), who.kind), ("alice@example.test", "acme", Kind::User));
+    assert_eq!(Some(creds.secret_key.as_str()), json["secret_access_key"].as_str());
+    let scope = ReadScope::of(&who);
+    assert!(scope.allows("tenant=acme/index=payments/x.parquet") && !scope.allows("tenant=acme/index=default/x.parquet") && !scope.allows("tenant=default/index=default/x.parquet"));
+
+    // The request cannot ask for more: a body, a query or a header naming another tenant changes nothing.
+    for (path, body) in [(crate::peer::S3_CREDENTIALS_PATH.to_string(), br#"{"tenant":"default","indexes":["*"]}"#.to_vec()), (format!("{}?tenant=default", crate::peer::S3_CREDENTIALS_PATH), Vec::new())] {
+        let auth = format!("Bearer {alice}");
+        let (code, text) = exchange(peer, &request("POST", &path, &[("Authorization", &auth), ("X-Tenant", "default"), ("Content-Type", "application/json")], &body), WAIT);
+        assert_eq!(200, code, "{path}");
+        let json: serde_json::Value = serde_json::from_str(text.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!((json["tenant"].as_str(), json["indexes"].clone()), (Some("acme"), serde_json::json!(["payments"])), "{path}");
+    }
+
+    // A reading service's machine token is traded the same way; the instance's own hour is the limit.
+    let (code, json, _) = trade(&rig.token("reader", "default", "reporting"), b"");
+    assert_eq!((200, Some("default"), serde_json::json!(["*"])), (code, json["tenant"].as_str(), json["indexes"].clone()));
+    assert!(json["expires_unix_secs"].as_u64().unwrap() <= crate::now_unix_secs() + 3600);
+
+    // Refused: a tenant this instance does not have, kinds that do not read, a static key, an expired
+    // token, one inside the clock allowance past its expiry (nothing left to give), and no token.
+    let mut late = claims.clone();
+    late["exp"] = (now - 100).into();
+    late["iat"] = (now - 4000).into();
+    let mut expired = claims.clone();
+    expired["exp"] = (now - 4000).into();
+    expired["iat"] = (now - 8000).into();
+    for (what, token) in [
+        ("another instance's tenant", rig.token("reader", "globex", "ro-9")),
+        ("an ingest token", rig.token("ingest", "acme", "svc-1")),
+        ("an admin token", rig.token("admin", "default", "ops-2")),
+        ("a static ingest key", K_INGEST.to_string()),
+        ("a static reader key", K_READER.to_string()),
+        ("an expired token", rig.signer.sign(&expired)),
+        ("a token past its expiry, inside the allowance", rig.signer.sign(&late)),
+    ] {
+        let (code, json, _) = trade(&token, b"");
+        assert_eq!(403, code, "{what}");
+        assert!(json.get("secret_access_key").is_none(), "{what}");
+    }
+    assert_eq!(401, status(peer, "POST", crate::peer::S3_CREDENTIALS_PATH, &[], b""));
+    assert_eq!(404, status(peer, "GET", crate::peer::S3_CREDENTIALS_PATH, &[], b""), "POST only");
+
+    let auth = rig.verifier.status();
+    assert_eq!(auth["s3_credentials"]["issued"].as_u64(), Some(4), "three for alice and one for the service; nothing for a refusal");
+    let text = auth.to_string();
+    assert!(!text.contains(json_secret(&trade(&alice, b"").1)), "a secret in status");
+    rig.shutdown();
+}
+
+fn json_secret(json: &serde_json::Value) -> &str {
+    json["secret_access_key"].as_str().unwrap()
+}
+
+#[test]
+fn a_person_with_the_admin_role_is_still_not_an_operator() {
+    // The admin API opens for kind `admin` and nothing else. A role on a user token is carried and shown,
+    // not interpreted (ADR 0004): making a person an operator of this instance is not the broker's to do.
+    let rig = rig();
+    let mut claims = claims("user", "default", "x", crate::now_unix_secs());
+    let o = claims.as_object_mut().unwrap();
+    o.remove("name");
+    o.remove("scopes");
+    o.insert("sub".into(), "root@example.test".into());
+    o.insert("roles".into(), serde_json::json!(["admin", "owner"]));
+    let token = rig.signer.sign(&claims);
+    let auth = format!("Bearer {token}");
+    for (method, path) in [("GET", "/admin/v1/info"), ("GET", "/admin/v1/policy"), ("POST", "/admin/v1/retention/run")] {
+        assert_eq!(401, status(rig.admin.local_addr(), method, path, &[("Authorization", &auth), ("Content-Type", "application/json")], b"{}"), "{method} {path}");
+    }
+    let p = rig.verifier.verify(Listener::Admin, &token).unwrap();
+    assert_eq!((p.kind, p.roles.clone()), (Kind::User, vec!["admin".to_string(), "owner".to_string()]));
+    assert_eq!(200, status(rig.admin.local_addr(), "GET", "/admin/v1/info", &[("Authorization", &format!("Bearer {K_ADMIN}"))], b""));
+    assert_eq!(200, status(rig.admin.local_addr(), "GET", "/admin/v1/info", &[("Authorization", &format!("Bearer {}", rig.token("admin", "default", "ops-2")))], b""), "a broker token of kind admin is an operator's");
+    rig.shutdown();
 }

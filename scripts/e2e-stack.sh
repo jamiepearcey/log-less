@@ -6,7 +6,7 @@
 # second edge (node edge-3, upload timer on, nothing sent but parts) then has central frozen and stopped in the middle
 # of its uploads and started again (no part lost, none duplicated), and its files removed by disk pressure (retired).
 # A third instance with two tenants takes records under `[[principals]]` keys: each lands under its key's tenant, and
-# a write that names another tenant is refused.
+# a write that names another tenant is refused. Its store is then read over S3 by a reader scoped to one tenant.
 # Prints a PASS/FAIL table and exits 1 if any check failed. Everything runs on random free ports in a throwaway
 # directory, with random credentials, and is removed on exit (KEEP=1 keeps the directory).
 #
@@ -754,8 +754,9 @@ check "the late spool exists and is drained" "$( [ -d "$R/edge/data/wal-late" ] 
 # A third instance with two tenants and `[[principals]]` keys (docs/auth.md): a key decides the tenant its records
 # are stored under, nothing in a request can name another, and status names the principal and never the key. Its
 # listeners are on loopback and closed with `require_auth`, as a multi-tenant central would run them.
-T_PEER=$(free_port); T_HEC=$(free_port); T_ADMIN=$(free_port)
+T_PEER=$(free_port); T_HEC=$(free_port); T_ADMIN=$(free_port); T_S3=$(free_port)
 ACME_KEY="$(rand 24)"; OWN_KEY="$(rand 24)"; T_TOKEN="$(rand 24)"
+ACME_RO_KEY="$(rand 24)"; T_S3_KEY="$(rand 24)"   # a reader of tenant acme, and the store's own key pair
 N_ACME=7; N_OWN=3
 mkdir -p "$R/tenants"; : > "$R/tenants/empty.log"
 render_config "$R/tenants/data" "
@@ -769,9 +770,18 @@ hec|require_auth|true
 admin|enabled|true
 admin|addr|\"127.0.0.1:$T_ADMIN\"
 admin|token|\"$T_TOKEN\"
+serve_s3|addr|\"127.0.0.1:$T_S3\"
+serve_s3|access_key|\"e2e-operator\"
+serve_s3|secret_key|\"$T_S3_KEY\"
 " "
 [[tenants]]
 id = \"acme\"
+
+[[principals]]
+id = \"acme-ro\"
+kind = \"reader\"
+tenant = \"acme\"
+key = \"$ACME_RO_KEY\"
 
 [[principals]]
 id = \"acme-app\"
@@ -815,6 +825,29 @@ if wait_http "http://127.0.0.1:$T_ADMIN/" 30 && wait_http "http://127.0.0.1:$T_H
   acme_files=$(find "$R/tenants/data/store/tenant=acme/index=default" -name '*.parquet' 2>/dev/null | wc -l | tr -d ' ')
   check "a [[principals]] key stores under its own tenant's path" "$( [ "$acme_sent" = 200 ] && [ "$own_sent" = 200 ] && [ "$placed" = "acme,e2e-acme,$N_ACME default,e2e-own,$N_OWN " ] && [ "$acme_files" -ge 1 ] && [ "$t_stop" = 1 ] && echo 1 || echo 0)" \
     "acme key -> $acme_sent, own-tenant key (configured hashed) -> $own_sent; rows by tenant and service: $placed; files under tenant=acme/index=default/: $acme_files"
+
+  # The same store over S3 (`logless serve`): the reader of tenant acme globs the whole bucket and gets acme's rows
+  # only, is refused a path of the other tenant, and the store's own key pair still reads everything.
+  "$LOGLESS_BIN" serve --config "$R/tenants/config.toml" > "$R/tenants/serve.log" 2>&1 &
+  TS_PID=$!; PIDS="$PIDS $TS_PID"
+  wait_http "http://127.0.0.1:$T_S3/" 30
+  s3_as() { # key id, secret, sql -> DuckDB's answer (or its error) on one line
+    "$DUCKDB_BIN" -noheader -csv -c "LOAD httpfs; CREATE SECRET (TYPE s3, KEY_ID '$1', SECRET '$2', ENDPOINT '127.0.0.1:$T_S3', URL_STYLE 'path', USE_SSL false, REGION 'us-east-1'); $3" 2>&1 | grep -v '^true$' | tr '\n' ' ' | sed 's/ *$//'
+  }
+  ALL_ROWS="select string_agg(tenant || ':' || n, ' ' order by tenant) from (select tenant, count(*) n from read_parquet('s3://logs/**/*.parquet', hive_partitioning = true, union_by_name = true) group by 1)"
+  ro_all=$(s3_as acme-ro "$ACME_RO_KEY" "$ALL_ROWS")
+  ro_dict=$(s3_as acme-ro "$ACME_RO_KEY" "select count(distinct 1) from read_parquet('s3://logs/tenant=acme/index=default/_meta/templates/*.pq')")
+  other_file=$(cd "$R/tenants/data/store" && find tenant=default -name '*.parquet' | head -1)
+  ro_other=$(s3_as acme-ro "$ACME_RO_KEY" "select count(*) from read_parquet('s3://logs/$other_file')")
+  ro_other_glob=$(s3_as acme-ro "$ACME_RO_KEY" "select count(*) from read_parquet('s3://logs/tenant=default/**/*.parquet')")
+  check "a reader of one tenant reads that tenant only" "$( [ "$ro_all" = "acme:$N_ACME" ] && [ "$ro_dict" = 1 ] && grep -q 403 <<< "$ro_other" && grep -qi 'no files found' <<< "$ro_other_glob" && echo 1 || echo 0)" \
+    "acme-ro over s3://logs/**: '$ro_all'; its dictionary read: $ro_dict; a file of tenant default: $(grep -o '403[^)]*)' <<< "$ro_other" | head -1); a glob of tenant default: $(grep -oi 'no files found' <<< "$ro_other_glob" | head -1)"
+  op_all=$(s3_as e2e-operator "$T_S3_KEY" "$ALL_ROWS")
+  wrong=$(s3_as acme-ro "$T_S3_KEY" "$ALL_ROWS")
+  s3_leaked=$(grep -c -e "$ACME_RO_KEY" -e "$T_S3_KEY" "$R/tenants/serve.log" "$R/tenants/agent.log" "$R/tenants/info.json" | awk -F: '{n += $2} END {print n}')
+  stop_within "$TS_PID" 10
+  check "the store's own key pair still reads every tenant" "$( [ "$op_all" = "acme:$N_ACME default:$N_OWN" ] && grep -q 403 <<< "$wrong" && [ "$s3_leaked" = 0 ] && echo 1 || echo 0)" \
+    "operator over s3://logs/**: '$op_all'; the reader's id with the operator's secret: $(grep -o '403[^)]*)' <<< "$wrong" | head -1); reader keys in a log or info: $s3_leaked"
 else
   check "a [[principals]] key stores under its own tenant's path" 0 "the instance did not start: $(tail -1 "$R/tenants/agent.log" | cut -c1-200)"
 fi

@@ -35,6 +35,9 @@ use sha2::{Digest, Sha256};
 use crate::config::{RouteStats, Tenancy, UnknownIndex, ATTR_INDEX};
 use crate::model::{Attr, AttrValue, LogRecord};
 
+mod s3;
+pub use s3::{ReadScope, S3Credentials, Sessions, SESSION_KEY_FILE, SESSION_TOKEN_HEADER, TEMP_KEY_PREFIX};
+
 /// The record attribute that carries the tenant from the listener to the merge, for a record of a
 /// tenant other than the instance's own. Set only by [`Verifier::admit`], from the principal; a value
 /// the sender put there is checked against the principal and never believed. It is a directory in the
@@ -57,6 +60,9 @@ const MAX_TOKEN_LEN: usize = 8 * 1024;
 /// Principals with their own row of counters; past it the rest share one row.
 const MAX_COUNTED_PRINCIPALS: usize = 1024;
 const CLOCK_DRIFT_WARN_SECS: u64 = 30;
+/// Longest life `[auth] s3_credentials_ttl_secs` may give a temporary S3 credential: twelve hours, the
+/// most AWS STS gives a session.
+pub const MAX_S3_CREDENTIALS_TTL_SECS: u64 = 12 * 3600;
 
 /// What a principal is, which decides what it may do ([`Kind::may`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -109,7 +115,7 @@ impl Kind {
                 | (Kind::Replica, Op::Replica)
                 | (Kind::Admin, Op::Admin)
                 | (Kind::Reader, Op::Read)
-                | (Kind::User, Op::S3Credentials)
+                | (Kind::User | Kind::Reader, Op::S3Credentials)
         )
     }
 }
@@ -127,7 +133,7 @@ pub enum Op {
     Admin,
     /// Read the store over S3 with a static reader key.
     Read,
-    /// Trade a user token for temporary S3 credentials.
+    /// Trade a broker token (a person's, or a reading service's) for temporary S3 credentials.
     S3Credentials,
 }
 
@@ -197,6 +203,8 @@ pub enum Source {
     Token,
     /// No credential, on a listener that asks for none (loopback).
     Anonymous,
+    /// A temporary S3 credential this instance issued for a broker token.
+    Session,
 }
 
 impl Source {
@@ -205,6 +213,7 @@ impl Source {
             Source::Static => "static",
             Source::Token => "token",
             Source::Anonymous => "anonymous",
+            Source::Session => "s3-session",
         }
     }
 }
@@ -305,6 +314,10 @@ pub struct AuthConfig {
     /// Allowance on `exp` and `iat`, either way.
     #[serde(default = "default_clock_skew")]
     pub clock_skew_secs: u64,
+    /// How long the temporary S3 credentials of `POST /v1/auth/s3-credentials` last, at most: one never
+    /// outlives the token it was issued for.
+    #[serde(default = "default_s3_credentials_ttl")]
+    pub s3_credentials_ttl_secs: u64,
 }
 
 fn default_audience() -> String {
@@ -313,10 +326,13 @@ fn default_audience() -> String {
 fn default_clock_skew() -> u64 {
     300
 }
+fn default_s3_credentials_ttl() -> u64 {
+    3600
+}
 
 impl Default for AuthConfig {
     fn default() -> Self {
-        Self { issuer: None, audience: default_audience(), jwks_url: None, jwks_file: None, clock_skew_secs: default_clock_skew() }
+        Self { issuer: None, audience: default_audience(), jwks_url: None, jwks_file: None, clock_skew_secs: default_clock_skew(), s3_credentials_ttl_secs: default_s3_credentials_ttl() }
     }
 }
 
@@ -355,10 +371,12 @@ pub enum Refusal {
     NodeMismatch,
     /// A record that names a tenant other than its principal's.
     WrongTenant,
+    /// A read of a part of the store outside the reader's tenant and indexes.
+    Scope,
 }
 
 impl Refusal {
-    const ALL: [Refusal; 15] = [
+    const ALL: [Refusal; 16] = [
         Refusal::Missing,
         Refusal::UnknownKey,
         Refusal::Malformed,
@@ -374,6 +392,7 @@ impl Refusal {
         Refusal::Kind,
         Refusal::NodeMismatch,
         Refusal::WrongTenant,
+        Refusal::Scope,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -393,6 +412,7 @@ impl Refusal {
             Refusal::Kind => "kind",
             Refusal::NodeMismatch => "node_mismatch",
             Refusal::WrongTenant => "wrong_tenant",
+            Refusal::Scope => "scope",
         }
     }
 
@@ -449,6 +469,9 @@ pub fn check_config(auth: &AuthConfig, principals: &[PrincipalConfig], tenancy: 
     if auth.audience.trim().is_empty() {
         return Err("[auth] audience must not be empty".into());
     }
+    if !(1..=MAX_S3_CREDENTIALS_TTL_SECS).contains(&auth.s3_credentials_ttl_secs) {
+        return Err(format!("[auth] s3_credentials_ttl_secs must be 1 to {MAX_S3_CREDENTIALS_TTL_SECS}"));
+    }
     Ok(())
 }
 
@@ -491,12 +514,13 @@ pub struct Builder {
     readers: Vec<(Arc<Principal>, String)>,
     routes: Arc<RouteStats>,
     jwt: Option<Jwt>,
+    sessions: Option<(Sessions, u64)>,
     route_indexes: bool,
 }
 
 impl Builder {
     pub fn new(tenancy: Arc<Tenancy>) -> Self {
-        Self { tenancy, statics: HashMap::new(), readers: Vec::new(), routes: Arc::new(RouteStats::default()), jwt: None, route_indexes: true }
+        Self { tenancy, statics: HashMap::new(), readers: Vec::new(), routes: Arc::new(RouteStats::default()), jwt: None, sessions: None, route_indexes: true }
     }
 
     /// For a listener started on its own, outside the agent (a test, a tool): the single tenant
@@ -621,6 +645,10 @@ impl Builder {
             if self.statics.contains_key(&key_digest) || self.readers.iter().any(|(_, secret)| digest(secret) == key_digest) {
                 return bad(format!("{:?} has the same key as another credential; every principal needs its own", c.id));
             }
+            // A reader is found by its id, the S3 access key id: two with one id would be one of them, by luck.
+            if c.kind == Kind::Reader && (self.readers.iter().any(|(p, _)| p.id == c.id) || c.id.starts_with(TEMP_KEY_PREFIX)) {
+                return bad(format!("reader {:?} has the id of the [serve_s3] access key, or starts with {TEMP_KEY_PREFIX} (kept for temporary credentials); give it another", c.id));
+            }
             let principal = Principal {
                 id: c.id.clone(),
                 kind: c.kind,
@@ -664,6 +692,10 @@ impl Builder {
             jwt.refresh(crate::now_unix_secs());
         }
         self.jwt = Some(jwt);
+        // The key of the temporary S3 credentials is made only where they can be asked for: an instance
+        // without `[auth]` writes no file.
+        let sessions = data_dir.map(Sessions::open).unwrap_or_else(Sessions::in_memory);
+        self.sessions = Some((sessions, config.s3_credentials_ttl_secs.clamp(1, MAX_S3_CREDENTIALS_TTL_SECS)));
         Ok(self)
     }
 
@@ -685,6 +717,8 @@ impl Builder {
             readers: self.readers,
             anonymous,
             jwt: self.jwt,
+            sessions: self.sessions,
+            s3_credentials_issued: AtomicU64::new(0),
             routes: self.routes,
             route_indexes: self.route_indexes,
             refused: Default::default(),
@@ -705,6 +739,10 @@ pub struct Verifier {
     readers: Vec<(Arc<Principal>, String)>,
     anonymous: Arc<Principal>,
     jwt: Option<Jwt>,
+    /// The key the temporary S3 credentials are made and checked under, and how long one lasts. Present
+    /// exactly when `[auth]` names a broker.
+    sessions: Option<(Sessions, u64)>,
+    s3_credentials_issued: AtomicU64,
     routes: Arc<RouteStats>,
     /// False only for [`Builder::standalone`]: `admit` then binds the tenant and leaves the index alone.
     route_indexes: bool,
@@ -753,6 +791,47 @@ impl Verifier {
     /// The S3 readers: access key id (the principal id), principal, signing secret.
     pub fn readers(&self) -> impl Iterator<Item = (&Arc<Principal>, &str)> {
         self.readers.iter().map(|(p, secret)| (p, secret.as_str()))
+    }
+
+    /// The reader whose S3 access key id is `access_key_id`, with the secret its requests are signed with.
+    pub fn s3_reader(&self, access_key_id: &str) -> Option<(&Arc<Principal>, &str)> {
+        self.readers().find(|(p, _)| p.id == access_key_id)
+    }
+
+    /// Whether temporary S3 credentials can be issued and checked here: `[auth]` names a broker.
+    pub fn s3_sessions_enabled(&self) -> bool {
+        self.sessions.is_some()
+    }
+
+    /// Temporary S3 credentials for the holder of a broker token: scoped to the token's tenant and
+    /// indexes, and good for `[auth] s3_credentials_ttl_secs` or until the token expires, whichever is
+    /// sooner. Nothing is stored (`auth::s3`). The caller has already checked the principal's kind
+    /// ([`Op::S3Credentials`]).
+    pub fn issue_s3_credentials(&self, principal: &Principal, now_unix_secs: u64) -> Result<S3Credentials, Refusal> {
+        let Some((sessions, ttl)) = self.sessions.as_ref().filter(|_| principal.source == Source::Token) else {
+            return Err(Refusal::UnknownKey);
+        };
+        let expires = principal.expires_unix_secs.unwrap_or(u64::MAX).min(now_unix_secs.saturating_add(*ttl));
+        if expires <= now_unix_secs {
+            // A token inside the clock allowance past its `exp`: still a token, no time left to give.
+            return Err(Refusal::Expired);
+        }
+        self.s3_credentials_issued.fetch_add(1, Ordering::Relaxed);
+        self.count(principal, |c| c.requests += 1);
+        Ok(sessions.issue(principal, expires))
+    }
+
+    /// Who the session token of an S3 request is, and the key pair the request must be signed with.
+    pub fn s3_session(&self, session_token: &str, now_unix_secs: u64) -> Result<(Arc<Principal>, crate::s3_sigv4::Credentials), Refusal> {
+        match &self.sessions {
+            Some((sessions, _)) => sessions.verify(session_token, now_unix_secs),
+            None => Err(Refusal::UnknownKey),
+        }
+    }
+
+    /// Counts one S3 request of `principal`.
+    pub fn count_read(&self, principal: &Principal) {
+        self.count(principal, |c| c.requests += 1);
     }
 
     /// Who `presented` is at `listener`, at the current time. A static key first (one hash and one map
@@ -977,6 +1056,8 @@ impl Verifier {
                     "tenant": p.tenant,
                     "indexes": p.indexes.to_json(),
                     "listener": p.only_at.map(Listener::as_str),
+                    // For a reader: the key prefixes of the store it may read (`""` is all of it).
+                    "reads": (p.kind == Kind::Reader).then(|| ReadScope::of(p).to_json()),
                 })
             })
             .collect();
@@ -986,6 +1067,12 @@ impl Verifier {
             "seen": seen,
             "refused": refused,
             "broker": self.jwt.as_ref().map(|j| j.status(now)),
+            "s3_credentials": self.sessions.as_ref().map(|(sessions, ttl)| serde_json::json!({
+                "ttl_secs": ttl,
+                "issued": self.s3_credentials_issued.load(Ordering::Relaxed),
+                // False: the key is in memory only, and a restart ends every credential issued.
+                "key_persisted": sessions.persisted(),
+            })),
         })
     }
 
@@ -1379,6 +1466,10 @@ pub(crate) mod testing {
         out
     }
 
+    pub fn unb64(text: &str) -> Vec<u8> {
+        b64url(text).unwrap()
+    }
+
     pub struct Signer {
         pair: ring::signature::Ed25519KeyPair,
         pub kid: String,
@@ -1432,7 +1523,13 @@ pub(crate) mod testing {
     pub fn with_broker(builder: Builder, signer: &Signer) -> Builder {
         let jwt = Jwt::new(ISSUER, "logless", 300, None, None);
         jwt.keys.write().unwrap().keys = parse_jwks(signer.jwks().as_bytes()).unwrap();
-        Builder { jwt: Some(jwt), ..builder }
+        Builder { jwt: Some(jwt), sessions: Some((Sessions::in_memory(), 3600)), ..builder }
+    }
+
+    /// As [`with_broker`], with the temporary S3 credentials kept under the key in `data_dir` and good
+    /// for `ttl` seconds.
+    pub fn with_broker_in(builder: Builder, signer: &Signer, data_dir: &Path, ttl: u64) -> Builder {
+        Builder { sessions: Some((Sessions::open(data_dir), ttl)), ..with_broker(builder, signer) }
     }
 }
 
@@ -1820,7 +1917,7 @@ mod tests {
             (Kind::Node, [true, true, false, false, false, false]),
             (Kind::Replica, [false, false, true, false, false, false]),
             (Kind::Admin, [false, false, false, true, false, false]),
-            (Kind::Reader, [false, false, false, false, true, false]),
+            (Kind::Reader, [false, false, false, false, true, true]),
             (Kind::User, [false, false, false, false, false, true]),
         ];
         for (kind, row) in table {

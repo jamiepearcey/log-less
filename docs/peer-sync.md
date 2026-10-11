@@ -20,6 +20,12 @@ fidelity = 100                        # 1 to 100: see "How much is sent"
 anomaly_boost = true                  # send extra detail by itself when something unusual happens
 ```
 
+`tokens` is the simple form and stays: each entry is read as an ingest principal of the central's own tenant. A
+central with more than one tenant gives each sender a `[[principals]]` key (or a session-broker token) bound to its
+tenant, presented the same way (`token = "..."` on the edge, `Authorization: Bearer` on the wire); the tenant its
+records are stored under is the credential's, never the request's. Kinds, tenants, tokens and the
+`POST /v1/auth/s3-credentials` route this listener also serves are in [auth.md](auth.md).
+
 The admin API (`GET`/`PUT /admin/v1/sync`, `POST /admin/v1/sync/test`) edits the same setting at run time. Its copy
 is kept in `sync.json` (and the token in `sync-token`, mode 0600) in the data dir, outranks the config file, and applies
 to the running sender with no restart. The console's Admin > Sync screen drives it.
@@ -258,7 +264,7 @@ token = "..."                                     # the edge's [[destinations]] 
 ```
 
 **Node-owned prefixes.** A part lives at `<prefix>/<node>/<name>` in the bucket, or `<dir>/<node>/<name>` on central's
-disk, where `<node>` is the id of the `[[peer.nodes]]` entry whose token made the request. Central builds the key; a request cannot choose it. A body that names another node is 403
+disk, where `<node>` is the id of the `[[peer.nodes]]` entry whose token made the request (or of the `kind = "node"` principal, `docs/auth.md`). Central builds the key; a request cannot choose it. A body that names another node is 403
 `foreign_prefix`, a name that is not `<64 hex>.parquet` (traversal, slashes, query strings) is 422 `bad_name`, and a
 shared `[peer] tokens` token owns no prefix (403 `no_node`). The catalog is keyed `(node, name)`. Decision and rejected
 alternatives: `docs/adr/0001-parts-tiering-and-lifecycle.md`.

@@ -24,7 +24,10 @@ did for those comes from reading it (marked "read"). Real-client checks for thos
 | The WAL and catalog | data dir | Integrity of what is written next; a corrupted catalog loses template ids. |
 | Peer tokens (`[peer].tokens`) | config file, console | Write access to the central's store, and read of its capabilities. |
 | Admin token (`LOGLESS_ADMIN_TOKEN` or `[admin].token`) | env, config, console backend | Changes retention (deletes data), budgets, the sync target (where logs are sent). |
-| S3 key pair (`[serve_s3]`, `LOGLESS_S3_*`) | config, env, console, DuckDB sessions | Read of the whole store. |
+| S3 key pair (`[serve_s3]`, `LOGLESS_S3_*`) | config, env, console, DuckDB sessions | Read of the whole store. A `[[principals]]` reader key reads one tenant (and optionally only some of its indexes). |
+| `[[principals]]` keys | config file (optionally as SHA-256 digests) | What their kind allows, for their tenant only (`docs/auth.md`). |
+| S3 session key (`s3-session.key`, mode 0600) | data dir, only when `[auth]` is set | Signs temporary S3 credentials. With it, credentials for any tenant can be made. |
+| Broker key set (`jwks-cache.json`) | data dir | Public keys only. Integrity matters: whoever can write it can add a key that signs tokens. |
 | `[peer.parts]` object-storage secret (S3 backend) | central config | Write to the object-storage bucket. Only ever used to sign short-lived URLs. |
 | Uploaded parts (`<data_dir>/parts`, local backend) | central disk | The same logs as the store, per edge node. Written only by the upload path; read through S3 serve's `parts` bucket. |
 | Upload-token key (local backend) | central process memory, never on disk | Signs upload tokens. With it, a part can be written under any node's directory (still only bytes that hash to their name). |
@@ -182,7 +185,7 @@ credential, and a replica that writes files named by what a source tells it. All
 | Abuse case | Defence | Test |
 |---|---|---|
 | No token, a wrong token, a node token, an ingest token on the replica paths | 401 / 403 from the head, counted in `parts_store.refused_replica`; a central with no `replication_tokens` answers 404 | `parts::replicate::tests::the_replica_paths_open_only_with_a_replication_token_and_nothing_else_opens_with_it`, `...::a_central_with_no_replication_tokens_offers_nothing_and_a_replica_says_so` |
-| A replication token used for anything else (presign, the capability document) | 403: `authenticated` knows only ingest and node tokens | same first test |
+| A replication token used for anything else (presign, the capability document) | 403: a replica principal may read the replica paths and nothing else (`Kind::may`) | same first test |
 | A replication token that is also a node or ingest token | the listener refuses to start (`replication_tokens must differ`) | `parts::replicate::tests::replication_is_configured_only_where_it_can_work` |
 | Reading a file that was never committed, or by a traversal path | only catalogued `(node, name)` pairs are served, each validated (`valid_node`, `valid_name`) before a path is built; the path is not decoded; 404 | first test (an uncommitted file on disk, `../`, a name under the wrong node) |
 | A source that lists a name or node that is not one (traversal, a dot directory), a size or hash that does not fit, an unknown tier | the entry is skipped as `invalid`; nothing is written | `parts::replicate::tests::an_entry_that_could_not_be_a_file_in_a_node_directory_is_never_believed` |
@@ -319,6 +322,43 @@ reflected `X-Sentry-Rate-Limits` are unchanged (`upstream_rate_limits_are_reflec
 | `@sentry/node` streams its body: chunked, gzipped past 32 KiB | read | `sentry::tests::the_node_sdk_shape_a_chunked_gzip_stream_is_read`; real SDKs in the evidence file |
 | A web page posting `text/plain` with a key in the query | **accepted by design**: browser SDKs send exactly that so that no preflight is needed, and a DSN key is public. On a loopback proxy with no `allowed_keys` any local page can write envelopes; with `allowed_keys` a page that knows a key can | not a defect; pinned by `the_key_may_arrive_in_the_query_string` |
 
+## Principals, broker tokens and scoped reads (`crates/logless-core/src/auth.rs`, `auth/s3.rs`)
+
+One verifier decides who every request is from (`docs/auth.md`, ADR 0004). These rows are about what a holder of one
+credential can do with it beyond its own tenant and kind, and about tokens. `route_tests` is
+`auth::route_tests`, `s3_serve` is `s3_serve::tests`.
+
+| Abuse case | Defence | Test |
+|---|---|---|
+| A credential of one kind on another kind's route (an ingest key on the admin API, a reader key as a bearer, a replica key posting records) | one table, `Kind::may`; 401 without a credential, 403 with one, the same answer whatever was wrong | `route_tests::each_kind_of_credential_on_each_route_is_let_in_or_refused` (9 routes x 14 credentials), `auth::tests::what_each_kind_may_do` |
+| A listener's own key used at another listener (a public Sentry DSN key on the peer endpoint) | a legacy credential is good at its own listener only | `auth::tests::an_older_credential_is_a_principal_of_the_own_tenant_at_its_own_listener_only` |
+| A sender naming another tenant in the record (`logless.tenant` attribute, a HEC field) | the tenant is the principal's; a record that names another refuses the batch, 403 | `route_tests::the_tenant_is_the_principals_on_every_ingest_route_and_a_cross_tenant_write_is_refused`, `auth::tests::admit_takes_the_tenant_from_the_principal_and_never_from_the_record` |
+| A line on stdin or in a tailed file naming a tenant | cannot: one parser, which makes only a `request_id` attribute | `logless-cli` `tests::a_line_on_stdin_or_in_a_tailed_file_cannot_name_a_tenant_or_an_index` |
+| Writing to an index outside the principal's list | follows the tenant's `unknown_index`: defaulted or refused, counted per principal | `route_tests::the_index_allow_list_holds_on_the_wire_and_is_counted_for_the_principal` |
+| A node acting under another node's id | the prefix is the principal's id | `route_tests::a_node_uses_the_parts_routes_under_its_own_id_only` |
+| A token for a tenant this instance does not have | refused (`unknown_tenant`); tenants are never created by a credential | `auth::tests::a_static_key_is_tried_first_and_may_be_configured_hashed`; `scripts/auth-broker-e2e.sh` check 2 |
+| Token forgery: `alg: none`, HS256 with the public key as the secret, a changed payload under the old signature, a foreign key under a known `kid`, wrong issuer or audience, expired, issued in the future | EdDSA only, judged before any key is looked at; nothing of the payload is read before the signature verifies; 300 s allowance | `auth::tests::the_token_never_chooses_the_algorithm`, `a_changed_or_padded_token_fails_its_signature_and_missing_claims_are_named`, `audience_expiry_and_issue_time_are_checked_with_the_allowance`, `every_session_broker_vector_gets_its_verdict_and_its_reason` (the broker's own 11 vectors) |
+| Taking the broker away to stop ingest, or to make tokens unverifiable | the key set is cached on disk and used with no time limit; a failed refresh drops nothing; static keys never involve the broker | `auth::tests::keys_are_fetched_cached_on_disk_and_kept_while_the_issuer_is_unreachable`; `scripts/auth-broker-e2e.sh` checks 5a and 5b |
+| A broker (or something answering for it) serving an empty or foreign key set | never replaces a working set | `auth::tests::a_key_set_that_is_empty_or_not_a_key_set_never_replaces_the_cached_one` |
+| Flooding with tokens of unknown key ids to make log-less hammer the broker | one refresh per 60 s whoever asks | `auth::tests::keys_are_fetched_cached_on_disk_and_kept_while_the_issuer_is_unreachable` |
+| A person with the role `admin` in their token calling the admin API | refused: kind `admin` only; roles are not interpreted | `route_tests::a_person_with_the_admin_role_is_still_not_an_operator` |
+| A reader of one tenant reading another's objects, by GET or HEAD, by path tricks (`..`, `%2F`, another case) | `403 AccessDenied` on the decoded key before the disk is touched; a missing key outside the scope answers the same | `s3_serve::a_reader_reads_and_lists_its_own_tenant_and_indexes_and_nothing_else` (5 readers x 11 keys x GET and HEAD) |
+| A reader listing above its scope to learn other tenants' keys, or paging with a continuation token made by hand to resume inside another tenant | the walk itself skips what is outside the scope; a forged token resumes at the reader's own keys or past them | `s3_serve::a_scoped_listing_pages_exactly_across_the_edges_of_the_scope` |
+| A tenant's reader reading the uploaded-parts bucket (kept by node, not by tenant) | whole-store readers only; the bucket is not listed for anyone else | `s3_serve::the_older_key_pair_still_reads_the_whole_store_and_only_a_whole_store_reader_reads_uploaded_parts` |
+| One reader's id with another's secret; a request signed with the stand-in key used for unknown ids | `SignatureDoesNotMatch`, same point, same answer as an unknown id | same test |
+| Trading a token for S3 credentials of another tenant (a body, query or header naming it) | the scope is the token's; the request names nothing | `route_tests::a_broker_token_is_traded_for_s3_credentials_of_its_own_tenant_and_nobody_elses` |
+| Trading a static key, an ingest or admin token, an expired token | 403; the exchange asks for a token also on loopback | same test |
+| Editing a session token: another tenant, more indexes, a later expiry; one credential's payload under another's MAC | `400 InvalidToken`: the HMAC is judged before anything of the payload is read | `auth::s3::tests::an_expired_or_changed_token_is_refused_and_the_secret_follows_the_token`, `s3_serve::temporary_credentials_read_what_their_token_may_and_stop_when_they_expire` |
+| Using a temporary key pair without its session token, or with another credential's token or secret | 403: the secret is derived from the token | same `s3_serve` test |
+| An expired temporary credential | `400 ExpiredToken`, no allowance | `s3_serve::an_expired_temporary_credential_is_refused_and_a_restart_keeps_a_live_one`; `scripts/auth-broker-e2e.sh` check 3c |
+| A bad session token on a listener that asks for no credential (loopback, no readers) quietly reading everything | judged there too, 400 | `s3_serve::a_listener_that_asks_for_no_credential_still_judges_a_session_token` |
+| A reader configured with the id of the operator pair, or one that looks like a temporary key | startup error | `s3_serve::a_reader_must_not_share_an_id_with_the_older_pair_or_look_like_a_temporary_key` |
+| Keys, tokens or secrets in status, a log line or a logged config | ids only; `Debug` of every config and credential type redacts | the status assertions in the tests above; `scripts/auth-broker-e2e.sh` (13 values looked for, 0 found), `scripts/e2e-stack.sh` |
+
+Not defended, by decision (ADR 0004, "deliberately not built"): an issued token or temporary S3 credential cannot be
+revoked before it expires; `s3-session.key` at rest is as protected as the data dir and no more; a captured static key
+is good until changed; scopes and roles are not enforced; there is no lockout on failed authentication.
+
 ## Not defended or not done
 
 1. **Residuals of the OTLP, HEC and Sentry listeners** (moved to `bounded_http` on `hard/listeners`):
@@ -349,7 +389,8 @@ reflected `X-Sentry-Rate-Limits` are unchanged (`upstream_rate_limits_are_reflec
    records, on up to 64 connections at once. The defaults cap one request, not the sum. There is no global in-flight budget.
    Not measured.
 5. **A token holder can write anything**: forge `logless.origin`/`logless.hops` to have records dropped as loops, fill the
-   store up to the disk budget, or send a record claiming any service. Tokens are not scoped per sender.
+   store up to the disk budget, or send a record claiming any service, within its own tenant. Since LOG-179 a `[[principals]]` key or a broker token is bound to a tenant and
+   optionally to indexes; the older shared tokens are all the instance's own tenant.
 6. **Slots can be held for the deadline.** An attacker who can open connections can hold all 64 slots of a listener for
    10 to 30 s each and so deny that listener (since `hard/listeners` this includes OTLP/HTTP, HEC and Sentry). No
    per-source cap.
@@ -364,7 +405,9 @@ reflected `X-Sentry-Rate-Limits` are unchanged (`upstream_rate_limits_are_reflec
    in its source) does not forward `Authorization` to a redirect target. Not tested.
 10. **Keep-alive is gone** on the S3 and peer listeners (`Connection: close`). That is deliberate (no per-connection state
     to abuse) and costs a handshake per request; not measured against a DuckDB scan.
-11. **Logs are sensitive content.** Nothing here redacts what applications log; S3 read access is access to all of it.
+11. **Logs are sensitive content.** Nothing here redacts what applications log; S3 read access is access to all of it
+    within the reader's scope: the whole store for the `[serve_s3]` pair, one tenant (or some of its indexes) for a
+    `[[principals]]` reader or a temporary credential.
 
 ## What was checked and was fine
 
