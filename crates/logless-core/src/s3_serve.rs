@@ -9,6 +9,12 @@
 //! that asks for them, and one index of one tenant is one prefix. Only `GET`/`HEAD` of objects and ListObjectsV2 exist — there is no
 //! write path to harden.
 //!
+//! Who may read what is the verifier's (`crate::auth`): every request is signed (SigV4) by a reader,
+//! and a reader is scoped to its tenant and indexes ([`ReadScope`]). The store's one older key pair
+//! reads everything; a `[[principals]]` reader reads its own prefixes; a temporary credential
+//! (`x-amz-security-token`, issued by `POST /v1/auth/s3-credentials`) reads what the token it was
+//! issued for may. An object outside the scope is refused, and a listing shows only what is inside it.
+//!
 //! It runs on [`crate::bounded_http`], like the admin API and the peer receiver:
 //! the request head is capped and has to arrive within a deadline, connections
 //! are capped, and a client that stops reading is cut off by the write timeout.
@@ -23,6 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::auth::{Listener, Principal, ReadScope, Refusal, Verifier, SESSION_TOKEN_HEADER};
 use crate::bounded_http::{BoundedServer, HeadLimits};
 use crate::httpd::{self, Handler, HttpError, Incoming, Limits, Method, Reject, Streamed};
 use crate::s3_sigv4::{self, AuthError, Credentials};
@@ -129,7 +136,11 @@ struct Inner {
     bucket: String,
     /// The parts bucket and its directory, when uploaded parts are on this disk.
     parts: Option<(String, PathBuf)>,
-    creds: Option<Credentials>,
+    /// Who the readers are (`crate::auth`).
+    auth: Arc<Verifier>,
+    /// Every request must be signed: there is a reader, or the bind is not loopback. Otherwise a request
+    /// without a session token is served the whole store, as an install without credentials always was.
+    closed: bool,
     allowed_hosts: Vec<String>,
     requests: AtomicU64,
     range_requests: AtomicU64,
@@ -172,7 +183,20 @@ impl S3Server {
     /// As [`S3Server::start`], and serves `parts_dir` (the local parts directory, `crate::parts`) as the
     /// bucket `cfg.parts_bucket`, under the same credentials and the same rules.
     pub fn start_with_parts(cfg: &S3ServeConfig, store_dir: PathBuf, parts_dir: Option<PathBuf>) -> Result<S3Server, S3ServeError> {
-        let creds = resolve_credentials(cfg)?;
+        let mut readers = crate::auth::Builder::standalone();
+        if let Some(creds) = resolve_credentials(cfg)? {
+            readers = readers.s3(&creds.access_key, &creds.secret_key);
+        }
+        Self::start_with_auth(cfg, store_dir, parts_dir, readers.build())
+    }
+
+    /// As [`S3Server::start_with_parts`], with the instance's one verifier: the store's own key pair (a
+    /// reader of everything), the `[[principals]]` readers, each scoped to its tenant and indexes, and
+    /// the temporary credentials issued for broker tokens.
+    pub fn start_with_auth(cfg: &S3ServeConfig, store_dir: PathBuf, parts_dir: Option<PathBuf>, auth: Arc<Verifier>) -> Result<S3Server, S3ServeError> {
+        // Only for the error a half-set pair gets; the pair itself is one of the verifier's readers.
+        resolve_credentials(cfg)?;
+        let has_readers = auth.readers().next().is_some();
         if parts_dir.is_some() && cfg.parts_bucket == cfg.bucket {
             return Err(S3ServeError::SameBucket(cfg.bucket.clone()));
         }
@@ -186,11 +210,15 @@ impl S3Server {
             .first()
             .ok_or_else(|| HttpError::NoAddress { addr: cfg.addr.clone() })?;
 
-        if creds.is_none() {
-            if !addrs.iter().all(|a| a.ip().is_loopback()) {
+        let loopback = addrs.iter().all(|a| a.ip().is_loopback());
+        if !has_readers {
+            // Off loopback somebody must be able to sign: a reader, or a person through the broker.
+            if !loopback && !auth.s3_sessions_enabled() {
                 return Err(S3ServeError::OpenOnPublicAddress { addr: cfg.addr.clone() });
             }
-            tracing::warn!(addr = %cfg.addr, "s3 serve has no credentials; serving the store anonymously on loopback");
+            if loopback {
+                tracing::warn!(addr = %cfg.addr, "s3 serve has no credentials; serving the store anonymously on loopback");
+            }
         }
 
         let inner = Arc::new(Inner {
@@ -198,7 +226,8 @@ impl S3Server {
             bucket: cfg.bucket.clone(),
             parts: parts_dir.map(|dir| (cfg.parts_bucket.clone(), dir)),
             allowed_hosts: cfg.allowed_hosts.iter().map(|h| h.to_ascii_lowercase()).collect(),
-            creds,
+            auth,
+            closed: has_readers || !loopback,
             requests: AtomicU64::new(0),
             range_requests: AtomicU64::new(0),
             bytes_served: AtomicU64::new(0),
@@ -255,7 +284,7 @@ impl Handler for S3Handler {
         let inner = &self.0;
         // Counted only when it refuses; an admitted request is counted by `handle`.
         let id = inner.requests.load(Ordering::Relaxed) + 1;
-        let denied = inner.gate(id, request.method_name, request.path, request.query, request.headers())?;
+        let denied = inner.gate(id, request.method_name, request.path, request.query, request.headers()).err()?;
         inner.requests.fetch_add(1, Ordering::Relaxed);
         Some(denied.into_http(id, inner, request.method == Method::Head))
     }
@@ -366,7 +395,7 @@ impl Read for Counting {
 
 impl Inner {
     fn host_allowed(&self, headers: &[(String, String)]) -> bool {
-        if self.allowed_hosts.is_empty() && self.creds.is_some() {
+        if self.allowed_hosts.is_empty() && self.closed {
             return true;
         }
         let Some(value) = headers
@@ -388,21 +417,60 @@ impl Inner {
         self.allowed_hosts.iter().any(|h| h == host)
     }
 
-    /// Host and credential checks, which come before anything else is looked at.
-    fn gate(&self, id: u64, method: &str, raw_path: &str, raw_query: &str, headers: &[(String, String)]) -> Option<Reply> {
+    /// Host and credential checks, which come before anything else is looked at. `Ok` is who the request
+    /// is from and what of the store it may read; a refusal is counted by its reason (`crate::auth`), and
+    /// against the reader when the key id was a known one.
+    fn gate(&self, id: u64, method: &str, raw_path: &str, raw_query: &str, headers: &[(String, String)]) -> Result<Access, Reply> {
         if !self.host_allowed(headers) {
-            return Some(Reply::error(id, 403, "AccessDenied", "Invalid Host header"));
+            return Err(Reply::error(id, 403, "AccessDenied", "Invalid Host header"));
         }
-
-        let creds = self.creds.as_ref()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let Err(e) = s3_sigv4::verify(creds, method, raw_path, raw_query, headers, now) else {
-            return None;
+
+        // A temporary credential: the session token says who and until when, and names the secret the
+        // request must be signed with. It is judged wherever it is presented, on an open listener too:
+        // an expired one must not quietly become a read of everything.
+        let (principal, creds) = if let Some(token) = header(headers, SESSION_TOKEN_HEADER) {
+            match self.auth.s3_session(token.trim(), now) {
+                Ok((principal, creds)) => (Some(principal), creds),
+                Err(reason) => {
+                    self.auth.refuse(Listener::S3, reason);
+                    return Err(match reason {
+                        Refusal::Expired => Reply::error(id, 400, "ExpiredToken", "The provided token has expired."),
+                        _ => Reply::error(id, 400, "InvalidToken", "The provided token is malformed or otherwise invalid."),
+                    });
+                }
+            }
+        } else if !self.closed {
+            return Ok(Access { principal: None, scope: ReadScope::whole() });
+        } else {
+            // An unknown key id is verified against a key nobody holds, so it fails where and how a bad
+            // secret does (see `s3_sigv4::verify`).
+            match s3_sigv4::access_key_id(headers).ok().and_then(|id| self.auth.s3_reader(id)) {
+                Some((principal, secret)) => (Some(Arc::clone(principal)), Credentials { access_key: principal.id.clone(), secret_key: secret.to_string() }),
+                None => (None, Credentials { access_key: "\0".into(), secret_key: "\0".into() }),
+            }
         };
-        Some(match e {
+        let e = match (s3_sigv4::verify(&creds, method, raw_path, raw_query, headers, now), &principal) {
+            (Ok(()), Some(p)) => return Ok(Access { scope: ReadScope::of(p), principal }),
+            // Nobody holds the stand-in key: whatever was signed with it is an unknown key.
+            (Ok(()), None) => AuthError::UnknownKey,
+            (Err(e), _) => e,
+        };
+        let reason = match e {
+            AuthError::Missing => Refusal::Missing,
+            AuthError::Malformed => Refusal::Malformed,
+            AuthError::Expired => Refusal::Expired,
+            AuthError::UnknownKey => Refusal::UnknownKey,
+            AuthError::BadSignature => Refusal::Signature,
+        };
+        match &principal {
+            Some(p) => self.auth.refuse_principal(Listener::S3, p, reason),
+            None => self.auth.refuse(Listener::S3, reason),
+        }
+        Err(match e {
             AuthError::Missing | AuthError::Malformed => Reply::error(id, 403, "AccessDenied", "Access Denied"),
             AuthError::Expired => Reply::error(id, 403, "AccessDenied", "Request has expired"),
             // An unknown key id answers like a bad secret; see `verify`.
@@ -415,6 +483,15 @@ impl Inner {
         })
     }
 
+    /// A read outside the reader's tenant and indexes: counted against it, and answered like S3 does.
+    fn out_of_scope(&self, id: u64, access: &Access) -> Reply {
+        match &access.principal {
+            Some(p) => self.auth.refuse_principal(Listener::S3, p, Refusal::Scope),
+            None => self.auth.refuse(Listener::S3, Refusal::Scope),
+        }
+        Reply::error(id, 403, "AccessDenied", "Access Denied")
+    }
+
     fn route(
         &self,
         id: u64,
@@ -424,8 +501,12 @@ impl Inner {
         headers: &[(String, String)],
         meta: &mut Meta,
     ) -> Reply {
-        if let Some(denied) = self.gate(id, method, raw_path, raw_query, headers) {
-            return denied;
+        let access = match self.gate(id, method, raw_path, raw_query, headers) {
+            Ok(access) => access,
+            Err(denied) => return denied,
+        };
+        if let Some(p) = &access.principal {
+            self.auth.count_read(p);
         }
 
         let head = match method {
@@ -446,7 +527,7 @@ impl Inner {
             return Reply::error(id, 400, "InvalidURI", "Couldn't parse the specified URI");
         };
         if rest.is_empty() {
-            return if head { Reply::xml(200, String::new()) } else { self.list_buckets() };
+            return if head { Reply::xml(200, String::new()) } else { self.list_buckets(&access.scope) };
         }
         let has_param = |name: &str| parse_query(raw_query).iter().any(|(k, _)| k == name);
 
@@ -459,6 +540,10 @@ impl Inner {
             }
             _ => return Reply::error(id, 404, "NoSuchBucket", "The specified bucket does not exist"),
         };
+        // Uploaded parts are kept by node, not by tenant: only a reader of the whole store reads them.
+        if bucket != self.bucket && !access.scope.is_whole() {
+            return self.out_of_scope(id, &access);
+        }
         if key_raw.is_empty() {
             let reply = if head {
                 Reply::xml(200, String::new())
@@ -468,9 +553,14 @@ impl Inner {
                     format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LocationConstraint xmlns=\"{XMLNS}\">{REGION}</LocationConstraint>"),
                 )
             } else {
-                self.list_objects(id, bucket, root, raw_query, meta)
+                self.list_objects(id, bucket, root, raw_query, &access.scope, meta)
             };
             return reply.with("x-amz-bucket-region", REGION);
+        }
+        // Judged on the decoded key and before the disk is touched: a reader learns nothing about what
+        // exists outside its scope, not even that it does not.
+        if !access.scope.is_whole() && !percent_decode(key_raw, false).is_some_and(|key| access.scope.allows(&key)) {
+            return self.out_of_scope(id, &access);
         }
         self.object(id, head, root, key_raw, headers, meta)
     }
@@ -632,12 +722,12 @@ impl Inner {
         Reply { status, headers: hs, body }
     }
 
-    fn list_buckets(&self) -> Reply {
+    fn list_buckets(&self, scope: &ReadScope) -> Reply {
         let created = fs::metadata(&self.store_dir)
             .and_then(|m| m.modified())
             .unwrap_or(UNIX_EPOCH);
         let mut buckets = format!("<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>", xml_escape(&self.bucket), iso_date(created));
-        if let Some((name, dir)) = &self.parts {
+        if let Some((name, dir)) = self.parts.as_ref().filter(|_| scope.is_whole()) {
             let created = fs::metadata(dir).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
             buckets.push_str(&format!("<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>", xml_escape(name), iso_date(created)));
         }
@@ -649,7 +739,7 @@ impl Inner {
         )
     }
 
-    fn list_objects(&self, id: u64, bucket: &str, root: &Path, raw_query: &str, meta: &mut Meta) -> Reply {
+    fn list_objects(&self, id: u64, bucket: &str, root: &Path, raw_query: &str, scope: &ReadScope, meta: &mut Meta) -> Reply {
         let query = parse_query(raw_query);
         let get = |name: &str| query.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
         let invalid = |msg: &str| Reply::error(id, 400, "InvalidArgument", msg);
@@ -691,7 +781,7 @@ impl Inner {
         meta.key = format!("list prefix={prefix}");
 
         let params = ListParams { prefix, delimiter, max_keys, marker };
-        let mut walker = Walker { p: &params, out: Vec::new(), truncated: false, last_prefix: None };
+        let mut walker = Walker { p: &params, scope, out: Vec::new(), truncated: false, last_prefix: None };
         if max_keys > 0 {
             if let Some((dir, base)) = list_base(root, prefix) {
                 walker.walk(&dir, &base);
@@ -788,8 +878,17 @@ impl Unit {
     }
 }
 
+/// Who a request is from (`None`: nobody, on a listener that asks for no credential) and what it may read.
+struct Access {
+    principal: Option<Arc<Principal>>,
+    scope: ReadScope,
+}
+
 struct Walker<'a> {
     p: &'a ListParams<'a>,
+    /// What the reader may see. Applied here, in the walk, and not to a finished page: a page is then
+    /// full of keys the reader may read, and its last key is a continuation token that resumes exactly.
+    scope: &'a ReadScope,
     out: Vec<Unit>,
     truncated: bool,
     last_prefix: Option<String>,
@@ -813,9 +912,12 @@ impl Walker<'_> {
             }
             let Ok(ft) = entry.file_type() else { continue };
             if ft.is_dir() {
+                if !self.scope.reaches(&format!("{key_prefix}{name}/")) {
+                    continue;
+                }
                 entries.push((format!("{name}/"), name, true));
             } else if ft.is_file() && servable(&format!("{key_prefix}{name}")) {
-                if !format!("{key_prefix}{name}").starts_with(self.p.prefix) {
+                if !format!("{key_prefix}{name}").starts_with(self.p.prefix) || !self.scope.allows(&format!("{key_prefix}{name}")) {
                     continue;
                 }
                 entries.push((name.clone(), name, false));
@@ -1086,6 +1188,11 @@ fn iso_date(t: SystemTime) -> String {
         rem % 60,
         d.subsec_millis()
     )
+}
+
+/// `2026-01-01T00:00:00Z`, for a JSON reply.
+pub(crate) fn rfc3339(unix_secs: u64) -> String {
+    format!("{}Z", &iso_date(UNIX_EPOCH + Duration::from_secs(unix_secs))[..19])
 }
 
 fn xml_escape(s: &str) -> String {
@@ -2480,6 +2587,409 @@ mod tests {
         assert_eq!(200, f.list("").status, "still serving");
     }
 
+    // --- Readers scoped to a tenant and its indexes, and temporary credentials (`crate::auth`). ---
+
+    use crate::auth::testing as broker;
+    use crate::auth::{Builder, Kind, PrincipalConfig};
+
+    const HOUR: &str = "hour=2026-01-01T00/level=info/node=n";
+    const SECRET_ACME: &str = "acme-reader-secret-0123456789ab";
+    const SECRET_PAY: &str = "payments-reader-secret-01234567";
+    const SECRET_OWN: &str = "own-tenant-reader-secret-012345";
+    const SECRET_ALL: &str = "every-tenant-reader-secret-0123";
+    const LEGACY: (&str, &str) = ("AK", "legacy-pair-secret-0123456789ab");
+
+    /// The keys of a store with three tenants; `default` sorts between the other two.
+    fn tenant_keys() -> Vec<String> {
+        let mut keys = vec![
+            format!("tenant=acme/index=default/{HOUR}/a.parquet"),
+            format!("tenant=acme/index=default/{HOUR}/b.parquet"),
+            "tenant=acme/index=default/_meta/templates/writer=n.pq".to_string(),
+            format!("tenant=acme/index=payments/{HOUR}/p.parquet"),
+            "tenant=acme/index=payments/_meta/shape_history/writer=n.pq".to_string(),
+            "tenant=acme/index=payments/_meta/templates/writer=n.pq".to_string(),
+            format!("tenant=default/index=default/{HOUR}/d1.parquet"),
+            format!("tenant=default/index=default/{HOUR}/d2.parquet"),
+            format!("tenant=default/index=default/{HOUR}/d3.parquet"),
+            "tenant=default/index=default/_meta/templates/writer=n.pq".to_string(),
+            format!("tenant=zeta/index=default/{HOUR}/z.parquet"),
+        ];
+        keys.sort();
+        keys
+    }
+
+    struct Scoped {
+        tmp: tempfile::TempDir,
+        server: S3Server,
+        addr: SocketAddr,
+        verifier: Arc<Verifier>,
+        signer: broker::Signer,
+    }
+
+    impl Scoped {
+        /// The store of [`tenant_keys`], an uploaded part in the parts bucket, the older key pair, four
+        /// `[[principals]]` readers and a broker. `data_dir` is where the key of the temporary credentials
+        /// is kept (a restart is a second `Scoped` over the same one); they last `ttl` seconds.
+        fn start(tmp: tempfile::TempDir, ttl: u64) -> Self {
+            let store = tmp.path().join("store");
+            for key in tenant_keys() {
+                let path = store.join(&key);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, key.as_bytes()).unwrap();
+            }
+            let parts = tmp.path().join("parts");
+            fs::create_dir_all(parts.join("edge-1")).unwrap();
+            fs::write(parts.join("edge-1/part.parquet"), b"an uploaded part").unwrap();
+
+            let reader = |id: &str, tenant: &str, indexes: Option<&[&str]>, key: &str| PrincipalConfig {
+                indexes: indexes.map(|list| list.iter().map(|i| i.to_string()).collect()),
+                ..broker::principal(id, Kind::Reader, Some(tenant), key)
+            };
+            let signer = broker::Signer::new(21, "kid-1");
+            let builder = Builder::new(broker::two_tenants(crate::config::UnknownIndex::Default))
+                .s3(LEGACY.0, LEGACY.1)
+                .principals(&[
+                    reader("acme-ro", "acme", None, SECRET_ACME),
+                    reader("acme-pay", "acme", Some(&["payments"]), SECRET_PAY),
+                    reader("own-ro", "default", None, SECRET_OWN),
+                    reader("all-ro", "*", None, SECRET_ALL),
+                ])
+                .unwrap();
+            let verifier = broker::with_broker_in(builder, &signer, tmp.path(), ttl).build();
+            let cfg = S3ServeConfig { addr: "127.0.0.1:0".into(), ..Default::default() };
+            let server = S3Server::start_with_auth(&cfg, store, Some(parts), Arc::clone(&verifier)).unwrap();
+            let addr = server.local_addr();
+            Scoped { tmp, server, addr, verifier, signer }
+        }
+
+        fn new() -> Self {
+            Self::start(tempfile::tempdir().unwrap(), 3600)
+        }
+
+        /// A signed request as `who` (access key id, secret, session token).
+        fn call(&self, method: &str, who: (&str, &str, Option<&str>), path: &str, query: &[(&str, &str)]) -> Resp {
+            let mut pairs: Vec<(String, String)> = query.iter().map(|(k, v)| (s3_sigv4::encode_segment(k), s3_sigv4::encode_segment(v))).collect();
+            pairs.sort();
+            let query = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+            // The key id is not part of what is signed, so the helper's own is swapped for the caller's.
+            let mut h = sigv4(method, path, &query, &self.addr.to_string(), &amz_at(0), SIGNED_ALL, who.1);
+            for (name, value) in &mut h {
+                if name == "Authorization" {
+                    *value = value.replace("Credential=AK/", &format!("Credential={}/", who.0));
+                }
+            }
+            if let Some(token) = who.2 {
+                h.push(("x-amz-security-token".into(), token.to_string()));
+            }
+            let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let target = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+            http(self.addr, method, &target, &h)
+        }
+
+        fn get(&self, who: (&str, &str, Option<&str>), key: &str) -> Resp {
+            self.call("GET", who, &obj(key), &[])
+        }
+
+        /// Every key a listing gives `who`, walking the pages `page` keys at a time.
+        fn list_all(&self, who: (&str, &str, Option<&str>), prefix: &str, page: usize) -> Vec<String> {
+            let (mut keys, mut token) = (Vec::new(), None::<String>);
+            loop {
+                let page = page.to_string();
+                let mut q = vec![("list-type", "2"), ("max-keys", page.as_str()), ("prefix", prefix)];
+                if let Some(t) = &token {
+                    q.push(("continuation-token", t.as_str()));
+                }
+                let r = self.call("GET", who, "/logs", &q);
+                assert_eq!(200, r.status, "{}", r.text());
+                let xml = r.text();
+                keys.extend(tags(&xml, "Key"));
+                token = tags(&xml, "NextContinuationToken").into_iter().next();
+                if token.is_none() {
+                    assert_eq!(tags(&xml, "IsTruncated"), ["false"]);
+                    return keys;
+                }
+            }
+        }
+
+        /// Temporary credentials for a broker token of `kind` for `tenant` and `indexes`, good for
+        /// `token_secs` at the broker.
+        fn credentials(&self, kind: &str, tenant: &str, indexes: &[&str], token_secs: u64) -> crate::auth::S3Credentials {
+            let now = crate::now_unix_secs();
+            let mut claims = broker::claims(kind, tenant, "reporting", now);
+            claims["indexes"] = serde_json::json!(indexes);
+            claims["exp"] = (now + token_secs).into();
+            let principal = self.verifier.verify(Listener::Peer, &self.signer.sign(&claims)).unwrap();
+            self.verifier.issue_s3_credentials(&principal, now).unwrap()
+        }
+    }
+
+    const ACME: (&str, &str, Option<&str>) = ("acme-ro", SECRET_ACME, None);
+    const PAY: (&str, &str, Option<&str>) = ("acme-pay", SECRET_PAY, None);
+    const OWN: (&str, &str, Option<&str>) = ("own-ro", SECRET_OWN, None);
+    const ALL: (&str, &str, Option<&str>) = ("all-ro", SECRET_ALL, None);
+    const OLD: (&str, &str, Option<&str>) = (LEGACY.0, LEGACY.1, None);
+
+    fn under(prefixes: &[&str]) -> Vec<String> {
+        tenant_keys().into_iter().filter(|k| prefixes.iter().any(|p| k.starts_with(p))).collect()
+    }
+
+    #[test]
+    fn a_reader_reads_and_lists_its_own_tenant_and_indexes_and_nothing_else() {
+        let f = Scoped::new();
+        // (reader, the prefixes it may read)
+        let readers: [((&str, &str, Option<&str>), Vec<&str>); 5] = [
+            (ACME, vec!["tenant=acme/"]),
+            (PAY, vec!["tenant=acme/index=payments/"]),
+            (OWN, vec!["tenant=default/"]),
+            (ALL, vec![""]),
+            (OLD, vec![""]),
+        ];
+        let mut checked = 0;
+        for (who, prefixes) in &readers {
+            let mine = under(prefixes);
+            // Every object of the store, by GET and by HEAD: its own are served, the rest refused.
+            for key in tenant_keys() {
+                let allowed = mine.contains(&key);
+                let got = f.get(*who, &key);
+                let head = f.call("HEAD", *who, &obj(&key), &[]);
+                if allowed {
+                    assert_eq!((200, key.as_bytes()), (got.status, got.body.as_slice()), "{} reads {key}", who.0);
+                    assert_eq!(200, head.status);
+                } else {
+                    assert_eq!((403, "AccessDenied"), (got.status, code(&got).as_str()), "{} reads {key}", who.0);
+                    assert_eq!(403, head.status);
+                }
+                checked += 2;
+            }
+            // A key that does not exist is not told apart from one that does, outside the scope.
+            let missing = f.get(*who, "tenant=zeta/index=default/nothing-here.parquet");
+            assert_eq!(if prefixes == &[""] { 404 } else { 403 }, missing.status, "{}", who.0);
+            // A listing from the top is exactly what the reader may read, whatever the page size.
+            for page in [1, 2, 1000] {
+                assert_eq!(mine, f.list_all(*who, "", page), "{} lists the bucket {page} at a time", who.0);
+            }
+            // A listing of another tenant's prefix is empty, not an error: a glob above the scope works.
+            for prefix in ["tenant=acme/", "tenant=acme/index=default/", "tenant=default/", "tenant=zeta/", "tenant="] {
+                let want: Vec<String> = mine.iter().filter(|k| k.starts_with(prefix)).cloned().collect();
+                assert_eq!(want, f.list_all(*who, prefix, 2), "{} lists {prefix}", who.0);
+            }
+        }
+        assert_eq!(5 * 11 * 2, checked);
+
+        // The dictionary of an index follows the index: the payments reader has its own and not the other.
+        assert_eq!(200, f.get(PAY, "tenant=acme/index=payments/_meta/templates/writer=n.pq").status);
+        assert_eq!(403, f.get(PAY, "tenant=acme/index=default/_meta/templates/writer=n.pq").status);
+        // Spellings of another tenant's key that a filesystem might fold into it.
+        for key in ["tenant=acme/../tenant=zeta/index=default/x.parquet", "tenant=ACME/index=default/x.parquet", "tenant=acme%2F..%2Ftenant=zeta/index=default/x.parquet", "tenant=zeta%2Findex=default/x.parquet", "/tenant=acme/index=default/x.parquet"] {
+            assert_ne!(200, f.call("GET", ACME, &format!("/logs/{key}"), &[]).status, "{key}");
+        }
+        f.server.shutdown();
+    }
+
+    #[test]
+    fn a_scoped_listing_pages_exactly_across_the_edges_of_the_scope() {
+        let f = Scoped::new();
+        // `default` sits between `acme` and `zeta`: both edges of the scope are crossed by the walk.
+        let mine = under(&["tenant=default/"]);
+        assert_eq!(4, mine.len());
+        let page = |token: Option<&str>| {
+            let mut q = vec![("list-type", "2"), ("max-keys", "1")];
+            if let Some(t) = token {
+                q.push(("continuation-token", t));
+            }
+            let xml = f.call("GET", OWN, "/logs", &q).text();
+            (tags(&xml, "Key"), tags(&xml, "KeyCount"), tags(&xml, "IsTruncated"), tags(&xml, "NextContinuationToken").into_iter().next())
+        };
+        let mut token: Option<String> = None;
+        for (n, want) in mine.iter().enumerate() {
+            let (keys, count, truncated, next) = page(token.as_deref());
+            let last = n + 1 == mine.len();
+            assert_eq!((vec![want.clone()], vec!["1".to_string()], vec![(!last).to_string()]), (keys, count, truncated), "page {n}");
+            assert_eq!(last, next.is_none(), "the last page of the scope is the last page, though the store goes on");
+            token = next;
+        }
+        // A continuation token made by hand to resume inside another tenant resumes at the reader's own
+        // keys, or past them: never at somebody else's.
+        let (keys, ..) = page(Some(&encode_token(&format!("tenant=acme/index=default/{HOUR}/a.parquet"))));
+        assert_eq!(keys, [mine[0].clone()]);
+        let (keys, _, truncated, _) = page(Some(&encode_token("tenant=default/zzz")));
+        assert_eq!((keys.len(), truncated), (0, vec!["false".to_string()]), "nothing of zeta follows");
+
+        // Rolled up by directory: the reader sees the way down to its scope and no sibling of it.
+        let prefixes = |who, prefix: &str| tags(&f.call("GET", who, "/logs", &[("list-type", "2"), ("delimiter", "/"), ("prefix", prefix)]).text(), "Prefix").into_iter().skip(1).collect::<Vec<_>>();
+        assert_eq!(prefixes(PAY, ""), ["tenant=acme/"]);
+        assert_eq!(prefixes(PAY, "tenant=acme/"), ["tenant=acme/index=payments/"]);
+        assert_eq!(prefixes(ACME, "tenant=acme/"), ["tenant=acme/index=default/", "tenant=acme/index=payments/"]);
+        assert_eq!(prefixes(OWN, ""), ["tenant=default/"]);
+        assert_eq!(prefixes(OLD, ""), ["tenant=acme/", "tenant=default/", "tenant=zeta/"]);
+        // ListObjects v1 takes the same road.
+        let v1 = f.call("GET", PAY, "/logs", &[("max-keys", "1000")]).text();
+        assert_eq!(tags(&v1, "Key"), under(&["tenant=acme/index=payments/"]));
+        f.server.shutdown();
+    }
+
+    #[test]
+    fn the_older_key_pair_still_reads_the_whole_store_and_only_a_whole_store_reader_reads_uploaded_parts() {
+        let f = Scoped::new();
+        for who in [OLD, ALL] {
+            assert_eq!(tenant_keys(), f.list_all(who, "", 1000), "{}", who.0);
+            assert_eq!(tags(&f.call("GET", who, "/", &[]).text(), "Name"), ["logs", "parts"]);
+            assert_eq!(200, f.call("GET", who, "/parts/edge-1/part.parquet", &[]).status);
+            assert_eq!(tags(&f.call("GET", who, "/parts", &[("list-type", "2")]).text(), "Key"), ["edge-1/part.parquet"]);
+        }
+        // Parts are kept by node, not by tenant, so a tenant's reader has no part of that bucket.
+        for who in [ACME, PAY, OWN] {
+            assert_eq!(tags(&f.call("GET", who, "/", &[]).text(), "Name"), ["logs"], "{}", who.0);
+            for (path, query) in [("/parts/edge-1/part.parquet", vec![]), ("/parts", vec![("list-type", "2")])] {
+                let r = f.call("GET", who, path, &query);
+                assert_eq!((403, "AccessDenied"), (r.status, code(&r).as_str()), "{} {path}", who.0);
+            }
+        }
+        // One reader's id with another reader's secret, and a secret with no id, open nothing.
+        for who in [("acme-ro", SECRET_PAY, None), ("acme-ro", LEGACY.1, None), ("AK", SECRET_ALL, None), ("nobody", SECRET_ACME, None), ("\0", "\0", None)] {
+            let r = f.get(who, &tenant_keys()[0]);
+            assert_eq!((403, "SignatureDoesNotMatch"), (r.status, code(&r).as_str()), "{:?}", who.0);
+        }
+        assert_eq!(403, http(f.addr, "GET", &obj(&tenant_keys()[0]), &[]).status, "unsigned");
+
+        // Status: requests and refusals per reader, by id. Never a key.
+        let status = f.verifier.status();
+        let seen = |id: &str| status["seen"].as_array().unwrap().iter().find(|s| s["principal"] == id).cloned().unwrap_or_default();
+        assert_eq!((seen("acme/acme-ro")["kind"].as_str(), seen("acme/acme-ro")["requests"].as_u64(), seen("acme/acme-ro")["refused"].as_u64()), (Some("reader"), Some(3), Some(4)), "three requests let in (two of them out of scope) and two bad signatures");
+        assert_eq!((seen("*/AK")["requests"].as_u64(), seen("*/AK")["refused"].as_u64()), (Some(4), Some(1)));
+        assert!(status["refused"]["scope"].as_u64().unwrap() >= 6 && status["refused"]["signature"].as_u64().unwrap() >= 3, "{}", status["refused"]);
+        let reads = |id: &str| status["principals"].as_array().unwrap().iter().find(|p| p["id"] == id).map(|p| p["reads"].clone()).unwrap();
+        assert_eq!((reads("acme-pay"), reads("AK"), reads("all-ro")), (serde_json::json!(["tenant=acme/index=payments/"]), serde_json::json!([""]), serde_json::json!([""])));
+        let text = status.to_string();
+        for secret in [SECRET_ACME, SECRET_PAY, SECRET_OWN, SECRET_ALL, LEGACY.1] {
+            assert!(!text.contains(secret), "a secret in status");
+        }
+        f.server.shutdown();
+    }
+
+    #[test]
+    fn a_reader_must_not_share_an_id_with_the_older_pair_or_look_like_a_temporary_key() {
+        let load = |id: &str| Builder::new(broker::two_tenants(crate::config::UnknownIndex::Default)).s3("AK", LEGACY.1).principals(&[broker::principal(id, Kind::Reader, Some("acme"), SECRET_ACME)]).err().map(|e| e.to_string()).unwrap_or_default();
+        assert_eq!("", load("acme-ro"));
+        assert!(load("AK").contains("give it another"), "{}", load("AK"));
+        assert!(load("LLTMP0123").contains("give it another"));
+        assert!(!load("AK").contains(SECRET_ACME));
+    }
+
+    #[test]
+    fn temporary_credentials_read_what_their_token_may_and_stop_when_they_expire() {
+        let f = Scoped::new();
+        let user = f.credentials("user", "acme", &["payments"], 600);
+        let who = (user.access_key_id.as_str(), user.secret_access_key.as_str(), Some(user.session_token.as_str()));
+        assert!(user.expires_unix_secs <= crate::now_unix_secs() + 600, "no later than the token, though the instance would give an hour");
+
+        // The round trip: a scoped read and a scoped listing work, another tenant and index are refused.
+        let own = format!("tenant=acme/index=payments/{HOUR}/p.parquet");
+        assert_eq!((200, own.as_bytes()), (f.get(who, &own).status, f.get(who, &own).body.as_slice()));
+        assert_eq!(under(&["tenant=acme/index=payments/"]), f.list_all(who, "", 1));
+        for key in [format!("tenant=acme/index=default/{HOUR}/a.parquet"), format!("tenant=default/index=default/{HOUR}/d1.parquet"), format!("tenant=zeta/index=default/{HOUR}/z.parquet")] {
+            let r = f.get(who, &key);
+            assert_eq!((403, "AccessDenied"), (r.status, code(&r).as_str()), "{key}");
+        }
+        assert_eq!(403, f.call("GET", who, "/parts/edge-1/part.parquet", &[]).status);
+        // A reading service's token gets the same, for its own tenant; `*` is every index of it.
+        let service = f.credentials("reader", "default", &["*"], 600);
+        let svc = (service.access_key_id.as_str(), service.secret_access_key.as_str(), Some(service.session_token.as_str()));
+        assert_eq!(under(&["tenant=default/"]), f.list_all(svc, "", 1000));
+
+        // The wrong secret, another credential's secret, and the token left off.
+        let wrong = f.get((who.0, SECRET_ACME, who.2), &own);
+        assert_eq!((403, "SignatureDoesNotMatch"), (wrong.status, code(&wrong).as_str()));
+        assert_eq!(403, f.get((who.0, svc.1, who.2), &own).status, "the secret of another credential");
+        assert_eq!(403, f.get((svc.0, svc.1, who.2), &own).status, "the key pair of one credential beside the token of another");
+        assert_eq!(403, f.get((who.0, who.1, None), &own).status, "a temporary key is nothing without its token");
+
+        // The scope or the expiry rewritten inside the token: refused before the signature is looked at.
+        let parts: Vec<&str> = user.session_token.split('.').collect();
+        let rewritten = |name: &str, value: serde_json::Value| {
+            let mut claims: serde_json::Value = serde_json::from_slice(&crate::auth::testing::unb64(parts[1])).unwrap();
+            claims[name] = value;
+            format!("{}.{}.{}", parts[0], broker::b64(claims.to_string().as_bytes()), parts[2])
+        };
+        for (what, token) in [
+            ("another tenant", rewritten("tenant", "default".into())),
+            ("every index", rewritten("indexes", serde_json::json!(["*"]))),
+            ("a later expiry", rewritten("exp", (user.expires_unix_secs + 86_400).into())),
+            ("not a token", "garbage".to_string()),
+        ] {
+            let r = f.get((who.0, who.1, Some(&token)), &own);
+            assert_eq!((400, "InvalidToken"), (r.status, code(&r).as_str()), "{what}");
+        }
+        let status = f.verifier.status();
+        assert_eq!(status["s3_credentials"], serde_json::json!({"ttl_secs": 3600, "issued": 2, "key_persisted": true}));
+        let seen = status["seen"].as_array().unwrap().iter().find(|s| s["principal"] == "acme/reporting" && s["source"] == "s3-session").unwrap().clone();
+        assert!(seen["requests"].as_u64().unwrap() >= 5 && seen["refused"].as_u64().unwrap() >= 4, "{seen}");
+        let text = status.to_string();
+        assert!(!text.contains(&user.secret_access_key) && !text.contains(&user.session_token), "a secret or a token in status");
+        f.server.shutdown();
+    }
+
+    #[test]
+    fn an_expired_temporary_credential_is_refused_and_a_restart_keeps_a_live_one() {
+        // Two seconds of life.
+        let f = Scoped::start(tempfile::tempdir().unwrap(), 2);
+        let short = f.credentials("user", "acme", &["*"], 600);
+        let key = format!("tenant=acme/index=default/{HOUR}/a.parquet");
+        let who = |c: &crate::auth::S3Credentials| (c.access_key_id.clone(), c.secret_access_key.clone(), c.session_token.clone());
+        let (id, secret, token) = who(&short);
+        assert_eq!(200, f.get((&id, &secret, Some(&token)), &key).status);
+        std::thread::sleep(Duration::from_millis(2100));
+        let r = f.get((&id, &secret, Some(&token)), &key);
+        assert_eq!((400, "ExpiredToken"), (r.status, code(&r).as_str()));
+        assert_eq!(400, f.call("GET", (&id, &secret, Some(&token)), "/logs", &[("list-type", "2")]).status);
+        assert_eq!(f.verifier.status()["refused"]["expired"], 2);
+
+        // A restart: the server and the verifier are made again over the same data dir, and a credential
+        // issued before it is still good, because the key it was made under is in the data dir.
+        let tmp = { let Scoped { tmp, server, .. } = f; server.shutdown(); tmp };
+        let before = Scoped::start(tmp, 3600);
+        let long = before.credentials("user", "acme", &["*"], 600);
+        let (id, secret, token) = who(&long);
+        assert_eq!(200, before.get((&id, &secret, Some(&token)), &key).status);
+        let tmp = { let Scoped { tmp, server, .. } = before; server.shutdown(); tmp };
+        let after = Scoped::start(tmp, 3600);
+        assert_eq!(200, after.get((&id, &secret, Some(&token)), &key).status, "issued before the restart, used after it");
+        assert_eq!(after.verifier.status()["s3_credentials"]["issued"], 0, "and nothing was kept to make that so");
+        // Another instance (another data dir, another key) does not take it.
+        let elsewhere = Scoped::new();
+        let r = elsewhere.get((&id, &secret, Some(&token)), &key);
+        assert_eq!((400, "InvalidToken"), (r.status, code(&r).as_str()));
+        elsewhere.server.shutdown();
+        after.server.shutdown();
+    }
+
+    #[test]
+    fn a_listener_that_asks_for_no_credential_still_judges_a_session_token() {
+        // No reader at all, on loopback: the whole store is served unsigned, as it always was.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let key = format!("tenant=acme/index=default/{HOUR}/a.parquet");
+        fs::create_dir_all(store.join(&key).parent().unwrap()).unwrap();
+        fs::write(store.join(&key), b"x").unwrap();
+        let signer = broker::Signer::new(22, "kid-1");
+        let verifier = broker::with_broker_in(Builder::new(broker::two_tenants(crate::config::UnknownIndex::Default)), &signer, tmp.path(), 3600).build();
+        let cfg = S3ServeConfig { addr: "127.0.0.1:0".into(), ..Default::default() };
+        let server = S3Server::start_with_auth(&cfg, store.clone(), None, Arc::clone(&verifier)).unwrap();
+        let addr = server.local_addr();
+        assert_eq!(200, http(addr, "GET", &obj(&key), &[]).status);
+        // A token that is not good is refused there too: it must not quietly become a read of everything.
+        let r = http(addr, "GET", &obj(&key), &[("x-amz-security-token", "v1.e30.AAAA")]);
+        assert_eq!((400, "InvalidToken"), (r.status, code(&r).as_str()));
+        server.shutdown();
+
+        // Off loopback with nobody who could sign, the server does not start; with a broker it does, closed.
+        let public = S3ServeConfig { addr: "0.0.0.0:0".into(), ..Default::default() };
+        assert!(matches!(S3Server::start_with_auth(&public, store.clone(), None, Builder::standalone().build()), Err(S3ServeError::OpenOnPublicAddress { .. })));
+        let server = S3Server::start_with_auth(&public, store, None, verifier).unwrap();
+        let port = server.local_addr().port();
+        assert_eq!(403, http(SocketAddr::from(([127, 0, 0, 1], port)), "GET", &obj(&key), &[]).status, "unsigned is refused once the bind is not loopback");
+        server.shutdown();
+    }
 
     #[test]
     fn a_logged_config_never_carries_the_secret_key() {

@@ -88,6 +88,8 @@ use crate::model::{Attr, AttrValue, LogRecord};
 
 pub const CAPABILITY_PATH: &str = "/.well-known/logless";
 pub const INGEST_PATH: &str = "/v1/ingest";
+/// Trades a broker token for temporary S3 credentials (`docs/auth.md`).
+pub const S3_CREDENTIALS_PATH: &str = "/v1/auth/s3-credentials";
 /// The wire format name a sender and receiver both list in `formats`.
 pub const WIRE_FORMAT: &str = "logless-ndjson/1";
 pub const MAX_HOPS: u32 = 8;
@@ -690,7 +692,8 @@ impl PeerHandler {
     /// in status.
     fn authenticated(&self, request: &Incoming, op: Op) -> Result<Arc<Principal>, Reply> {
         // The replica paths open with a replica credential and nothing else: the open-on-loopback mode does not apply.
-        let closed = op == Op::Replica || !self.open;
+        // Nor to the credential exchange: it is a token that is exchanged.
+        let closed = matches!(op, Op::Replica | Op::S3Credentials) || !self.open;
         self.auth.authorize(Listener::Peer, op, closed, bearer(request)).map_err(|reason| {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
             match reason {
@@ -866,6 +869,42 @@ impl PeerHandler {
         Reply::json(200, format!(r#"{{"accepted":{accepted},"duplicates":{duplicates},"loops":{loops}}}"#))
     }
 
+    /// `POST /v1/auth/s3-credentials`: temporary S3 credentials for the holder of a broker token (a
+    /// person signed in at the console, or a reading service), scoped to the token's tenant and indexes
+    /// and ending no later than the token. The request names nothing: what the credentials may read comes
+    /// from the token and from nowhere else. Nothing is stored (`crate::auth`).
+    fn s3_credentials(&self, request: &Incoming) -> Reply {
+        self.stats.requests.fetch_add(1, Ordering::Relaxed);
+        let principal = match self.authenticated(request, Op::S3Credentials) {
+            Ok(principal) => principal,
+            Err(denied) => return denied,
+        };
+        match self.auth.issue_s3_credentials(&principal, crate::now_unix_secs()) {
+            Ok(issued) => Reply::json(
+                200,
+                serde_json::json!({
+                    "access_key_id": issued.access_key_id,
+                    "secret_access_key": issued.secret_access_key,
+                    "session_token": issued.session_token,
+                    "expires_at": crate::s3_serve::rfc3339(issued.expires_unix_secs),
+                    "expires_unix_secs": issued.expires_unix_secs,
+                    "tenant": principal.tenant,
+                    "indexes": match &principal.indexes {
+                        crate::auth::Indexes::All => vec!["*".to_string()],
+                        crate::auth::Indexes::Only(list) => list.clone(),
+                    },
+                })
+                .to_string(),
+            )
+            .with_header("Cache-Control", "no-store"),
+            Err(reason) => {
+                self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                self.auth.refuse_principal(Listener::Peer, &principal, reason);
+                error_reply(403, "forbidden", "the token is not accepted").with_header("WWW-Authenticate", "Bearer")
+            }
+        }
+    }
+
     fn save_ids(&self, ids: &[Uuid]) {
         if let Err(e) = self.dedupe.insert_all(ids.iter()) {
             self.stats.dedupe_unsaved.fetch_add(1, Ordering::Relaxed);
@@ -901,6 +940,7 @@ impl Handler for PeerHandler {
                 }
             }
             (Method::Post, INGEST_PATH) => self.ingest(&request),
+            (Method::Post, S3_CREDENTIALS_PATH) => self.s3_credentials(&request),
             (Method::Post, path @ (crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH | crate::parts::RETIRE_PATH)) => {
                 self.stats.requests.fetch_add(1, Ordering::Relaxed);
                 let principal = match self.authenticated(&request, self.parts_op()) {
@@ -942,6 +982,7 @@ impl Handler for PeerHandler {
         let (counted, ingest, op) = match (head.method, head.path) {
             (Method::Get, CAPABILITY_PATH) => (false, false, Op::Ingest),
             (Method::Post, INGEST_PATH) => (true, true, Op::Ingest),
+            (Method::Post, S3_CREDENTIALS_PATH) => (true, false, Op::S3Credentials),
             // Parts take the same Content-Type rule as ingest: a typeless POST is a blind cross-site write.
             (Method::Post, crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH | crate::parts::RETIRE_PATH) => (true, true, self.parts_op()),
             _ => return None,

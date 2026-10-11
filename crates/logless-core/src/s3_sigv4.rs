@@ -83,6 +83,13 @@ pub fn verify(
     }
 }
 
+/// The access key id a request says it is signed with, so the caller can find that key's secret before
+/// [`verify`]. Says nothing about whether the key exists or the signature is good.
+pub fn access_key_id(headers: &[(String, String)]) -> Result<&str, AuthError> {
+    let auth = header(headers, "authorization").ok_or(AuthError::Missing)?;
+    Ok(parse_authorization(auth)?.access_key)
+}
+
 /// A presigned (query-string auth) URL path and query for `method` on `raw_path`, signing `host` and
 /// `headers` (lowercase names, the values the request must then carry) with an unsigned payload,
 /// valid `expires_secs` from `now_unix_secs`. `raw_path` is already percent-encoded the way it will
