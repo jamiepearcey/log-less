@@ -920,3 +920,5 @@ document:
 None of the three is chosen here. What is settled is that §6's format contradiction has a
 cheap resolution, and §13's benchmark needs re-running against the store's real sort order
 before any of its time-window numbers can be quoted about this product.
+
+**Resolved 2026-10-11 (Plane 73, ADR 0001):** partition on event time with 8k-row row groups, keep the sort order; time-first rejected. The "re-run against the real sort order" this section asked for is `scripts/sort-layout-bench.py`, written up in `docs/evidence/sort-layout-bench.md`. Section 13's time-window numbers still may not be quoted for the layout the product writes today.
