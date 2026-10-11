@@ -50,12 +50,26 @@ secret_key = "..."       # or LOGLESS_S3_SECRET_KEY
 
 ## Auth
 
-Requests are verified with AWS Signature V4 against the configured key pair.
-Both keys must be set (config or environment); setting only one is an error.
-With neither set the endpoint serves anonymously, which is accepted on loopback
-only: log-less refuses to start on a non-loopback address without credentials,
-so a misconfiguration cannot publish the store to the network. There is no TLS;
-put a proxy in front for anything beyond loopback.
+Requests are verified with AWS Signature V4 (header-signed; presigned URLs are not accepted for reads). Who may sign,
+and what each may read, is in [auth.md](auth.md):
+
+* **The `[serve_s3]` key pair** above reads the whole store, as it always has. Both keys must be set (config or
+  environment); setting only one is an error.
+* **A `[[principals]]` reader** (`kind = "reader"`; its id is the access key id, its `key` the secret) reads its own
+  tenant, `tenant=<t>/`, or only the indexes it lists, `tenant=<t>/index=<i>/`, including each index's `_meta/`.
+  `tenant = "*"` is the whole store.
+* **Temporary credentials** (`x-amz-security-token`), issued by `POST /v1/auth/s3-credentials` on the peer listener
+  for a broker token, read what that token's tenant and indexes allow and stop when they expire.
+
+Outside its scope a reader gets `403 AccessDenied` for an object, whether or not it exists, and a listing shows only
+what it may read: `s3://logs/**/*.parquet` works for every reader and returns its own files. The `parts` bucket is
+kept by node, not by tenant, so only a whole-store reader sees it. An expired session token is `400 ExpiredToken`,
+a changed one `400 InvalidToken`.
+
+With no reader of any kind the endpoint serves anonymously, which is accepted on loopback only: log-less refuses to
+start on a non-loopback address unless somebody could sign (a reader, or `[auth]` for temporary credentials), so a
+misconfiguration cannot publish the store to the network. There is no TLS; put a proxy in front for anything beyond
+loopback.
 
 ## Limits
 

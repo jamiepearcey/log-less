@@ -91,11 +91,23 @@ All agents run with `--tail` on an empty file, which keeps them running until SI
 | central keeps the edge's content-hash template ids | `template_id` is the content hash of the template text, assigned by the edge and kept by central: rows per `template_id` are the same table in both stores, at least 3 ids, and none is a small counter (below 1000000). Only one edge sends records here; two independent miners agreeing is `crates/logless-core/tests/template_hash_ids.rs` |
 | rollup reconciliation (fidelity 100) | no rollup records on central, and rollup counts + records that are not supplements == what the edge wrote |
 
+
+A third instance (`central-t`) has two tenants, `[[principals]]` keys and every listener closed (`docs/auth.md`). After
+it stops and its WAL is merged, the same store is served by `logless serve` and read with DuckDB:
+
+| Check | What it asserts |
+|---|---|
+| a wrong-tenant write, a missing key and an unknown key are refused | HEC without a key is 401, with an unknown key 403; a record naming another tenant (a HEC field, the `logless.tenant` attribute on the peer wire) is 403 |
+| status names the principal, counts refusals by reason, and holds no key | `auth.seen` has one row per principal with its record count; `auth.refused` counts by reason; no key in `GET /admin/v1/info` or the log |
+| a `[[principals]]` key stores under its own tenant's path | rows by tenant and service equal what each key sent; files exist under `tenant=acme/index=default/` |
+| a reader of one tenant reads that tenant only | the `acme-ro` reader globs `s3://logs/**/*.parquet` and gets acme's rows and no others, reads its index's template dictionary, is refused (403) a file of the other tenant, and finds no files under the other tenant's prefix |
+| the store's own key pair still reads every tenant | the `[serve_s3]` pair reads both tenants' rows; the reader's id with the pair's secret is 403; neither secret is in a log or in status |
+
 Counts are taken with `duckdb` over each store's Parquet files after both agents have stopped.
 
 ## What it does not cover
 
-OTLP gRPC, S3 serve beyond the one parts read above, the disk budget (unit-tested, not exercised here), TLS, a real Sentry upstream, `fidelity` below 100 (rollups with real counts), anomaly boosts,
+OTLP gRPC, S3 serve beyond the one parts read and the scoped reader above, broker tokens and temporary S3 credentials (`scripts/auth-broker-e2e.sh`, which needs session-broker binaries), the disk budget (unit-tested, not exercised here), TLS, a real Sentry upstream, `fidelity` below 100 (rollups with real counts), anomaly boosts,
 restarts and faults mid-sync of the record path (those are `sync_soak` and `scripts/chaos.sh`; the parts path's restart is the lifecycle section above), and anything on a non-loopback address.
 Ports are found by binding port 0 and closing it, so another process could take one between that and the agent
 binding it; the run then fails at start and should simply be rerun.
