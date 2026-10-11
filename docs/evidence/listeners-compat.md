@@ -91,6 +91,10 @@ otlp: requests=7 records=5 rejected_503=0 bad_request=2 too_large=0 dropped_upst
 pushdown: errors_forwarded=10 with_context=2 deduped=0 rate_limited=0 context_lines_held=78 ring_bytes=9736
 ```
 
+(Later note, `hard/stab`: `items_forwarded=67 held_locally=0` beside `envelopes_sent=0` was a counting defect. With no
+upstream route the proxy counted the items its policy kept as forwarded although none were sent. It now counts them
+as held locally; see `docs/evidence/e2e-stack.md`.)
+
 `requests=67 envelopes=67`, and nothing in `unauthorized`, `bad_request` or `too_large` in the Sentry line: every
 envelope the two SDKs sent was accepted. What was stored, by service (Sentry events take the SDK's `server_name`;
 transactions and sessions are `sentry:<project>`; project 1 is Node, project 2 is Python). These ran right after

@@ -49,7 +49,7 @@ the file.
 * Request bodies are capped at 1 MiB, and the request head (request line plus
   headers) at 16 KiB and 64 headers; over that is a 431 before any
   authentication. The listener is its own small HTTP/1.1 server
-  (`bounded_http.rs`) because `tiny_http` buffers headers without a limit; it
+  (`bounded_http.rs`, now under every HTTP/1.1 listener) because `tiny_http` buffered headers without a limit; it
   answers with `Connection: close`, needs `Content-Length` for bodies, gives a
   client 10 s to send a request, and caps concurrent connections at 64.
 * Failures before any endpoint logic: 403 `forbidden_host` (bad or repeated
