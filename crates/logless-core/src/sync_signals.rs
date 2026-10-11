@@ -6,7 +6,7 @@
 //!
 //! | kind | what it notices | boosts |
 //! |---|---|---|
-//! | `template_rate` | one template's rate far above its own baseline | yes |
+//! | `template_rate` | one template's rate far above its own baseline | only if the flood includes warnings or worse |
 //! | `silence` | a regular template, or a whole service, stopped | no: there is nothing more to send |
 //! | `new_pair` | a known template appearing in a service for the first time | yes |
 //! | `error_share` | errors a much bigger share of a service's records, even when volume is flat or falling | yes |
@@ -50,6 +50,7 @@ const DRIFT_SLOTS: usize = 3;
 const FORGET_AFTER_QUIET: u32 = 360;
 /// Severity at and above which a record is an "error" for the share detector.
 const ERROR: u8 = 17;
+const WARN: u8 = 13;
 
 /// One thing a detector noticed.
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +103,8 @@ struct Tracked {
 #[derive(Debug, Default)]
 struct Bucket {
     template: HashMap<Key, u32>,
+    /// The worst severity each template had in the bucket.
+    template_severity: HashMap<Key, u8>,
     service_total: HashMap<Option<String>, u32>,
     service_errors: HashMap<Option<String>, u32>,
     /// (service, template, slot) -> (sum, count) of a number found in the body.
@@ -160,6 +163,8 @@ impl Signals {
 
         if self.bucket.template.len() < MAX_PER_BUCKET || self.bucket.template.contains_key(&key) {
             *self.bucket.template.entry(key.clone()).or_insert(0) += 1;
+            let worst = self.bucket.template_severity.entry(key.clone()).or_insert(0);
+            *worst = (*worst).max(record.severity.0);
             for (slot, value) in numbers(&record.body).into_iter().enumerate().take(DRIFT_SLOTS) {
                 let acc = self.bucket.numbers.entry((service.clone(), template, slot as u8)).or_insert((0.0, 0));
                 acc.0 += value;
@@ -250,7 +255,10 @@ impl Signals {
                     service: key.0.clone(),
                     kind: "template_rate",
                     detail: format!("template {} in {}: {} in {} s, against about {:.0} for a bucket this long", key.1, name(&key.0), *count, BUCKET_MS / 1000, b.mean),
-                    boost: true,
+                    // A flood of info or debug lines is noted but does not send the whole service at full detail: that
+                    // would spend the bandwidth the dial exists to save on what is most often a loop or a load test.
+                    // A flood that includes warnings or worse does boost.
+                    boost: bucket.template_severity.get(key).copied().unwrap_or(0) >= WARN,
                 });
             }
             t.base.update(x, spiked);
@@ -457,7 +465,14 @@ mod tests {
         assert!(feed(&mut s, 0, 12, 10, make).iter().all(|f| f.kind != "template_rate"), "steady traffic raises nothing");
         let found = feed(&mut s, 12, 1, 400, make);
         let f = found.iter().find(|f| f.kind == "template_rate").expect("a flood is noticed");
-        assert!(f.boost && f.service.as_deref() == Some("api") && f.detail.contains("template 7"), "{f:?}");
+        assert!(f.service.as_deref() == Some("api") && f.detail.contains("template 7"), "{f:?}");
+        assert!(!f.boost, "a flood of info lines is noted, not boosted: {f:?}");
+        // The same flood at warning level does boost.
+        let mut w = warm(&[("api", 7)]);
+        let warn = |_| rec("api", Severity::WARN, 7, "tick", None);
+        feed(&mut w, 0, 12, 10, warn);
+        let found = feed(&mut w, 12, 1, 400, warn);
+        assert!(found.iter().any(|f| f.kind == "template_rate" && f.boost), "{found:?}");
     }
 
     #[test]
@@ -540,7 +555,7 @@ mod tests {
     fn a_call_sequence_never_seen_is_noticed_but_only_after_learning() {
         let mut s = Signals::new(0, [(Some("api".to_string()), 1), (Some("api".to_string()), 2), (Some("api".to_string()), 3)]);
         let mut at = 0u64;
-        let mut flow = |s: &mut Signals, trace: u8, templates: &[u64], at: u64| -> Vec<Finding> {
+        let flow = |s: &mut Signals, trace: u8, templates: &[u64], at: u64| -> Vec<Finding> {
             templates.iter().flat_map(|t| s.observe(at, &rec("api", Severity::INFO, *t, "x", Some(trace)), false)).collect()
         };
         // During the learning minute 1 -> 2 is learned silently.

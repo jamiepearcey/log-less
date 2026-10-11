@@ -50,6 +50,9 @@ pub struct Config {
     /// Off by default. To send TO another instance, add a `[[destinations]]` of `type = "logless"`.
     #[serde(default)]
     pub peer: crate::peer::PeerConfig,
+    /// An optional decision model that suggests which templates are the same failure (`docs/decision-model.md`). Off unless `url` is set.
+    #[serde(default)]
+    pub decision: crate::decision::DecisionConfig,
     /// File tailing sources (`[[tail]]`). Combined with any `--tail` flags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail: Vec<crate::tail::TailSource>,
@@ -426,6 +429,7 @@ mod tests {
             admin: crate::admin_api::AdminConfig::default(),
             sentry: crate::sentry::SentryConfig::default(),
             peer: crate::peer::PeerConfig::default(),
+            decision: crate::decision::DecisionConfig::default(),
             tail: Vec::new(),
             destinations: Vec::new(),
         })

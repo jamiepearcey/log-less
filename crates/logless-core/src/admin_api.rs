@@ -149,6 +149,8 @@ pub struct AdminService {
     /// state mutex is never held across a scan, so reads stay instant.
     /// Previews that find it taken get 429; writers queue behind it.
     scan_gate: Mutex<()>,
+    /// The decision model, when `[decision]` has a url (or a test supplied one).
+    decision: Option<(crate::decision::DecisionConfig, Arc<dyn crate::decision::DecisionProvider>)>,
     /// Peer sync, set once the sender exists (`set_sync`). Absent in a process that has none.
     sync: OnceLock<Arc<crate::sync::SyncControl>>,
 }
@@ -311,6 +313,7 @@ impl AdminService {
             started: Instant::now(),
             started_at_ms: now_ms(),
             clock,
+            decision: config.decision.enabled().then(|| crate::decision::HttpProvider::new(&config.decision)).flatten().map(|p| (config.decision.clone(), Arc::new(p) as Arc<dyn crate::decision::DecisionProvider>)),
             state: Mutex::new(State {
                 version,
                 updated_at_ms,
@@ -321,6 +324,24 @@ impl AdminService {
             scan_gate: Mutex::new(()),
             sync: OnceLock::new(),
         })
+    }
+
+    /// `GET /admin/v1/templates/merge-suggestions`: pairs of templates the decision model is confident are one failure. A
+    /// suggestion only: nothing is merged. Asks the model about at most `max_pairs` pairs, so it takes a few seconds.
+    pub fn merge_suggestions(&self) -> Resp {
+        let Some((cfg, provider)) = &self.decision else {
+            return err(404, "decision_off", "no decision model is configured; set [decision] url in the config");
+        };
+        let catalog = match self.catalog() {
+            Ok(c) => c,
+            Err(r) => return r,
+        };
+        let templates = match catalog.top_templates(300) {
+            Ok(t) => t,
+            Err(e) => return err(500, "catalog_unavailable", e.to_string()),
+        };
+        let report = crate::decision::suggest_merges(provider.as_ref(), &templates, cfg, std::time::Duration::from_secs(25));
+        (200, json!({ "source": "decision-model", "min_confidence": cfg.min_confidence, "templates_considered": templates.len(), "report": report }))
     }
 
     /// Hands the service the peer sync controls, which `/admin/v1/sync` reads and edits.
@@ -974,6 +995,7 @@ impl Handler for Api {
             (Method::Put, "/admin/v1/policies") => etag(s.put(if_match, &req.body)),
             (Method::Post, "/admin/v1/policies/preview") => reply(s.preview(&req.body)),
             (Method::Post, "/admin/v1/policies/restore") => etag(s.restore(if_match, &req.body)),
+            (Method::Get, "/admin/v1/templates/merge-suggestions") => reply(s.merge_suggestions()),
             (Method::Get, "/admin/v1/sync") => reply(s.sync_get()),
             (Method::Put, "/admin/v1/sync") => reply(s.sync_put(&req.body)),
             (Method::Post, "/admin/v1/sync/test") => reply(s.sync_test(&req.body)),
@@ -992,6 +1014,7 @@ impl Handler for Api {
                 | "/admin/v1/policies/restore"
                 | "/admin/v1/policies/history"
                 | "/admin/v1/sync"
+                | "/admin/v1/templates/merge-suggestions"
                 | "/admin/v1/sync/test"
                 | "/admin/v1/sync/backfill"
                 | "/admin/v1/sync/backfill/cancel",
@@ -1084,8 +1107,13 @@ mod tests {
     }
 
     fn rig_at(clock: Arc<dyn Fn() -> u64 + Send + Sync>) -> Rig {
+        rig_with(clock, |_| {})
+    }
+
+    fn rig_with(clock: Arc<dyn Fn() -> u64 + Send + Sync>, edit: impl FnOnce(&mut Config)) -> Rig {
         let tmp = tempfile::tempdir().unwrap();
-        let config = base_config(tmp.path());
+        let mut config = base_config(tmp.path());
+        edit(&mut config);
         std::fs::create_dir_all(config.store_dir()).unwrap();
         let start = startup(&config).unwrap();
         let handle = PolicyHandle::new(start.effective.clone()).unwrap();
@@ -2112,5 +2140,75 @@ mod tests {
         assert_eq!(400, r.call("POST", "/admin/v1/sync/backfill", &[], Some(json!({"from_ms": 1}))).0);
         assert_eq!(200, r.call("POST", "/admin/v1/sync/backfill/cancel", &[], None).0);
         assert_eq!(405, r.call("GET", "/admin/v1/sync/backfill", &[], None).0);
+    }
+
+    /// A decision model that answers "same" when both templates mention redis, over real HTTP.
+    fn fake_decision_model() -> (String, std::thread::JoinHandle<()>, Arc<AtomicU64>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/decide", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&calls);
+        let handle = std::thread::spawn(move || {
+            listener.set_nonblocking(false).unwrap();
+            for stream in listener.incoming().take(40) {
+                let Ok(stream) = stream else { return };
+                let mut out = stream.try_clone().unwrap();
+                let mut input = BufReader::new(stream);
+                let (mut length, mut auth) = (0usize, String::new());
+                loop {
+                    let mut line = String::new();
+                    if input.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                    if let Some(v) = lower.strip_prefix("authorization:") {
+                        auth = v.trim().to_string();
+                    }
+                }
+                let mut body = vec![0u8; length];
+                input.read_exact(&mut body).unwrap();
+                counted.fetch_add(1, Ordering::SeqCst);
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let state = v["state"].as_str().unwrap().to_string();
+                let p = if auth == "bearer model-token" && state.matches("redis").count() >= 2 { 0.92 } else { 0.08 };
+                let answer = json!({"answers": {"q": {"type": "choice", "choice": "same", "probabilities": {"same": p, "different": 1.0 - p}}}}).to_string();
+                let _ = write!(out, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}", answer.len());
+            }
+        });
+        (url, handle, calls)
+    }
+
+    #[test]
+    fn merge_suggestions_are_404_without_a_model_and_come_from_the_configured_one_with_it() {
+        assert_eq!(404, rig().call("GET", "/admin/v1/templates/merge-suggestions", &[], None).0);
+
+        let (url, _server, calls) = fake_decision_model();
+        let r = rig_with(Arc::new(now_unix_secs), |c| {
+            c.decision = crate::decision::DecisionConfig { url: Some(url), token: Some("model-token".into()), ..Default::default() };
+        });
+        let mut catalog = Catalog::open(&r.config.catalog_path()).unwrap();
+        let t = |id: u64, text: &str, count: u64| crate::drain::Template { id, tokens: text.split(' ').map(str::to_string).collect(), count, first_seen_unix_secs: 0, last_seen_unix_secs: 0 };
+        catalog
+            .save_templates(&[
+                t(1, "redis timeout after <*> ms on GET session", 900),
+                t(2, "redis exceptions timeout reading from redis session", 40),
+                t(3, "postgres timeout after <*> ms on SELECT orders", 70),
+            ])
+            .unwrap();
+        let (status, v) = r.call("GET", "/admin/v1/templates/merge-suggestions", &[], None);
+        assert_eq!(200, status, "{v}");
+        assert_eq!("decision-model", v["source"]);
+        let found = v["report"]["suggestions"].as_array().unwrap();
+        assert_eq!(1, found.len(), "{v}");
+        assert_eq!((1, 2), (found[0]["a"]["id"].as_u64().unwrap(), found[0]["b"]["id"].as_u64().unwrap()));
+        assert_eq!(900, found[0]["a"]["count"]);
+        assert!(found[0]["p_same"].as_f64().unwrap() >= 0.9);
+        assert!(calls.load(Ordering::SeqCst) >= 1, "the model was asked over HTTP, with the bearer token");
+        // It needs the admin token like every other route.
+        assert_eq!(401, r.agent.get(&format!("{}/admin/v1/templates/merge-suggestions", r.base)).call().unwrap().status().as_u16());
     }
 }

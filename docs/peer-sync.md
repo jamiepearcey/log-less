@@ -97,7 +97,7 @@ More signals (`sync_signals.rs`), each against the instance's own baseline, in m
 
 | `kind` | Noticed | Boosts |
 |---|---|---|
-| `template_rate` | one template's rate far above its own baseline | yes |
+| `template_rate` | one template's rate far above its own baseline | only if the flood includes warnings or worse |
 | `silence` | a regular template, or a whole service, stopped (once per episode; a silent service is one finding) | no |
 | `new_pair` | a known template in a service for the first time (pairs read from the catalog) | yes |
 | `error_share` | errors a much larger share of a service's records, even as traffic falls | yes |

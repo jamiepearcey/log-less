@@ -300,6 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 admin: admin_api::AdminConfig::default(),
                 sentry: sentry::SentryConfig::default(),
                 peer: logless_core::peer::PeerConfig::default(),
+                decision: logless_core::decision::DecisionConfig::default(),
                 tail: Vec::new(),
                 destinations: Vec::new(),
             };
