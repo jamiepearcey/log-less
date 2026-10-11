@@ -217,7 +217,7 @@ fn written_unix_secs(path: &Path) -> Option<u64> {
     Some(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
 }
 
-fn read_all(path: &Path) -> Result<Vec<LogRecord>, StoreError> {
+pub(crate) fn read_all(path: &Path) -> Result<Vec<LogRecord>, StoreError> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let file = std::fs::File::open(path)
         .map_err(|source| StoreError::Io { path: path.to_path_buf(), source })?;

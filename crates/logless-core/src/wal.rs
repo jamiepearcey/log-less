@@ -622,6 +622,88 @@ mod tests {
         assert_eq!(w.synced_records(), 51);
     }
 
+    fn split(dir: &Path, late_threshold: Duration, late_roll: Duration) -> SplitWal {
+        let config = SplitConfig {
+            segment_bytes: 1 << 30,
+            fsync_interval: Duration::from_secs(3600),
+            fsync_bytes: 1 << 30,
+            late_threshold,
+            late_roll,
+            late_segment_bytes: 1 << 30,
+        };
+        SplitWal::open(&dir.join("wal"), &late_dir_beside(&dir.join("wal")), &config).unwrap()
+    }
+
+    fn at(event_secs: u64, tag: &str) -> LogRecord {
+        LogRecord::new(event_secs * 1_000_000_000, Severity::INFO, tag)
+    }
+
+    #[test]
+    fn records_older_than_the_threshold_go_to_the_late_spool_and_the_rest_to_the_main_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = 3600u64;
+        let now = 100 * hour;
+        let mut w = split(dir.path(), Duration::from_secs(2 * hour), Duration::from_secs(1800));
+        w.append(&[at(now - 10, "live"), at(now - 3 * hour, "replayed"), at(now - 2 * hour + 1, "just inside"), at(now + 60, "ahead")], now * 1_000_000_000).unwrap();
+        assert_eq!((w.records_written(), w.late_records), (4, 1));
+        assert_eq!(w.sync().unwrap(), 4, "both logs are on disk before the count is given");
+        drop(w);
+        let bodies = |d: &Path| collect(d, false).1.into_iter().map(|r| r.body).collect::<Vec<_>>();
+        assert_eq!(bodies(&dir.path().join("wal")), ["live", "just inside", "ahead"]);
+        assert_eq!(bodies(&dir.path().join("wal-late")), ["replayed"]);
+    }
+
+    #[test]
+    fn the_late_spool_rolls_on_age_whether_or_not_more_late_records_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let late = dir.path().join("wal-late");
+        let ns = 1_000_000_000u64;
+        let now = 1_000_000 * ns;
+        let mut w = split(dir.path(), Duration::from_secs(60), Duration::from_secs(1800));
+        let old = |tag: &str| at(1, tag);
+        w.append(&[old("a")], now).unwrap();
+        w.append(&[old("b")], now + 1799 * ns).unwrap();
+        assert_eq!(w.active_segments(), (1, 1), "inside the roll period: one late segment");
+        // A late record past the period closes the segment and starts the next.
+        w.append(&[old("c")], now + 1800 * ns).unwrap();
+        assert_eq!(w.active_segments(), (1, 2));
+        // With nothing arriving, the writer's own pass closes it on time; an empty segment never rolls.
+        assert_eq!(w.maybe_sync(now + 1900 * ns).unwrap(), Some(3), "the roll synced: three records on disk");
+        assert_eq!(w.active_segments(), (1, 2));
+        w.maybe_sync(now + 3600 * ns).unwrap();
+        assert_eq!(w.active_segments(), (1, 3));
+        w.maybe_sync(now + 9000 * ns).unwrap();
+        assert_eq!(w.active_segments(), (1, 3), "segment 3 holds nothing");
+        drop(w);
+        assert_eq!(list_segments(&late).unwrap().len(), 3);
+        let first = replay_segment(&list_segments(&late).unwrap()[0].1, false, |_| {}).unwrap();
+        assert_eq!(first.records, 2);
+    }
+
+    #[test]
+    fn a_published_count_never_covers_a_record_still_buffered_in_the_other_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let ns = 1_000_000_000u64;
+        let now = 1_000_000 * ns;
+        // The main log syncs at once (interval 0); the late one would wait an hour by itself.
+        let config = SplitConfig {
+            segment_bytes: 1 << 30,
+            fsync_interval: Duration::ZERO,
+            fsync_bytes: 1 << 30,
+            late_threshold: Duration::from_secs(60),
+            late_roll: Duration::from_secs(1800),
+            late_segment_bytes: 1 << 30,
+        };
+        let mut w = SplitWal::open(&dir.path().join("wal"), &dir.path().join("wal-late"), &config).unwrap();
+        w.late.fsync_interval = Duration::from_secs(3600);
+        w.append(&[at(1, "late, first in order"), at(1_000_000, "live")], now).unwrap();
+        assert_eq!(w.maybe_sync(now).unwrap(), Some(2));
+        // Read back without the writer flushing anything more: both are on disk.
+        assert_eq!(collect(&dir.path().join("wal-late"), false).1.len(), 1);
+        assert_eq!(collect(&dir.path().join("wal"), false).1.len(), 1);
+        std::mem::forget(w);
+    }
+
     #[test]
     fn round_trips_batches() {
         let tmp = tempfile::tempdir().unwrap();

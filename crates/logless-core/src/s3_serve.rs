@@ -1,9 +1,12 @@
 //! Read-only S3-compatible server over the hive store.
 //!
-//! The store is `hour=YYYY-MM-DDTHH/level=<bucket>/*.parquet`; this exposes it
-//! path-style as `/{bucket}/{key}` so DuckDB (httpfs), Polars and Grafana read
-//! it with plain HTTP Range requests instead of log-less forwarding to a
-//! vendor. Only `GET`/`HEAD` of objects and ListObjectsV2 exist — there is no
+//! The store is
+//! `tenant=<t>/index=<i>/hour=YYYY-MM-DDTHH/level=<bucket>/node=<writer>/*.parquet`
+//! (`crate::partition`; `hour` is the event hour); this exposes it path-style
+//! as `/{bucket}/{key}`, the key being that path, so DuckDB (httpfs), Polars
+//! and Grafana read it with plain HTTP Range requests instead of log-less
+//! forwarding to a vendor. The five directories are hive columns to a reader
+//! that asks for them, and one index of one tenant is one prefix. Only `GET`/`HEAD` of objects and ListObjectsV2 exist — there is no
 //! write path to harden.
 //!
 //! It runs on [`crate::bounded_http`], like the admin API and the peer receiver:
@@ -1267,6 +1270,53 @@ mod tests {
 
     fn obj(key: &str) -> String {
         format!("/logs/{key}")
+    }
+
+    #[test]
+    fn the_tenant_index_hour_level_node_tree_lists_by_prefix_and_serves_its_files() {
+        use crate::partition::PartitionKey;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let rows = |n: u64| (0..n).map(|i| LogRecord::new(i, Severity::INFO, format!("line {i}"))).collect::<Vec<_>>();
+        let keys = [
+            PartitionKey::new("acme", "default", 491_400, "info", "edge-1"),
+            PartitionKey::new("acme", "default", 491_401, "warn_plus", "edge-1"),
+            PartitionKey::new("acme", "payments", 491_400, "info", "edge-1"),
+            PartitionKey::new("globex", "default", 491_400, "info", "edge-9"),
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            crate::store::write_partition_file(&key.dir(&store).join("f.parquet"), &rows(10 + i as u64)).unwrap();
+        }
+        fs::create_dir_all(store.join("_meta")).unwrap();
+        fs::write(store.join(crate::template_dict::DICT_KEY), b"dict").unwrap();
+        let server = S3Server::start(&S3ServeConfig { addr: "127.0.0.1:0".into(), ..Default::default() }, store.clone()).unwrap();
+        let addr = server.local_addr();
+        let list = |query: &str| String::from_utf8(http(addr, "GET", &format!("/logs?list-type=2&{query}"), &[]).body).unwrap();
+
+        // The whole store, as a `**/*.parquet` glob lists it: every key starts with its tenant.
+        let all = tags(&list(""), "Key");
+        assert_eq!(
+            all,
+            vec![
+                "_meta/templates.pq",
+                "tenant=acme/index=default/hour=2026-01-22T00/level=info/node=edge-1/f.parquet",
+                "tenant=acme/index=default/hour=2026-01-22T01/level=warn_plus/node=edge-1/f.parquet",
+                "tenant=acme/index=payments/hour=2026-01-22T00/level=info/node=edge-1/f.parquet",
+                "tenant=globex/index=default/hour=2026-01-22T00/level=info/node=edge-9/f.parquet",
+            ]
+        );
+        // One index of one tenant is one prefix, and its hours are the next directory.
+        let hours = list("prefix=tenant%3Dacme/index%3Ddefault/&delimiter=/");
+        assert_eq!(tags(&hours, "Prefix")[1..], ["tenant=acme/index=default/hour=2026-01-22T00/", "tenant=acme/index=default/hour=2026-01-22T01/"]);
+        assert!(tags(&hours, "Key").is_empty());
+        // A day of one index, the way a reader narrows by event time.
+        assert_eq!(tags(&list("prefix=tenant%3Dacme/index%3Ddefault/hour%3D2026-01-22T"), "Key").len(), 2);
+        assert_eq!(tags(&list("prefix=tenant%3Dglobex/"), "Key").len(), 1);
+
+        let got = http(addr, "GET", &format!("/logs/{}", all[3]), &[]);
+        assert_eq!((got.status, got.body), (200, fs::read(store.join(&all[3])).unwrap()));
+        assert_eq!(http(addr, "GET", "/logs/tenant=acme/index=default", &[]).status, 404, "a directory is not an object");
+        server.shutdown();
     }
 
     #[test]

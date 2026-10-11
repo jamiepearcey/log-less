@@ -22,6 +22,7 @@ pub mod bounded_http;
 pub mod httpd;
 pub mod mask;
 pub mod merge;
+pub mod migrate;
 pub mod otlp;
 pub mod parts;
 pub mod parts_edge;

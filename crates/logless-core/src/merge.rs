@@ -80,6 +80,28 @@ pub struct MergeReport {
     pub index_rerouted: u64,
 }
 
+impl MergeReport {
+    /// Adds the report of a second merge of the same pass (the late spool's)
+    /// to this one.
+    pub fn absorb(&mut self, other: MergeReport) {
+        self.segments_merged += other.segments_merged;
+        self.segments_skipped += other.segments_skipped;
+        self.records += other.records;
+        self.files_written += other.files_written;
+        self.bytes_written += other.bytes_written;
+        self.wal_bytes_freed += other.wal_bytes_freed;
+        self.truncated += other.truncated;
+        self.temp_files_cleaned += other.temp_files_cleaned;
+        self.templated += other.templated;
+        self.untemplated += other.untemplated;
+        self.new_templates += other.new_templates;
+        self.columns_promoted += other.columns_promoted;
+        self.index_rerouted += other.index_rerouted;
+        self.dictionary_rows = other.dictionary_rows.or(self.dictionary_rows);
+        self.dictionary_error = other.dictionary_error.or(self.dictionary_error.take());
+    }
+}
+
 /// Merge every eligible WAL segment.
 ///
 /// `active_segment` is the id the writer currently owns. That segment and every
