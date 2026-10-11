@@ -4,7 +4,7 @@
 //! usage: churn <out.json> <release.log>...   (releases in order)
 //!
 //! Emits, per release: the catalog before and after (id, content fingerprint,
-//! text), per-id event counts, ids minted, and, for every input line, the id
+//! text, lineage id), per-id event counts, ids minted, and, for every input line, the id
 //! it landed on (`<release.log>.ids`, one per line, `-` when untemplated).
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -23,7 +23,7 @@ fn snapshot(d: &Drain) -> String {
         if i > 0 {
             s.push(',');
         }
-        let _ = write!(s, "[{},\"{:016x}\",\"{}\"]", t.id, t.fingerprint(), esc(&t.text()));
+        let _ = write!(s, "[{},\"{:016x}\",\"{}\",\"{:016x}\"]", t.id, t.fingerprint(), esc(&t.text()), t.lineage_id);
     }
     s.push(']');
     s

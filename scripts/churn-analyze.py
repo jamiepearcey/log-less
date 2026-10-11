@@ -17,13 +17,17 @@ def sim(a, b): return difflib.SequenceMatcher(None, toks(a), toks(b)).ratio()
 rows, summary = [], defaultdict(int)
 for n, t in enumerate(tags):
     c = churn[n]
-    before = {i: (fp, tx) for i, fp, tx in c["before"]}
-    after = {i: (fp, tx) for i, fp, tx in c["after"]}
+    before = {i: (fp, tx) for i, fp, tx, *_ in c["before"]}
+    lin_b = {i: l for i, _, _, l in c["before"]}; lin_a = {i: l for i, _, _, l in c["after"]}
+    after = {i: (fp, tx) for i, fp, tx, *_ in c["after"]}
     ev = {i: k for i, k in c["events"]}
     total = sum(ev.values())
     active = len(ev)
     new_ids = set(c["new_ids"])
     widened = {i for i in before if i in after and before[i][0] != after[i][0]}
+    # issue identity = what the Sentry forwarder groups on: fingerprint of current text (old) vs lineage id (new)
+    id_changed_fp = widened
+    id_changed_lin = {i for i in before if i in after and lin_b[i] != lin_a[i]}
     r = dict(release=t, statements=len(stm[t]), lines=c["lines"], untemplated=c["untemplated"],
              catalog=len(after), active=active, new=len(new_ids), widened=len(widened))
     if n == 0:
@@ -58,6 +62,8 @@ for n, t in enumerate(tags):
         new_kind[i] = k; kind[k] += 1
     r.update(new_from_edited=kind["edited"], new_from_added=kind["added"], new_from_retagged=kind["retagged"],
              new_from_unchanged=kind["unchanged"])
+    r.update(ident_changed_ids_fp=len(id_changed_fp), ident_changed_events_fp=sum(ev.get(i, 0) for i in id_changed_fp),
+             ident_changed_ids_lin=len(id_changed_lin), ident_changed_events_lin=sum(ev.get(i, 0) for i in id_changed_lin))
     # events
     ev_new = sum(ev.get(i, 0) for i in new_ids)
     ev_wid = sum(ev.get(i, 0) for i in widened)
@@ -118,3 +124,6 @@ print(f"TOTAL transitions={len(tr)} new={S('new')} widened={S('widened')} events
       f"new_from_edited={S('new_from_edited')} new_from_added={S('new_from_added')} new_from_retagged={S('new_from_retagged')} "
       f"lineage_edit={S('lineage_edit_new')} linked={S('lineage_linked')} correct={S('lineage_correct')} added={S('lineage_added_new')} falselink={S('lineage_false_link')} "
       f"mean_cov={sum(x['shape_coverage_retained'] for x in tr)/len(tr):.4f} min_cov={min(x['shape_coverage_retained'] for x in tr):.4f}")
+print("\n| release | widened ids: identity changed (text fingerprint) | events | widened ids: identity changed (lineage id) | events |\n|---|---|---|---|---|")
+for x in tr: print(f"| {x['release']} | {x['ident_changed_ids_fp']} | {x['ident_changed_events_fp']} | {x['ident_changed_ids_lin']} | {x['ident_changed_events_lin']} |")
+print(f"TOTAL identity-changed ids fp={S('ident_changed_ids_fp')} events fp={S('ident_changed_events_fp')} ids lineage={S('ident_changed_ids_lin')} events lineage={S('ident_changed_events_lin')} of events={S('events')}")

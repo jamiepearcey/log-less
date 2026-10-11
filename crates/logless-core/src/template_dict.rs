@@ -20,13 +20,15 @@
 //! | `last_seen`   | Timestamp(µs, UTC)        | no   | latest `observed` of a row with this (template, service) |
 //! | `agent`       | Utf8                      | no   | the id space `template_id` was minted in (a UUID per catalog) |
 //! | `global_id`   | UInt64                    | no   | FNV-1a 64 of `text`: equal across agents and services for equal text |
+//! | `lineage_id`  | UInt64                    | no   | `global_id` of the text the template was minted with; unchanged when it widens |
 //!
 //! One row per `(template_id, service)` pair ever merged into the store, so
 //! `(service, template_id)` — the console's issue identity — joins to exactly
 //! one row. `(agent, template_id)` is unambiguous across agents; `global_id` is
-//! the key for merging one shape across services or agents. It is the same
-//! value the Sentry forwarder fingerprints with, so it changes when a template
-//! widens, exactly as a Sentry issue does. `first_seen`/`last_seen` describe
+//! the key for merging one shape across services or agents, and it changes
+//! when a template widens. `lineage_id` is the one that does not: it is what
+//! the Sentry forwarder fingerprints with, so an issue follows a template
+//! through widening. `first_seen`/`last_seen` describe
 //! rows as merged, not as retained: retention does not move them.
 //!
 //! Rewritten whole after every merge that committed a segment: written to a
@@ -84,6 +86,7 @@ pub struct DictRow {
     pub last_seen_micros: i64,
     pub agent: String,
     pub global_id: u64,
+    pub lineage_id: u64,
 }
 
 pub fn dict_path(store_dir: &Path) -> PathBuf {
@@ -100,6 +103,7 @@ pub fn schema() -> SchemaRef {
         Field::new("last_seen", ts, false),
         Field::new("agent", DataType::Utf8, false),
         Field::new("global_id", DataType::UInt64, false),
+        Field::new("lineage_id", DataType::UInt64, false),
     ]))
 }
 
@@ -111,6 +115,7 @@ pub fn rows_from_catalog(catalog: &Catalog) -> Result<Vec<DictRow>, DictError> {
         .into_iter()
         .map(|e| DictRow {
             global_id: crate::drain::fingerprint_of(&e.text),
+            lineage_id: e.lineage_id,
             template_id: e.template_id,
             service: e.service,
             text: e.text,
@@ -182,6 +187,7 @@ fn to_record_batch(rows: &[DictRow]) -> Result<RecordBatch, DictError> {
     let mut last = TimestampMicrosecondBuilder::with_capacity(n).with_timezone("UTC");
     let mut agent = StringBuilder::new();
     let mut global_id = UInt64Builder::with_capacity(n);
+    let mut lineage_id = UInt64Builder::with_capacity(n);
     for r in rows {
         template_id.append_value(r.template_id);
         service.append_option(r.service.as_deref());
@@ -190,6 +196,7 @@ fn to_record_batch(rows: &[DictRow]) -> Result<RecordBatch, DictError> {
         last.append_value(r.last_seen_micros);
         agent.append_value(&r.agent);
         global_id.append_value(r.global_id);
+        lineage_id.append_value(r.lineage_id);
     }
     Ok(RecordBatch::try_new(
         schema(),
@@ -201,6 +208,7 @@ fn to_record_batch(rows: &[DictRow]) -> Result<RecordBatch, DictError> {
             Arc::new(last.finish()),
             Arc::new(agent.finish()),
             Arc::new(global_id.finish()),
+            Arc::new(lineage_id.finish()),
         ],
     )?)
 }
@@ -230,6 +238,8 @@ pub fn read(path: &Path) -> Result<Vec<DictRow>, DictError> {
             .expect("timestamp µs");
         let agent = col("agent").as_any().downcast_ref::<StringArray>().expect("utf8");
         let global_id = col("global_id").as_any().downcast_ref::<UInt64Array>().expect("u64");
+        // Absent in files written before lineage existed: fall back to global_id.
+        let lineage_id = batch.column_by_name("lineage_id").and_then(|c| c.as_any().downcast_ref::<UInt64Array>());
         for i in 0..batch.num_rows() {
             out.push(DictRow {
                 template_id: template_id.value(i),
@@ -239,6 +249,7 @@ pub fn read(path: &Path) -> Result<Vec<DictRow>, DictError> {
                 last_seen_micros: last.value(i),
                 agent: agent.value(i).to_string(),
                 global_id: global_id.value(i),
+                lineage_id: lineage_id.map_or(global_id.value(i), |l| l.value(i)),
             });
         }
     }
@@ -305,6 +316,7 @@ mod tests {
             last_seen_micros: last,
             agent: agent.clone(),
             global_id: crate::drain::fingerprint_of(text),
+            lineage_id: crate::drain::fingerprint_of(text),
         };
         assert_eq!(
             rows,

@@ -1324,11 +1324,13 @@ fn run(
         // The template *text* is carried alongside for aggregate events, whose
         // job is to show the shape rather than one arbitrary example of it.
         let mut template_text = String::new();
+        let mut template_lineage = None;
         if let Ok(mut d) = drain.lock() {
             if let Some(m) = d.add_line(&record.body, now_unix_secs()) {
                 record.template_id = Some(m.template_id);
                 if let Some(t) = d.template(m.template_id) {
                     template_text = t.text();
+                    template_lineage = Some(t.lineage_id);
                 }
             }
         }
@@ -1343,8 +1345,9 @@ fn run(
                         // The ring assigns the local template id; the grouping
                         // key has to be content-derived, and only here is the
                         // template *text* known.
-                        w.error_template_fingerprint = (!template_text.is_empty())
-                            .then(|| logless_core::drain::fingerprint_of(&template_text));
+                        // Lineage, not the current text's hash: a template that
+                        // widens keeps its Sentry issue.
+                        w.error_template_fingerprint = template_lineage;
                         *windows += 1;
                         let json = window_json(&w);
                         (

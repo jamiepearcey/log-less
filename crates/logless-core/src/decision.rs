@@ -262,7 +262,7 @@ mod tests {
     use super::*;
 
     fn t(id: u64, text: &str, count: u64) -> Template {
-        Template { id, tokens: text.split(' ').map(str::to_string).collect(), count, first_seen_unix_secs: 0, last_seen_unix_secs: 0 }
+        Template { id, tokens: text.split(' ').map(str::to_string).collect(), count, first_seen_unix_secs: 0, last_seen_unix_secs: 0, lineage_id: id }
     }
 
     /// Says "same" when both texts name the same product and the same symptom.

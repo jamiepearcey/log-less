@@ -90,6 +90,13 @@ pub struct Template {
     pub count: u64,
     pub first_seen_unix_secs: u64,
     pub last_seen_unix_secs: u64,
+    /// Issue identity that survives widening: the [`Template::fingerprint`]
+    /// the template had when it was minted, never recomputed. `fingerprint()`
+    /// follows the current text and moves when a wildcard widens the template;
+    /// this does not, so a Sentry issue or a dictionary join keyed on it keeps
+    /// following the same template. Unique within a catalog. A template minted
+    /// before this field existed gets the fingerprint of its text at migration.
+    pub lineage_id: u64,
 }
 
 impl Template {
@@ -150,6 +157,8 @@ pub struct Drain {
     /// Keyed by token count, then by leading tokens.
     roots: HashMap<usize, Node>,
     templates: HashMap<u64, Template>,
+    /// Every `lineage_id` in use, so a re-minted shape cannot share one.
+    lineages: std::collections::HashSet<u64>,
     next_id: u64,
     /// Lines rejected because `max_templates` was reached.
     pub untemplated: u64,
@@ -176,6 +185,7 @@ impl Drain {
             config,
             roots: HashMap::new(),
             templates: HashMap::new(),
+            lineages: std::collections::HashSet::new(),
             next_id: 1,
             untemplated: 0,
             lines_seen: 0,
@@ -194,6 +204,7 @@ impl Drain {
             drain.next_id = drain.next_id.max(template.id + 1);
             let key: Vec<String> = template.tokens.clone();
             drain.insert_into_tree(&key, template.id);
+            drain.lineages.insert(template.lineage_id);
             drain.templates.insert(template.id, template);
         }
         drain
@@ -265,6 +276,15 @@ impl Drain {
         let tokens = masked.to_vec();
         let params = params_for(&tokens, masked, raw);
         self.insert_into_tree(&tokens, id);
+        // Content-derived, so agents that mint the same shape agree. If an
+        // earlier template of this catalog was born with this text and has
+        // since widened, the new one is a different template: salt with its id.
+        let text = tokens.join(" ");
+        let mut lineage_id = fingerprint_of(&text);
+        if !self.lineages.insert(lineage_id) {
+            lineage_id = fingerprint_of(&format!("{text}\u{1f}{id}"));
+            self.lineages.insert(lineage_id);
+        }
         self.templates.insert(
             id,
             Template {
@@ -273,6 +293,7 @@ impl Drain {
                 count: 1,
                 first_seen_unix_secs: now_unix_secs,
                 last_seen_unix_secs: now_unix_secs,
+                lineage_id,
             },
         );
         Some(Match {
@@ -598,5 +619,34 @@ mod tests {
             d.template_count()
         );
         assert_eq!(d.untemplated, 0);
+    }
+
+    fn loose() -> Drain {
+        Drain::new(DrainConfig { similarity_threshold: 0.5, ..DrainConfig::default() })
+    }
+
+    #[test]
+    fn lineage_survives_widening_while_the_fingerprint_moves() {
+        let mut d = loose();
+        let a = d.add_line("job run alpha finished ok in cache", 1).unwrap().template_id;
+        let before = d.template(a).unwrap().clone();
+        assert_eq!(before.lineage_id, before.fingerprint());
+        let m = d.add_line("job run beta finished ok in cache", 2).unwrap();
+        assert_eq!(m.template_id, a);
+        let after = d.template(a).unwrap();
+        assert_eq!(after.text(), "job run <*> finished ok in cache");
+        assert_eq!(after.lineage_id, before.lineage_id, "lineage is fixed at birth");
+        assert_ne!(after.fingerprint(), before.fingerprint(), "the text hash moved");
+    }
+
+    #[test]
+    fn restore_keeps_lineage() {
+        let mut d = loose();
+        let a = d.add_line("job run alpha finished ok in cache", 1).unwrap().template_id;
+        d.add_line("job run beta finished ok in cache", 2).unwrap();
+        let ts: Vec<_> = d.templates().cloned().collect();
+        let r = Drain::restore(DrainConfig::default(), ts);
+        assert_eq!(r.template(a).unwrap().lineage_id, d.template(a).unwrap().lineage_id);
+        assert_ne!(r.template(a).unwrap().lineage_id, r.template(a).unwrap().fingerprint());
     }
 }

@@ -101,14 +101,16 @@ demand.
 | `last_seen`   | TIMESTAMP(MICROS, UTC) / `TIMESTAMPTZ`   | no   | latest `observed` of a merged row with this (template, service) |
 | `agent`       | UTF8 / `VARCHAR`                         | no   | the id space `template_id` was minted in: a UUID per catalog |
 | `global_id`   | UINT64 / `UBIGINT`                       | no   | FNV-1a 64 of `text`; equal across agents and services for equal text |
+| `lineage_id`  | UINT64 / `UBIGINT`                       | no   | `global_id` of the text the template was minted with; unchanged when it widens |
 
 - One row per `(template_id, service)` pair ever merged, so a join on
   `template_id` plus `service IS NOT DISTINCT FROM` matches exactly one row.
   Templates no merged row carries yet are not listed.
 - `template_id` is a per-catalog counter: two agents can both call different
   shapes `7`. `(agent, template_id)` is unambiguous; `global_id` is the key for
-  merging one shape across services or agents. It is the value the Sentry
-  forwarder fingerprints with, so it changes when a template widens.
+  merging one shape across services or agents; it changes when a template
+  widens. `lineage_id` does not change when it widens and is what the Sentry
+  forwarder fingerprints with, so group a widened template's rows by it.
 - `first_seen`/`last_seen` describe rows as merged; retention does not move them.
 - A lost catalog restarts ids under a new `agent`, so rows written before the
   loss keep ids the new dictionary no longer describes.
