@@ -454,3 +454,16 @@ Not verified: whether `sync.rs`/`peer.rs` infer the ingest hour from any path (A
 - /Users/jamiepearcey/projects/infrastructure/log-less-wt-integ/crates/logless-core/src/parts.rs (presign/commit carry the partition path; node token bound to tenant; key built from the tuple)
 - /Users/jamiepearcey/projects/infrastructure/log-less-wt-integ/crates/logless-core/src/s3_serve.rs (one tree, `_meta/**/*.pq` servable, per-reader prefix scoping)
 - /Users/jamiepearcey/projects/logless-studio/crates/sqls-source/src/logless_scan.rs (console planning from manifests instead of prefix listings)
+
+---
+
+## Owner decisions (2026-10-11)
+
+1. **Tenant.** A customer in a hosted deployment; an isolated scope (team, environment) in a self-hosted one. A hard boundary in both. A single-tenant self-hosted install uses one tenant named `default`, so it needs no tenant configuration. Cross-tenant reads are for an operator principal only.
+2. **Template id = content hash: accepted.** A widened template gets a new id; the console folds by lineage.
+3. **Event-time retention: accepted.** A replayed row older than the horizon is deleted on the next pass.
+4. **Central's own record files join the same tree** as `node=<central>`: accepted.
+5. **Edges upload only compacted or hour-old files:** accepted.
+6. **Auth.** The shared ingest token goes. It is replaced by named service principals bound to a tenant; people sign in through session-broker at the console and never reach the agent directly. Design in its own item (Plane LOG-179); not decided in detail yet.
+7. **Several centrals.** The console selects a server and that server returns what it holds. When the servers share a bucket and all write the same partition layout, the same query can run directly against the bucket across `node=` leaves, outside any one server's namespace. A union across servers without a bucket is best effort in the console.
+8. **Pushdown:** not answered; stays undecided. Nothing here needs it.
