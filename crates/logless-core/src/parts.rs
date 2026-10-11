@@ -146,7 +146,7 @@ impl PartsConfig {
 }
 
 /// `(scheme, authority)` of an endpoint that is only a scheme and a host.
-fn split_endpoint(endpoint: &str) -> Result<(&str, &str), String> {
+pub(crate) fn split_endpoint(endpoint: &str) -> Result<(&str, &str), String> {
     let bad = || "[peer.parts] endpoint must be http(s)://host[:port]".to_string();
     let (scheme, rest) = endpoint.trim().split_once("://").ok_or_else(bad)?;
     if !matches!(scheme, "http" | "https") {
