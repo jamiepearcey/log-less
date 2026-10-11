@@ -10,6 +10,7 @@
 //! | `POST /v1/ingest` | newline-delimited JSON, one [`LogRecord`] per line, optionally gzipped |
 //! | `POST /v1/parts/presign`, `/v1/parts/commit`, `/v1/parts/retire` | Parquet part upload, when `[peer.parts]` is set (`crate::parts`) |
 //! | `PUT /v1/parts/blob/<node>/<name>` | the part itself, when central stores parts on its own disk; streamed, never buffered |
+//! | `GET /v1/parts/replica/catalog`, `/v1/parts/replica/blob/<node>/<name>` | another central copying this one's parts; opened only by `[peer.parts] replication_tokens` (`crate::parts`) |
 //!
 //! Plain OTLP also works against an instance's OTLP receiver and stays the fallback for a sender that
 //! is not log-less. This native path exists because OTLP cannot carry what a log-less hop needs:
@@ -675,13 +676,7 @@ impl PeerHandler {
         if self.config.unauthenticated() {
             return Ok(None);
         }
-        // Two Authorization headers are ambiguous (a proxy may pick the other one), so neither counts.
-        let presented = request
-            .header("authorization")
-            .filter(|_| request.header_count("authorization") == 1)
-            .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
-            .map(str::trim);
-        let Some(token) = presented else {
+        let Some(token) = bearer(request) else {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
             return Err(error_reply(401, "unauthorized", "a bearer token is required").with_header("WWW-Authenticate", "Bearer"));
         };
@@ -702,6 +697,29 @@ impl PeerHandler {
         } else {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
             Err(error_reply(403, "forbidden", "the token is not accepted").with_header("WWW-Authenticate", "Bearer"))
+        }
+    }
+
+    /// The replica paths (`GET /v1/parts/replica/...`) open with a `replication_tokens` token and nothing
+    /// else: not a node token, not an ingest token, and the listener's open-on-loopback mode does not
+    /// apply. `None` lets the request through.
+    fn replication_gate(&self, head: &Incoming) -> Option<Reply> {
+        let Some(parts) = self.parts.as_ref().filter(|p| p.replica_source_enabled()) else {
+            return Some(error_reply(404, "not_found", "this peer does not offer replication"));
+        };
+        let Some(token) = bearer(head) else {
+            parts.count_replica_refused();
+            return Some(error_reply(401, "unauthorized", "a replication token is required").with_header("WWW-Authenticate", "Bearer"));
+        };
+        let mut matched = false;
+        for accepted in &self.config.parts.replication_tokens {
+            matched |= constant_time_eq(accepted.as_bytes(), token.as_bytes());
+        }
+        if matched {
+            None
+        } else {
+            parts.count_replica_refused();
+            Some(error_reply(403, "forbidden", "the token is not a replication token").with_header("WWW-Authenticate", "Bearer"))
         }
     }
 
@@ -851,6 +869,15 @@ impl PeerHandler {
     }
 }
 
+/// The bearer token of a request. Two Authorization headers are ambiguous (a proxy may pick the other one), so neither counts.
+fn bearer<'a>(request: &'a Incoming) -> Option<&'a str> {
+    request
+        .header("authorization")
+        .filter(|_| request.header_count("authorization") == 1)
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .map(str::trim)
+}
+
 /// Whole seconds, at least one: about as long as a batch that just timed out may still take to sync.
 fn retry_after(bound: Duration) -> String {
     bound.as_secs().clamp(1, 5).to_string()
@@ -888,6 +915,14 @@ impl Handler for PeerHandler {
                     _ => parts.retire(node, &request.body),
                 }
             }
+            (Method::Get, crate::parts::REPLICA_CATALOG_PATH) => match &self.parts {
+                Some(parts) => parts.replica_catalog(request.query),
+                None => error_reply(404, "not_found", "this peer does not offer replication"),
+            },
+            (Method::Get, path) if path.starts_with(crate::parts::REPLICA_BLOB_PREFIX) => match &self.parts {
+                Some(parts) => parts.replica_blob(&path[crate::parts::REPLICA_BLOB_PREFIX.len()..], request.header("range")),
+                None => error_reply(404, "not_found", "this peer does not offer replication"),
+            },
             (Method::Get, INGEST_PATH) => error_reply(405, "method_not_allowed", "POST records here"),
             (Method::Post, CAPABILITY_PATH) => error_reply(405, "method_not_allowed", "GET only"),
             _ => error_reply(404, "not_found", "no such path"),
@@ -897,6 +932,9 @@ impl Handler for PeerHandler {
     /// Everything that needs only the head is decided here, so a refused client is answered before its
     /// body is buffered or inflated: who may talk (Host, token), and in what encoding.
     fn preflight(&self, head: &Incoming) -> Option<Reply> {
+        if head.method == Method::Get && (head.path == crate::parts::REPLICA_CATALOG_PATH || head.path.starts_with(crate::parts::REPLICA_BLOB_PREFIX)) {
+            return self.replication_gate(head);
+        }
         let (counted, ingest) = match (head.method, head.path) {
             (Method::Get, CAPABILITY_PATH) => (false, false),
             (Method::Post, INGEST_PATH) => (true, true),
@@ -1062,10 +1100,12 @@ impl Receiver {
                         Some(store) => tracing::info!(backend = "local", dir = %store.dir, budget_bytes = store.budget_bytes, used_bytes = store.used_bytes, "part upload is on, parts are stored on this instance's disk"),
                         None => tracing::info!(backend = "s3", bucket = %config.parts.bucket, "part upload is on, parts are stored in the bucket"),
                     }
-                    Some(Arc::new(p))
+                    let p = Arc::new(p);
+                    p.start_replication_timer();
+                    Some(p)
                 }
                 // The local backend needs nothing filled in, so a refusal is a mistake to fix, not a table half written.
-                Err(reason) if config.parts.backend() == crate::parts::Backend::Local => return Err(PeerError::BadParts(reason)),
+                Err(reason) if config.parts.backend() == crate::parts::Backend::Local || config.parts.replicate.is_some() => return Err(PeerError::BadParts(reason)),
                 Err(reason) => {
                     tracing::warn!(%reason, "part upload is off");
                     None
@@ -1082,12 +1122,16 @@ impl Receiver {
                 return Err(PeerError::BadNode(format!("node {:?} needs its own non-empty token, and ids are unique", n.id)));
             }
         }
+        // A replication token opens the part store for reading, so it is its own secret, not a node's or an ingest token.
+        if config.parts.replication_tokens.iter().any(|t| config.tokens.contains(t) || config.nodes.iter().any(|n| &n.token == t)) {
+            return Err(PeerError::BadNode("replication_tokens must differ from every peer token and node token".into()));
+        }
         if config.unauthenticated() && !is_loopback(&config.addr) {
             return Err(PeerError::OpenOnPublicAddress { addr: config.addr.clone() });
         }
         // A token that can be guessed online is no better than none once the listener is reachable.
         if !is_loopback(&config.addr) {
-            if let Some(weak) = config.tokens.iter().chain(config.nodes.iter().map(|n| &n.token)).find(|t| t.len() < crate::admin_api::MIN_REMOTE_TOKEN_LEN) {
+            if let Some(weak) = config.tokens.iter().chain(config.nodes.iter().map(|n| &n.token)).chain(&config.parts.replication_tokens).find(|t| t.len() < crate::admin_api::MIN_REMOTE_TOKEN_LEN) {
                 return Err(PeerError::WeakToken { addr: config.addr.clone(), len: weak.len() });
             }
         }
@@ -1144,6 +1188,9 @@ impl Receiver {
     }
 
     pub fn shutdown(self) -> PeerStatsSnapshot {
+        if let Some(parts) = &self.parts {
+            parts.stop_replication();
+        }
         self.server.shutdown();
         self.stats.snapshot()
     }

@@ -2,7 +2,8 @@
 
 Status: accepted, 2026-10-11 (Plane item LOG-167). Builds on ADR 0001 (node-owned prefixes, tiers, lifecycle), which
 stands unchanged, and replaces the assumption in `docs/peer-sync.md` and `docs/restore.md` that parts always live in an
-S3-compatible bucket. Measured runs: `docs/evidence/parts-local-backend.md`.
+S3-compatible bucket. Measured runs: `docs/evidence/parts-local-backend.md`. Amended by LOG-168 (see "Replica": one central
+copying another's parts), measured in `docs/evidence/parts-replication.md`.
 
 ## Context
 
@@ -104,6 +105,7 @@ before, because that is what a table half filled in looks like.
 | Configuration | A committed part survives | Does not survive |
 |---|---|---|
 | `local` | a crash or power loss of central (file and directory are synced before the 200); loss of the edge. While the part is `warm` there are two copies on two machines | loss of central's disk once the part is `cold` (the edge dropped its copy): one disk, one copy. Nothing in log-less replicates the directory. Put it on redundant storage or back it up if cold parts matter |
+| `local`, with a replica central | the same, and loss of central's disk: a second central holds the same bytes on its own disk, as of its last run (below). Its parts are the original node's, so `logless restore` works from it exactly as from the first | a replica that is behind: parts uploaded after its last run are on one disk until the next run. Retirement on the source is not copied, and neither is anything else (the replica never deletes) |
 | `s3`, managed bucket | whatever the provider gives, typically several zones; loss of central (the bucket is elsewhere) | a deleted bucket or key; the provider's failure modes |
 | `s3`, one MinIO or Garage node you run | the same as `local`, with a second system to run | loss of that node's disk |
 
@@ -114,6 +116,56 @@ restore still verifies every part it finds, but cannot say that one is missing. 
 Bit rot on central's disk is not detected by central on the local backend, as it is not on S3 (ADR 0001 and
 `docs/peer-sync.md`, "Damage to a stored part"): the name is the checksum, `logless restore` verifies it, and nothing
 scrubs on a timer.
+
+## Replica: a second central copies the first by catalog diff
+
+Added for LOG-168. Parts are immutable and named by SHA-256, so two centrals cannot disagree about one; the only thing
+to do is close the difference between two catalogs. A **replica** is a central on the local backend configured with a
+source central's URL and a read credential (`[peer.parts.replicate]`). Nothing else in this ADR changes: the edge still
+pushes to one central, there is still no S3 write API and no distributed store, and no central ever connects to an edge.
+The traffic is outbound from the replica only.
+
+1. **Source side.** A central with `[peer.parts] replication_tokens` answers two read-only paths on its peer listener,
+   `GET /v1/parts/replica/catalog?after=<node>/<name>&limit=N` (the catalog in `(node, name)` order, with each part's
+   size, SHA-256, rows, time range, origin and tier) and `GET /v1/parts/replica/blob/<node>/<name>` (the bytes, `Range`
+   honoured). The credential is its own: a node token or an ingest token opens neither path, and a replication token
+   opens nothing else (not presign, not ingest, not the capability document). It is not the admin token either.
+2. **Replica side.** On a timer (`interval_secs`, default 300) or `POST /admin/v1/parts/replicate`, a run pages through
+   the source's catalog. For each part it does not have: if the file is already on its disk it records it; otherwise it
+   fetches it to `<dir>/<node>/.fetch-<sha256>.tmp`, hashing as the bytes arrive, and only a body whose SHA-256 is the
+   name is synced, renamed into place (the upload path's rename and directory syncs) and recorded under its **original
+   node**, with the source's size, rows, time range, origin and tier, an audit row naming the source, and `committed_ms`
+   of the replica's own clock. A part the replica has recorded is never fetched again.
+3. **Resumable.** A fetch cut off by a network failure or a kill keeps its temporary file. The next run hashes the bytes
+   already there and asks for the rest with `Range: bytes=<n>-`; a source that ignores the range is read from byte 0.
+4. **Never deletes.** A part the replica holds that the source no longer lists (retired, swept by the source's retention,
+   or never there) is counted as `only_here` and named in the run's report, and left alone. Whether a deletion on one
+   central should reach the other is a later decision; this slice makes the safe choice and reports the difference. The
+   replica's own `warm_retention_secs` / `cold_retention_secs` apply to what it holds, from its own tier. Tier changes
+   after the first copy are likewise not propagated (`tier_differs` counts them).
+5. **Damaged or unservable.** A part whose bytes do not hash to the name, or whose size is not the listed one, is
+   refused, its temporary file removed, nothing catalogued, and the run goes on; so is a part the source lists but cannot
+   serve (its file is gone or not the catalogued size: 404 `part_missing`). Both are in the report (`damaged`,
+   `unservable`, with the first twenty named) and retried by the next run. A failing source or link (unreachable, a 5xx,
+   a refused token, a full disk) ends the run with that reason instead, so a source that is down is not hammered once
+   per part. Entries that could not be a file in a node directory (a bad node or name, a SHA-256 that is not the name, a
+   size over `max_part_bytes`, an unknown tier) are skipped as `invalid`: the replica believes nothing it is told about
+   where to write.
+6. **Backends.** Both centrals use the local backend. A source on the `s3` backend answers 409 `not_local` and a replica
+   reports it and does nothing else; a bucket is replicated with the storage's own tools (cross-region replication, `mc
+   mirror`, `rclone`). A replica on the `s3` backend is a configuration error and stops the listener at start.
+7. **Rate.** `bytes_per_sec` (0: unlimited) spaces the copy so a replica does not fill a shared link.
+
+The node namespace is shared: a replica that also takes uploads from its own edges holds both under `<dir>/<node>/`, and
+the same node id on both centrals means the same directory. Names are content hashes, so two different parts never
+collide and the same part is the same file.
+
+Alternatives rejected: **the source pushing to the replica** (it would need the replica's address and a credential for
+it, and a second place for a partial copy to be tracked; the replica is the one that knows what it lacks); **an object
+store's own replication in front of the directory** (the local backend's point is no second system); **propagating
+deletes** (an expiry on one central silently emptying the other defeats the second copy; it needs its own decision);
+**reusing the admin API's token or listing** (the admin token is full control of a central and its listing is the
+operator's view, not a peer protocol).
 
 ## Alternatives rejected
 
@@ -160,7 +212,12 @@ scrubs on a timer.
 * A restore over the network from a local-backend central. `logless restore` reads S3 with presigned GETs, and
   log-less's own S3 endpoint accepts only header-signed requests, so `--from s3://parts/<node>` against central does
   not work yet. Use the directory, or copy it.
-* A scrub that re-hashes stored parts on a schedule, and any replication of the parts directory.
+* A scrub that re-hashes stored parts on a schedule. (Replication of the parts directory is the section above; it copies
+  parts, it does not detect damage that happens later on either disk.)
+* Propagating retirement, tier changes or expiry from a source to its replica, and pointing a replica at a source that
+  keeps its parts in a bucket.
+* Removing the partial copies (`.fetch-*.tmp`) of parts a source later retires; they are dot files and are not counted
+  against the disk budget or listed by S3 serve.
 * Cleaning up parts that were uploaded and never committed. The sweep reads only the catalog (ADR 0001), a bucket
   lifecycle rule is the backstop on S3, and the local backend has none: such files count against the budget and show
   as `used_bytes` above the catalog's total.

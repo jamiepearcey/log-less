@@ -7,7 +7,7 @@ Plane item 119. This page records the decisions and describes `logless restore`.
 
 | Question | Decision |
 |---|---|
-| Durability target | Central's part store is the replica of an edge's committed data, reached by the parts path (`docs/peer-sync.md`, `crate::parts`). It is central's own disk or an S3-compatible bucket, whichever `[peer.parts]` configures (ADR 0003, which also says what each survives). An edge's data directory is rebuildable from it. "Bucket" below means either. |
+| Durability target | Central's part store is the replica of an edge's committed data, reached by the parts path (`docs/peer-sync.md`, `crate::parts`). It is central's own disk or an S3-compatible bucket, whichever `[peer.parts]` configures (ADR 0003, which also says what each survives). An edge's data directory is rebuildable from it. "Bucket" below means either. A second central can keep a copy of a local-backend central's parts (`[peer.parts.replicate]`, `docs/peer-sync.md`, "Replicating parts between centrals"): losing the first central's disk then loses only what was uploaded since the replica's last run. |
 | RPO | Everything in a part that was uploaded, plus whatever is still in the edge's own WAL on a surviving disk. Records accepted after the last upload and lost with the disk are not recoverable from the bucket. The bound is "what the edge accepted since its last upload", which is the operator's upload cadence; there is no automatic cadence yet. |
 | RTO | Measured, not promised. See the evidence file for the numbers and what they do and do not cover. |
 | Integrity | A part is named by the SHA-256 of its bytes. The restore recomputes it, so a flipped byte is detected without any inventory. |
@@ -45,6 +45,12 @@ The first form is the local backend: a node's directory under central's parts di
 parts, such as an upload in flight, are counted as `ignored_keys`. The second form is a bucket. `--node` takes only
 that node's rows from the inventory: the catalog is keyed `(node, name)`, and without it every other node's parts
 would be reported missing.
+
+A replica central (`docs/peer-sync.md`) keeps the same layout, parts under their original node and the same catalog rows, so
+a restore from it is the same command with its paths: `--from <replica data dir>/parts/<node> --inventory <replica
+catalog.sqlite> --node <node>`. It has the parts that replica has copied, and the inventory is that replica's, so a part the
+replica has not yet fetched is neither restored nor reported missing; run the replication (or compare the two catalogs) first.
+Measured with the first central and the edge destroyed: `docs/evidence/parts-replication.md`.
 
 Not built: restoring over the network from a local-backend central. Central serves its parts directory read-only over
 S3 (`docs/peer-sync.md`), but `logless restore` reads S3 with presigned GETs and that endpoint accepts only

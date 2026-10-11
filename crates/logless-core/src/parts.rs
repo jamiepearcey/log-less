@@ -41,6 +41,10 @@
 //! into place only if the digest is the name ([`PartsCentral::upload`]); nothing else writes there,
 //! so "stored intact" is a regular file of that name and size.
 //!
+//! # Replication between centrals
+//!
+//! A replica central pulls the parts it lacks from a source central by catalog diff: see [`replicate`].
+//!
 //! # The edge job
 //!
 //! Started by hand for a time range (`SyncControl::start_parts`), like the range fetch. It finds the
@@ -61,6 +65,9 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod replicate;
+pub use replicate::{ReplicateRefused, ReplicationStatus, RunReport, REPLICA_BLOB_PREFIX, REPLICA_CATALOG_PATH};
+
 use crate::httpd::Reply;
 use crate::s3_sigv4::{self, Credentials};
 use crate::sync::{SyncControl, SyncTarget};
@@ -78,6 +85,8 @@ pub const STATE_FILE: &str = "parts-uploaded.jsonl";
 const MAX_TTL_SECS: u64 = 7 * 24 * 3_600;
 /// A URL this close to expiry is presigned again before it is used.
 const EXPIRY_MARGIN_MS: u64 = 5_000;
+/// Most catalog entries a replica may ask for, and a source will give, in one page.
+pub const REPLICA_PAGE_MAX: usize = 1_000;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 const STORAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -139,6 +148,53 @@ pub struct PartsConfig {
     /// The same for a cold part.
     #[serde(default)]
     pub cold_retention_secs: u64,
+    /// Source side of replication (local backend): bearer tokens another central may use to list this one's
+    /// part catalog and read its parts (`GET /v1/parts/replica/...`). Their own credential: a node token or an
+    /// ingest token does not open these paths, and these open nothing else. Never serialized or logged.
+    #[serde(default, skip_serializing)]
+    pub replication_tokens: Vec<String>,
+    /// Replica side: copy another central's parts into this one (`[peer.parts.replicate]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replicate: Option<ReplicateConfig>,
+}
+
+/// `[peer.parts.replicate]`: this central is a replica of the central at `url`.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicateConfig {
+    /// `http(s)://host[:port]` of the source's peer listener.
+    pub url: String,
+    /// One of the source's `replication_tokens`. Never serialized or logged.
+    #[serde(default, skip_serializing)]
+    pub token: String,
+    /// A run starts this often, seconds. 0: only when asked (`POST /admin/v1/parts/replicate`).
+    #[serde(default = "default_replicate_interval")]
+    pub interval_secs: u64,
+    /// Slowest the copy may go, bytes per second over all parts, so a replica does not fill a shared link. 0: no limit.
+    #[serde(default)]
+    pub bytes_per_sec: u64,
+    /// Catalog entries asked for per request, 1 to 1000.
+    #[serde(default = "default_replicate_page")]
+    pub page_size: usize,
+}
+
+impl std::fmt::Debug for ReplicateConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicateConfig")
+            .field("url", &self.url)
+            .field("token", &"<redacted>")
+            .field("interval_secs", &self.interval_secs)
+            .field("bytes_per_sec", &self.bytes_per_sec)
+            .field("page_size", &self.page_size)
+            .finish()
+    }
+}
+
+fn default_replicate_interval() -> u64 {
+    300
+}
+fn default_replicate_page() -> usize {
+    500
 }
 
 fn default_region() -> String {
@@ -175,6 +231,8 @@ impl Default for PartsConfig {
             min_upload_bytes_per_sec: default_min_upload_rate(),
             warm_retention_secs: 0,
             cold_retention_secs: 0,
+            replication_tokens: Vec::new(),
+            replicate: None,
         }
     }
 }
@@ -197,6 +255,8 @@ impl std::fmt::Debug for PartsConfig {
             .field("min_upload_bytes_per_sec", &self.min_upload_bytes_per_sec)
             .field("warm_retention_secs", &self.warm_retention_secs)
             .field("cold_retention_secs", &self.cold_retention_secs)
+            .field("replication_tokens", &format_args!("<{} redacted>", self.replication_tokens.len()))
+            .field("replicate", &self.replicate)
             .finish()
     }
 }
@@ -242,6 +302,23 @@ impl PartsConfig {
         }
         if !(1..=MAX_TTL_SECS).contains(&self.url_ttl_secs) {
             return Err(format!("[peer.parts] url_ttl_secs must be 1 to {MAX_TTL_SECS}"));
+        }
+        if self.replication_tokens.iter().any(String::is_empty) || self.replication_tokens.iter().enumerate().any(|(i, t)| self.replication_tokens[..i].contains(t)) {
+            return Err("[peer.parts] replication_tokens must be non-empty and distinct".into());
+        }
+        if let Some(r) = &self.replicate {
+            if self.backend() != Backend::Local {
+                return Err("[peer.parts.replicate] needs this central's parts on its own disk (backend = \"local\"); a bucket is replicated with the storage's own tools".into());
+            }
+            if split_endpoint(&r.url).is_err() {
+                return Err("[peer.parts.replicate] url must be http(s)://host[:port]".into());
+            }
+            if r.token.is_empty() {
+                return Err("[peer.parts.replicate] needs the source's replication token".into());
+            }
+            if !(1..=REPLICA_PAGE_MAX).contains(&r.page_size) {
+                return Err(format!("[peer.parts.replicate] page_size must be 1 to {REPLICA_PAGE_MAX}"));
+            }
         }
         Ok(())
     }
@@ -426,6 +503,9 @@ struct LocalStats {
     refused_size: AtomicU64,
     refused_content: AtomicU64,
     incomplete: AtomicU64,
+    replica_pages: AtomicU64,
+    replica_served: AtomicU64,
+    refused_replica: AtomicU64,
 }
 
 /// The local backend's state, in `GET /admin/v1/sync` as `parts_store`.
@@ -452,6 +532,10 @@ pub struct PartsStoreStatus {
     pub refused_content: u64,
     /// Uploads that stalled or were cut off. Nothing is kept.
     pub incomplete: u64,
+    /// As the source of a replica: catalog pages answered, parts served (whole or a range), requests refused for their token.
+    pub replica_pages: u64,
+    pub replica_served: u64,
+    pub refused_replica: u64,
 }
 
 /// Bytes of the installed parts under `dir`: regular files one directory down whose names do not start
@@ -670,6 +754,9 @@ impl LocalStore {
             refused_size: load(&self.stats.refused_size),
             refused_content: load(&self.stats.refused_content),
             incomplete: load(&self.stats.incomplete),
+            replica_pages: load(&self.stats.replica_pages),
+            replica_served: load(&self.stats.replica_served),
+            refused_replica: load(&self.stats.refused_replica),
         }
     }
 }
@@ -680,6 +767,8 @@ pub struct PartsCentral {
     config: PartsConfig,
     catalog_path: PathBuf,
     store: Store,
+    /// Present when `[peer.parts.replicate]` is set.
+    replication: Option<replicate::Replication>,
 }
 
 impl PartsCentral {
@@ -689,7 +778,8 @@ impl PartsCentral {
             Backend::S3 => Store::S3 { agent: ureq::Agent::config_builder().timeout_global(Some(STORAGE_TIMEOUT)).http_status_as_error(false).build().into() },
             Backend::Local => Store::Local(LocalStore::open(&config, &catalog_path)?),
         };
-        Ok(Self { config, catalog_path, store })
+        let replication = config.replicate.clone().map(replicate::Replication::new);
+        Ok(Self { config, catalog_path, store, replication })
     }
 
     /// For the process that serves uploads, once, before it listens: clears the temporary files a crash

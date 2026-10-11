@@ -385,6 +385,94 @@ directory: `for f in *.parquet; do [ "$(shasum -a 256 < "$f" | cut -c1-64).parqu
 A damaged part is repaired as above: remove the file and its `peer_parts` row, and upload it again from the edge if the
 edge still has it. A cold part exists only on that disk; ADR 0003 says what each configuration survives.
 
+## Replicating parts between centrals
+
+A second central can hold a copy of the first one's parts, so that losing the first one's disk is not losing every cold
+part (`docs/adr/0003-parts-push-to-central-local-backend.md`, "Replica"). The replica **pulls** from the source by catalog
+diff; the edge still pushes to one central only, and no central connects to an edge. Parts are immutable and named by
+SHA-256, so there is no conflict to resolve, only a difference to close.
+
+```toml
+# On the source central (local backend): who may read its part catalog and its parts. Its own credential.
+[peer.parts]
+enabled = true
+replication_tokens = ["<long random token, different from every node and ingest token>"]
+
+# On the replica central (local backend too). It is an ordinary central: it may take uploads from its own edges as well.
+[peer]
+enabled = true
+addr = "127.0.0.1:9300"
+tokens = ["<its own ingest token>"]               # as any central: required on a non-loopback address
+[peer.parts]
+enabled = true
+[peer.parts.replicate]
+url = "https://central-a.example.com:9300"        # the source's peer listener
+token = "<one of the source's replication_tokens>"
+interval_secs = 300                               # a run starts this often; 0: only when asked
+bytes_per_sec = 0                                 # 0: unlimited; otherwise the copy is paced to this rate
+page_size = 500                                   # catalog entries per request, 1 to 1000
+```
+
+| Step | Request (replica to source, bearer replication token) | Source does |
+|---|---|---|
+| 1 | `GET /v1/parts/replica/catalog?after=<node>/<name>&limit=N` | answers `{parts: [{node, name, size, sha256, rows, min_unix_nano, max_unix_nano, origin, committed_ms, tier, tier_ms}], next}` in `(node, name)` order after `after`; `next` is the last entry's key when the page was full, `null` at the end |
+| 2 | `GET /v1/parts/replica/blob/<node>/<name>` with `Range: bytes=<n>-` when resuming | streams the file (200, or 206 with `Content-Range`); only a *committed* part is served, and only if its file is the catalogued size (404 `not_catalogued` / `part_missing` otherwise); 416 past the end |
+
+Both paths need a `replication_tokens` token and nothing else does: no token is 401, any other token (an ingest token, a
+node token, the replica's own) is 403, and a central with no `replication_tokens` answers 404 as if the paths did not
+exist. A replication token opens nothing else on the peer listener (presign, ingest and the capability document are 403 to
+it). Refusals are counted in `parts_store.refused_replica` on the source, with `replica_pages` and `replica_served`
+(responses started).
+
+**A run.** It pages the source's catalog; for each entry it checks the replica's own catalog:
+
+* **present**: already catalogued here. Nothing is done and nothing is fetched. (`tier_differs` counts the ones whose tier
+  is not the source's: tiers are each central's own after the first copy.)
+* **adopted**: the file is already on this disk under its name and size (a crash between the rename and the catalog row, or
+  an upload nobody committed here). It is recorded without fetching, on the rule that a file under its final name is a
+  whole verified part (ADR 0003).
+* **fetched**: not here. The bytes go to `<dir>/<node>/.fetch-<sha256>.tmp` in pieces, hashed as they arrive, reserved
+  against `disk_budget_bytes`. Only a body whose SHA-256 is the name is `fsync`ed, renamed to `<dir>/<node>/<name>`
+  (directories synced) and recorded under its **original node** with the source's size, rows, time range, origin and tier,
+  and an audit row (`action = replicate`, "copied from <source>"). A restore from the replica therefore finds the parts
+  where an edge's inventory says they are.
+* **resumed**: a fetch that was cut off (a network failure, a restart, a `kill -9`) keeps its `.fetch-*.tmp`. The next run
+  hashes what is there and asks for the rest with `Range`; `resumed_bytes` is what it did not fetch again. A source that
+  answers 200 to a range is read again from byte 0.
+* **damaged**: the bytes do not hash to the name, or the source serves a size other than the listed one. Refused: the
+  temporary file is removed, nothing is catalogued, the run goes on, and the part is named in `problems`.
+* **unservable**: listed by the source but not served (its file is gone or not the catalogued size). Not recorded, named in
+  `problems`, retried by the next run.
+* **invalid**: the entry could not be a file in a node directory (a node or name that is not valid, a SHA-256 that is not
+  the name, a size over `max_part_bytes`, a tier other than `warm`/`cold`). Skipped; the replica does not trust a listing
+  with where to write.
+* **only_here**: held here, not listed by the source. See below.
+
+A source or link that fails (unreachable, a 5xx, a refused token, a full replica disk, a listing out of order) ends the run
+with that reason in `error`, so a down source is not hammered once per part; `complete` is true only when the listing was
+read to its end. Runs never overlap (a manual one while one is under way is 409 `already_running`). A restart of the
+replica keeps its catalog and its partial copies; the run counter and the last report are in memory.
+
+**It never deletes.** A part retired or swept on the source (or never there) stays on the replica and is reported as
+`only_here` (with the first twenty names) on a complete run. Deletion propagation is not built and not decided; the
+replica expires what it holds by its own `warm_retention_secs` / `cold_retention_secs` and sweep (`POST
+/admin/v1/parts/sweep`). Likewise a retirement (`warm` to `cold`) after the first copy is not copied.
+
+**Admin API on the replica.** `POST /admin/v1/parts/replicate` starts a run in the background (202; 409 `not_a_replica` /
+`already_running` / `parts_disabled`); `GET /admin/v1/parts/replicate` and `parts_replication` in `GET /admin/v1/sync` show
+`source`, `state` (`idle` or `running`), `runs`, and `run`, the current or last run: `started_ms`, `finished_ms`,
+`complete`, `error`, `listed`, `present`, `adopted`, `fetched`, `fetched_bytes`, `resumed`, `resumed_bytes`, `damaged`,
+`unservable`, `invalid`, `tier_differs`, `only_here`, `problems`, `only_here_sample`. The token is never shown.
+
+**A source on the S3 backend** answers both paths 409 `not_local`, and a replica reports "keeps its parts in a bucket" and
+copies nothing. A bucket is copied with the storage's own tools. A replica on the S3 backend is a configuration error and
+stops the peer listener at start.
+
+**Restoring from the replica.** The replica's directory and catalog are a central's, so `logless restore` reads them as it
+reads the first one's: `--from <replica data_dir>/parts/<node> --inventory <replica catalog.sqlite> --node <node>`
+(`docs/restore.md`). `docs/evidence/parts-replication.md` has a drill that destroys the first central and the edge and
+restores from the replica.
+
 ## Not built yet
 
 * **Query pushdown** (a filtered scan or partial aggregate answered by the instance). Measure first: the S3 path's bytes
