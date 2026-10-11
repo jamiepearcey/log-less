@@ -271,8 +271,8 @@ serve the damaged object, so a read of it fails.
 
 What an operator does about it:
 
-* Run the storage's own scrub. On MinIO that is its background healing and scanner (`mc admin heal`, and `mc admin scanner status`
-  to see it running); on AWS S3 and other managed stores durability and checksum scrubbing are the provider's. Run it on a
+* Run the storage's own scrub. On MinIO that is its background healing and scanner (`mc admin heal` monitors healing and `mc admin scanner`
+  shows the scanner; check both in your MinIO release, since the admin commands change between versions); on AWS S3 and other managed stores durability and checksum scrubbing are the provider's. Run it on a
   schedule the retention policy can live with.
 * A read that fails with a checksum or bitrot error means the part is damaged. Delete the object and its row in `peer_parts`, then
   upload the part again from the edge (`POST /admin/v1/sync/parts` over the range, after removing its entry from
