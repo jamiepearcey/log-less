@@ -153,6 +153,8 @@ pub struct AdminService {
     decision: Option<(crate::decision::DecisionConfig, Arc<dyn crate::decision::DecisionProvider>)>,
     /// Peer sync, set once the sender exists (`set_sync`). Absent in a process that has none.
     sync: OnceLock<Arc<crate::sync::SyncControl>>,
+    /// The peer receiver's counters, when this process accepts records from other instances.
+    peer: OnceLock<Arc<crate::peer::PeerStats>>,
 }
 
 type Resp = (u16, Value);
@@ -323,6 +325,7 @@ impl AdminService {
             }),
             scan_gate: Mutex::new(()),
             sync: OnceLock::new(),
+            peer: OnceLock::new(),
         })
     }
 
@@ -349,6 +352,11 @@ impl AdminService {
         let _ = self.sync.set(control);
     }
 
+    /// Hands the service the peer receiver's counters, which `/admin/v1/sync` reports as `receiver`.
+    pub fn set_peer_stats(&self, stats: Arc<crate::peer::PeerStats>) {
+        let _ = self.peer.set(stats);
+    }
+
     fn sync_control(&self) -> Result<&Arc<crate::sync::SyncControl>, Resp> {
         self.sync.get().ok_or_else(|| err(404, "sync_unavailable", "peer sync is not running in this process"))
     }
@@ -366,7 +374,9 @@ impl AdminService {
         } else {
             "none"
         };
-        (200, json!({ "source": source, "instance_id": control.instance(), "status": control.status() }))
+        // What this instance receives: the WAL waits and 503s show a receiver whose disk is behind.
+        let receiver = self.peer.get().map(|p| p.snapshot());
+        (200, json!({ "source": source, "instance_id": control.instance(), "status": control.status(), "receiver": receiver }))
     }
 
     /// `PUT /admin/v1/sync`: set the peer. Applies to the running sender at once and is kept in the data
@@ -2049,6 +2059,18 @@ mod tests {
             |_| crate::peer::Admitted::Accepted,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn sync_reports_the_peer_receivers_wal_waits_and_503s_when_it_has_one() {
+        let r = rig_with_sync();
+        assert!(r.call("GET", "/admin/v1/sync", &[], None).1["receiver"].is_null(), "no receiver in this process");
+        let stats = Arc::new(crate::peer::PeerStats::default());
+        stats.wal_timeouts.store(3, Ordering::Relaxed);
+        stats.wal_wait_us_max.store(250_000, Ordering::Relaxed);
+        r.service.set_peer_stats(Arc::clone(&stats));
+        let (_, v) = r.call("GET", "/admin/v1/sync", &[], None);
+        assert_eq!((3, 250_000), (v["receiver"]["wal_timeouts"].as_u64().unwrap(), v["receiver"]["wal_wait_us_max"].as_u64().unwrap()), "{v}");
     }
 
     #[test]

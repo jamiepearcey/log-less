@@ -8,6 +8,10 @@
 //! ring (A to B to A) runs beside it. Every record is accounted for at the end, and the ledger is
 //! printed.
 //!
+//! Two more runs put the agent's WAL acknowledgement under it (`peer` module docs, "Acknowledgement"): a
+//! receiver whose disk never syncs must never let the sender's cursor move, and a queue ahead of a slow WAL
+//! that fills must answer 503 until every record has landed exactly once.
+//!
 //! `cargo test -p logless-core --lib -- sync::soak --nocapture` runs one round of each phase.
 //! The ignored `soak_for_minutes` repeats them for `LOGLESS_SOAK_SECS` (default 180) seconds.
 
@@ -23,7 +27,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::model::{Attr, AttrValue, Severity};
-use crate::peer::{Admitted, PeerConfig, PeerStatsSnapshot};
+use crate::peer::{Admitted, PeerConfig, PeerStatsSnapshot, Ticket, WalAcks};
 
 const SPOOL_MAX: u64 = 256 * 1024;
 const RECEIVER: &str = "central";
@@ -366,6 +370,7 @@ fn start_receiver(dir: &Path, token: &str, store: &Store) -> peer::Receiver {
         RECEIVER.into(),
         None,
         Some(dir),
+        None,
         move |records| {
             sink.lock().unwrap().extend(records);
             Admitted::Accepted
@@ -741,4 +746,186 @@ fn a_flapping_peer_loses_nothing_and_every_record_is_accounted_for() {
 fn soak_for_minutes() {
     let secs = std::env::var("LOGLESS_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(180);
     soak(Duration::from_secs(secs));
+}
+
+// --- acknowledgement after the WAL -------------------------------------------------------------------
+//
+// A central shaped like the agent: the sink queues each batch with a ticket on a bounded channel, a writer
+// thread appends it after `append_delay` (a slow disk) and binds the ticket, and every `fsync_every` it
+// publishes what it has appended as synced. `None` is a disk that never syncs.
+
+struct WalCentral {
+    receiver: Option<peer::Receiver>,
+    acks: Arc<WalAcks>,
+    /// Appended rows, synced or not.
+    appended: Store,
+    stop: Arc<AtomicBool>,
+    writer: Option<std::thread::JoinHandle<()>>,
+}
+
+fn start_wal_central(dir: &Path, queue: usize, bound: Duration, append_delay: Duration, fsync_every: Option<Duration>) -> WalCentral {
+    let acks = WalAcks::new(Arc::new(AtomicU64::new(0)), bound);
+    let (tx, rx) = crossbeam_channel::bounded::<(Ticket, Vec<LogRecord>)>(queue);
+    let appended: Store = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (acks, appended, stop) = (Arc::clone(&acks), Arc::clone(&appended), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let (mut total, mut last_sync) = (0u64, Instant::now());
+            while !stop.load(Ordering::Acquire) {
+                if let Ok((ticket, records)) = rx.recv_timeout(Duration::from_millis(2)) {
+                    std::thread::sleep(append_delay);
+                    total += records.len() as u64;
+                    appended.lock().unwrap().extend(records);
+                    acks.bind(ticket, total);
+                }
+                if let Some(every) = fsync_every {
+                    if last_sync.elapsed() >= every {
+                        acks.publish(total);
+                        last_sync = Instant::now();
+                    }
+                }
+            }
+        })
+    };
+    let config = PeerConfig { enabled: true, addr: "127.0.0.1:0".into(), dedupe_window: 50_000, ..PeerConfig::default() };
+    let tickets = Arc::clone(&acks);
+    let receiver = peer::Receiver::start_in(&config, RECEIVER.into(), None, Some(dir), Some(Arc::clone(&acks)), move |records| {
+        let ticket = tickets.issue();
+        match tx.try_send((ticket, records)) {
+            Ok(()) => Admitted::Pending(ticket),
+            Err(_) => {
+                tickets.forget(ticket);
+                Admitted::Busy
+            }
+        }
+    })
+    .unwrap();
+    WalCentral { receiver: Some(receiver), acks, appended, stop, writer: Some(writer) }
+}
+
+impl WalCentral {
+    fn receiver(&self) -> &peer::Receiver {
+        self.receiver.as_ref().unwrap()
+    }
+
+    fn target(&self) -> SyncTarget {
+        SyncTarget { url: format!("http://{}", self.receiver().local_addr()), token: None, min_severity: 0, fidelity: 100, anomaly_boost: false }
+    }
+
+    /// Tears the pipeline down as the agent does on the way out (or as a crash does, for what was not synced).
+    fn stop(mut self) -> (PeerStatsSnapshot, Vec<LogRecord>) {
+        self.acks.close();
+        let stats = self.receiver.take().unwrap().shutdown();
+        self.stop.store(true, Ordering::Release);
+        self.writer.take().unwrap().join().unwrap();
+        let appended = self.appended.lock().unwrap().clone();
+        (stats, appended)
+    }
+}
+
+fn offer_records(node: &Node, batches: usize, per_batch: usize, ids: &mut HashSet<Uuid>, next: &mut u64) {
+    for _ in 0..batches {
+        let batch: Vec<LogRecord> = (0..per_batch)
+            .map(|_| {
+                *next += 1;
+                soak_record(*next, false)
+            })
+            .collect();
+        ids.extend(batch.iter().map(|r| r.event_id));
+        node.tap.offer(&batch);
+    }
+}
+
+#[test]
+fn a_receiver_whose_wal_never_syncs_never_moves_the_senders_cursor() {
+    let (edge_dir, central_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    // The disk never syncs: every batch waits out the bound and is answered 503.
+    let dying = start_wal_central(central_dir.path(), 8, Duration::from_millis(300), Duration::ZERO, None);
+    let node = start_node("edge", edge_dir.path(), Some(dying.target()));
+    let (mut ids, mut next) = (HashSet::new(), 0);
+    offer_records(&node, 2, 25, &mut ids, &mut next);
+    wait_until("the sender to have been refused twice", Duration::from_secs(30), || dying.receiver().stats().wal_timeouts >= 2);
+    let before_crash = node.control.status();
+    assert_eq!(0, before_crash.sent_records, "no 200 for a batch the WAL never synced: {before_crash:?}");
+    assert!(before_crash.backlog_bytes > 0, "the cursor did not move: the batch is still pending");
+    assert!(before_crash.busy_answers >= 2, "the sender counted the 503s: {before_crash:?}");
+    let dedupe = central_dir.path().join(peer::DEDUPE_FILE);
+    assert_eq!(0, std::fs::metadata(&dedupe).map(|m| m.len()).unwrap_or(0), "no id saved for an unsynced batch");
+
+    // The central dies. What its writer had appended but never synced is gone with it.
+    let (dead, lost) = dying.stop();
+    println!("--- receiver whose WAL never synced, then died ---");
+    println!("receiver: requests {}, wal waits {}, wal timeouts (503) {}, accepted {}; rows appended unsynced (lost) {}", dead.requests, dead.wal_waits, dead.wal_timeouts, dead.accepted, lost.len());
+    println!("sender before the crash: sent {}, busy answers {}, backlog {} bytes", before_crash.sent_records, before_crash.busy_answers, before_crash.backlog_bytes);
+
+    // Restarted on the same data dir with a healthy disk: the spool resends and every record lands once.
+    let healthy = start_wal_central(central_dir.path(), 8, Duration::from_secs(5), Duration::ZERO, Some(Duration::from_millis(20)));
+    node.control.set_target(Some(healthy.target()));
+    wait_until("the resend to land", Duration::from_secs(30), || {
+        let s = node.control.status();
+        s.sent_records == ids.len() as u64 && s.backlog_bytes == 0
+    });
+    let edge = node.finish();
+    let (after, stored) = healthy.stop();
+    let unique: HashSet<Uuid> = stored.iter().map(|r| r.event_id).collect();
+    println!("after the restart: receiver accepted {}, duplicates {}, stored rows {} (unique {}), offered {}", after.accepted, after.duplicates, stored.len(), unique.len(), ids.len());
+    println!("sender: sent {}, duplicates {}, busy answers {}, backlog {}", edge.sent_records, edge.duplicates, edge.busy_answers, edge.backlog_bytes);
+    assert_eq!(dead.accepted, 0);
+    assert_eq!(ids, unique, "every offered record is stored");
+    assert_eq!(stored.len(), unique.len(), "and stored once");
+    assert_eq!((ids.len() as u64, 0), (edge.sent_records, edge.duplicates));
+    assert_eq!(ids.len() as u64 * 16, std::fs::metadata(&dedupe).unwrap().len(), "ids saved once synced");
+}
+
+#[test]
+fn a_full_queue_ahead_of_a_slow_wal_is_a_503_and_every_record_lands_exactly_once() {
+    let central_dir = tempfile::tempdir().unwrap();
+    // One batch of queue, a disk that takes 15 ms per append and syncs every 25 ms, and four edges at once.
+    let central = start_wal_central(central_dir.path(), 1, Duration::from_secs(5), Duration::from_millis(15), Some(Duration::from_millis(25)));
+    let edge_dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    // A spool of the default size: this run is about the receiver refusing, not the sender shedding.
+    let roomy = Tuning { spool_max_bytes: Tuning::default().spool_max_bytes, ..tuning() };
+    let nodes: Vec<Node> = edge_dirs.iter().enumerate().map(|(i, d)| start_node_tuned(&format!("edge{i}"), d.path(), Some(central.target()), roomy)).collect();
+    let (mut ids, mut next) = (HashSet::new(), 0);
+    let started = Instant::now();
+    for _ in 0..10 {
+        for node in &nodes {
+            offer_records(node, 4, 25, &mut ids, &mut next);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    wait_until("every edge to drain", Duration::from_secs(120), || {
+        nodes.iter().all(|n| {
+            let s = n.control.status();
+            s.backlog_bytes == 0 && s.queued_batches == 0
+        }) && central.receiver().stats().accepted == ids.len() as u64
+    });
+    let elapsed = started.elapsed();
+    let edges: Vec<SyncStatus> = nodes.into_iter().map(Node::finish).collect();
+    let (r, stored) = central.stop();
+    let unique: HashSet<Uuid> = stored.iter().map(|rec| rec.event_id).collect();
+    let sum = |f: fn(&SyncStatus) -> u64| edges.iter().map(f).sum::<u64>();
+    let (sent, dup, busy, shed) = (sum(|s| s.sent_records), sum(|s| s.duplicates), sum(|s| s.busy_answers), sum(|s| s.dropped_records));
+
+    println!("\n=== full queue ahead of a slow WAL: 4 edges -> 1 central ({:.1} s) ===", elapsed.as_secs_f64());
+    println!("offered {} records in {} batches", ids.len(), ids.len() / 25);
+    println!("receiver: requests {} = 200 after a WAL sync {} + queue-full 503 {} + wal-timeout 503 {}", r.requests, r.wal_waits - r.wal_timeouts, r.busy, r.wal_timeouts);
+    println!("receiver: records parsed {} = accepted {} + duplicates {} + in refused batches {}", r.records, r.accepted, r.duplicates, r.records - r.accepted - r.duplicates);
+    println!(
+        "receiver: wal waits {}, mean {:.1} ms, max {:.1} ms",
+        r.wal_waits,
+        r.wal_wait_us_total as f64 / r.wal_waits.max(1) as f64 / 1000.0,
+        r.wal_wait_us_max as f64 / 1000.0
+    );
+    println!("senders: sent {sent}, duplicates {dup}, busy answers (503/429) {busy}, shed {shed}");
+    println!("stored rows {}, distinct ids {}, offered ids {}, missing {}", stored.len(), unique.len(), ids.len(), ids.difference(&unique).count());
+
+    assert!(r.busy > 0, "the queue filled and answered 503: {r:?}");
+    assert_eq!(busy, r.busy + r.wal_timeouts, "each 503 the receiver sent, a sender counted");
+    assert_eq!(0, r.wal_timeouts, "the slow WAL stayed inside the bound");
+    assert_eq!(r.requests, r.wal_waits + r.busy, "every request either waited for the WAL or was refused");
+    assert_eq!(ids, unique, "every record landed");
+    assert_eq!(stored.len(), unique.len(), "exactly once");
+    assert_eq!((sent, dup, shed), (ids.len() as u64, 0, 0));
 }

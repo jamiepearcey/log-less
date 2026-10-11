@@ -30,27 +30,51 @@
 //! a non-empty string, or either attribute twice, is refused as a loop (counted with the loops), so a
 //! forged `logless.hops = "0"` or `-100` cannot buy a record more hops.
 //!
-//! # Idempotency
+//! # Acknowledgement
+//!
+//! A 200 means **the WAL has these records on disk** (`fdatasync`ed, not merely written): the sender
+//! commits its spool cursor on a 200 and forgets the batch, so anything weaker turns a crash into loss.
+//! In the agent the sink only puts the batch on a bounded channel ahead of the WAL writer, so it answers
+//! [`Admitted::Pending`] with a [`Ticket`] from [`WalAcks`], and the request thread waits:
+//!
+//! 1. the sink [`WalAcks::issue`]s a ticket and queues the batch (a full queue is [`Admitted::Busy`]: 503);
+//! 2. the record path [`WalAcks::bind`]s the ticket to the WAL record count that covers the batch, as the
+//!    HEC ack table does (`crate::hec::AckTable`), once the batch is submitted;
+//! 3. the WAL writer [`WalAcks::publish`]es its synced record count after each `fdatasync`;
+//! 4. the request thread wakes, saves the ids to the dedupe log, and answers 200.
+//!
+//! The wait is the next fsync, so at most `wal_fsync_interval` (100 ms by default) plus a writer pass. It
+//! is bounded by `ack_wait_ms`: past it the answer is 503 with `Retry-After`, and the sender resends. The
+//! batch is still in the pipeline, so its ticket is kept: once it does sync, the next request saves its
+//! ids ([`WalAcks::settle`]) and the resend is reported as duplicates rather than stored twice (unless the
+//! resend arrives before that sync, see below). Waits, timeouts and late settlements are in [`PeerStats`].
+//!
+//! # Idempotency and crash ordering
 //!
 //! A bounded window of recently accepted event ids ([`DedupeWindow`]) drops a record seen again. The agent
 //! keeps it in [`DEDUPE_FILE`] in the data dir, so it survives a restart: the ids of each admitted batch
-//! are appended and synced in one write after the pipeline took the batch and before the 200 reply, and
-//! the file is compacted to the window once it holds twice that many. A crash between the pipeline taking
-//! a batch and its ids being saved means the sender, which never heard 200, resends it and the receiver
-//! takes it again; a crash after the ids are saved but before the reply means the resend is reported as
-//! duplicates. A retry older than the window (`dedupe_window` records) can still duplicate: at-least-once,
-//! stated rather than hidden.
+//! are appended and synced in one write, and the file is compacted to the window once it holds twice that
+//! many. The order is **WAL synced, then ids saved, then 200**, and a crash between any two steps loses
+//! nothing:
 //!
-//! "The pipeline took it" is only as durable as the sink. In the agent the sink is a bounded in-memory
-//! channel ahead of the WAL, so the 200 (and the saved ids) can precede the WAL write: a crash in that
-//! window loses the batch, and with the ids saved a resend would be dropped as a duplicate too. Closing it
-//! means replying only after the WAL synced the batch, as HEC acks do; `docs/peer-sync.md` tracks it.
+//! * before the WAL sync: the sender never heard 200 and resends, and the ids were never saved, so the
+//!   resend is taken as new. No loss. If an unsynced WAL write survived (a process crash keeps the page
+//!   cache, a power loss does not), the restart replays it too: one duplicate copy.
+//! * after the WAL sync, before the ids are saved: the WAL replays the batch on restart *and* the sender
+//!   resends it, which is taken as new: one duplicate copy in the store (the store does not dedupe by
+//!   event id). The same holds for a resend after a 503 timeout that beats the batch's late sync.
+//! * after the ids are saved, before the 200: the resend is reported as duplicates and committed.
+//!
+//! A retry older than the window (`dedupe_window` records) can still duplicate: at-least-once, stated
+//! rather than hidden. A sink that returns [`Admitted::Accepted`] says the batch is already durable (tests,
+//! and any sink that stores synchronously).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -93,6 +117,10 @@ pub struct PeerConfig {
     /// How many recently accepted event ids are remembered for duplicate detection.
     #[serde(default = "default_dedupe_window")]
     pub dedupe_window: usize,
+    /// How long an ingest request waits for the WAL to sync its batch before answering 503 (see
+    /// "Acknowledgement"). Well above `wal_fsync_interval`, well below the sender's 15 s request timeout.
+    #[serde(default = "default_ack_wait_ms")]
+    pub ack_wait_ms: u64,
     /// Advertised in the capability document: whether this instance also serves its store over S3.
     #[serde(default)]
     pub advertise_s3: bool,
@@ -116,6 +144,9 @@ fn default_max_decompressed() -> usize {
 fn default_dedupe_window() -> usize {
     500_000
 }
+fn default_ack_wait_ms() -> u64 {
+    5_000
+}
 
 impl Default for PeerConfig {
     fn default() -> Self {
@@ -127,6 +158,7 @@ impl Default for PeerConfig {
             max_body_bytes: default_max_body(),
             max_decompressed_bytes: default_max_decompressed(),
             dedupe_window: default_dedupe_window(),
+            ack_wait_ms: default_ack_wait_ms(),
             advertise_s3: false,
             parts: crate::parts::PartsConfig::default(),
         }
@@ -144,6 +176,7 @@ impl std::fmt::Debug for PeerConfig {
             .field("max_body_bytes", &self.max_body_bytes)
             .field("max_decompressed_bytes", &self.max_decompressed_bytes)
             .field("dedupe_window", &self.dedupe_window)
+            .field("ack_wait_ms", &self.ack_wait_ms)
             .field("advertise_s3", &self.advertise_s3)
             .field("parts", &self.parts)
             .finish()
@@ -342,11 +375,176 @@ fn compact(log: &mut IdLog, window: &VecDeque<Uuid>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// What the pipeline did with a batch, as the other receivers: a full pipeline is a 503 and a retry.
+/// What the pipeline did with a batch. A full pipeline is a 503 and a retry, as for the other receivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admitted {
+    /// Taken and already durable: the sink stored it before returning.
     Accepted,
+    /// Taken into a pipeline ahead of the WAL: durable once the ticket's [`WalAcks`] says so.
+    Pending(Ticket),
     Busy,
+}
+
+/// One batch on its way to the WAL, from [`WalAcks::issue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Ticket(u64);
+
+/// Tickets whose request gave up waiting (503) but whose batch may still reach the WAL. Each holds a batch's
+/// ids, so the list is capped; one evicted early only costs a duplicate if its sender resends.
+const MAX_ABANDONED: usize = 1024;
+
+#[derive(Debug, Default)]
+struct TicketState {
+    /// The WAL record count that covers the batch, once the record path has submitted it.
+    watermark: Option<u64>,
+    /// Set when the request answered 503: the ids to save if the batch syncs after all.
+    abandoned: Option<Vec<Uuid>>,
+}
+
+#[derive(Debug, Default)]
+struct AcksInner {
+    tickets: HashMap<u64, TicketState>,
+    abandoned: VecDeque<u64>,
+    closed: bool,
+}
+
+/// How a peer request learns that the WAL has its batch (see "Acknowledgement" in the module docs). Shared
+/// by the peer sink (issue), the record path (bind), the WAL writer (publish) and the request threads (wait).
+#[derive(Debug)]
+pub struct WalAcks {
+    /// Records the WAL has `fdatasync`ed. The same counter HEC acks are judged against.
+    synced: Arc<AtomicU64>,
+    bound: Duration,
+    next: AtomicU64,
+    inner: Mutex<AcksInner>,
+    changed: Condvar,
+}
+
+/// How a wait for the WAL ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalWait {
+    Synced(Duration),
+    /// The bound passed first; the ticket is still held until [`WalAcks::abandon`].
+    TimedOut(Duration),
+    /// The process is shutting down and will not drain the pipeline for this batch.
+    Closed,
+}
+
+impl WalAcks {
+    /// `synced` is the WAL writer's synced record count; `bound` caps each wait.
+    pub fn new(synced: Arc<AtomicU64>, bound: Duration) -> Arc<Self> {
+        Arc::new(Self { synced, bound, next: AtomicU64::new(1), inner: Mutex::new(AcksInner::default()), changed: Condvar::new() })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, AcksInner> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// A ticket for a batch the sink is about to queue.
+    pub fn issue(&self) -> Ticket {
+        let seq = self.next.fetch_add(1, Ordering::Relaxed);
+        self.lock().tickets.insert(seq, TicketState::default());
+        Ticket(seq)
+    }
+
+    /// The batch never made it into the queue.
+    pub fn forget(&self, ticket: Ticket) {
+        self.lock().tickets.remove(&ticket.0);
+    }
+
+    /// Called by the record path once the batch is submitted: it is durable when `synced` reaches
+    /// `records_submitted_total`. Submission order is the order the WAL writer appends in.
+    pub fn bind(&self, ticket: Ticket, records_submitted_total: u64) {
+        let mut inner = self.lock();
+        if let Some(t) = inner.tickets.get_mut(&ticket.0) {
+            t.watermark = Some(records_submitted_total);
+        }
+        drop(inner);
+        self.changed.notify_all();
+    }
+
+    /// Called by the WAL writer after each `fdatasync`, with the record count now on disk.
+    pub fn publish(&self, synced_records: u64) {
+        self.synced.store(synced_records, Ordering::Release);
+        // Taken so a waiter between its check and its wait cannot miss the change.
+        drop(self.lock());
+        self.changed.notify_all();
+    }
+
+    /// Wakes every waiter with [`WalWait::Closed`]: the pipeline is being torn down.
+    pub fn close(&self) {
+        self.lock().closed = true;
+        self.changed.notify_all();
+    }
+
+    pub fn bound(&self) -> Duration {
+        self.bound
+    }
+
+    fn durable(&self, t: &TicketState) -> bool {
+        t.watermark.is_some_and(|w| self.synced.load(Ordering::Acquire) >= w)
+    }
+
+    /// Blocks until the WAL has synced the ticket's batch, the bound passes, or [`WalAcks::close`].
+    pub fn wait(&self, ticket: Ticket) -> WalWait {
+        let started = Instant::now();
+        let deadline = started + self.bound;
+        let mut inner = self.lock();
+        loop {
+            if inner.closed {
+                inner.tickets.remove(&ticket.0);
+                return WalWait::Closed;
+            }
+            if inner.tickets.get(&ticket.0).is_some_and(|t| self.durable(t)) {
+                inner.tickets.remove(&ticket.0);
+                return WalWait::Synced(started.elapsed());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return WalWait::TimedOut(started.elapsed());
+            }
+            inner = self.changed.wait_timeout(inner, deadline - now).unwrap_or_else(|p| p.into_inner()).0;
+        }
+    }
+
+    /// The request answered 503 for a ticket that may still sync: keep its ids for [`WalAcks::settle`].
+    pub fn abandon(&self, ticket: Ticket, ids: Vec<Uuid>) {
+        let mut inner = self.lock();
+        let Some(t) = inner.tickets.get_mut(&ticket.0) else { return };
+        t.abandoned = Some(ids);
+        inner.abandoned.push_back(ticket.0);
+        while inner.abandoned.len() > MAX_ABANDONED {
+            if let Some(old) = inner.abandoned.pop_front() {
+                inner.tickets.remove(&old);
+            }
+        }
+    }
+
+    /// The ids of abandoned batches that have since synced. They are durable now, so saving them makes a
+    /// resend count as duplicates instead of a second copy.
+    pub fn settle(&self) -> Vec<Uuid> {
+        let mut inner = self.lock();
+        if inner.abandoned.is_empty() {
+            return Vec::new();
+        }
+        let AcksInner { tickets, abandoned, .. } = &mut *inner;
+        let mut ids = Vec::new();
+        abandoned.retain(|seq| {
+            if !tickets.get(seq).is_some_and(|t| self.durable(t)) {
+                return true;
+            }
+            if let Some(t) = tickets.remove(seq) {
+                ids.extend(t.abandoned.unwrap_or_default());
+            }
+            false
+        });
+        ids
+    }
+
+    /// Tickets issued and not yet answered or settled.
+    pub fn outstanding(&self) -> usize {
+        self.lock().tickets.len()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -356,11 +554,22 @@ pub struct PeerStats {
     pub accepted: AtomicU64,
     pub duplicates: AtomicU64,
     pub loops: AtomicU64,
+    /// 503s because the pipeline queue was full.
     pub busy: AtomicU64,
     pub unauthorized: AtomicU64,
     pub bad_request: AtomicU64,
     /// Accepted batches whose ids could not be saved to the dedupe log.
     pub dedupe_unsaved: AtomicU64,
+    /// Batches that waited for the WAL to sync before their 200, and the time they spent waiting.
+    pub wal_waits: AtomicU64,
+    pub wal_wait_us_total: AtomicU64,
+    pub wal_wait_us_max: AtomicU64,
+    /// 503s because the WAL did not sync the batch within `ack_wait_ms`: a slow disk.
+    pub wal_timeouts: AtomicU64,
+    /// 503s because the process was shutting down with the batch not yet on disk.
+    pub wal_closed: AtomicU64,
+    /// Ids of timed-out batches saved after their late sync (their resends count as duplicates).
+    pub settled_late: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -374,6 +583,12 @@ pub struct PeerStatsSnapshot {
     pub unauthorized: u64,
     pub bad_request: u64,
     pub dedupe_unsaved: u64,
+    pub wal_waits: u64,
+    pub wal_wait_us_total: u64,
+    pub wal_wait_us_max: u64,
+    pub wal_timeouts: u64,
+    pub wal_closed: u64,
+    pub settled_late: u64,
 }
 
 impl PeerStats {
@@ -389,7 +604,20 @@ impl PeerStats {
             unauthorized: load(&self.unauthorized),
             bad_request: load(&self.bad_request),
             dedupe_unsaved: load(&self.dedupe_unsaved),
+            wal_waits: load(&self.wal_waits),
+            wal_wait_us_total: load(&self.wal_wait_us_total),
+            wal_wait_us_max: load(&self.wal_wait_us_max),
+            wal_timeouts: load(&self.wal_timeouts),
+            wal_closed: load(&self.wal_closed),
+            settled_late: load(&self.settled_late),
         }
+    }
+
+    fn waited(&self, waited: Duration) {
+        let us = waited.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.wal_waits.fetch_add(1, Ordering::Relaxed);
+        self.wal_wait_us_total.fetch_add(us, Ordering::Relaxed);
+        self.wal_wait_us_max.fetch_max(us, Ordering::Relaxed);
     }
 }
 
@@ -399,6 +627,7 @@ struct PeerHandler {
     dedupe: DedupeWindow,
     stats: Arc<PeerStats>,
     sink: Box<dyn Fn(Vec<LogRecord>) -> Admitted + Send + Sync>,
+    acks: Option<Arc<WalAcks>>,
     parts: Option<crate::parts::PartsCentral>,
 }
 
@@ -498,6 +727,15 @@ impl PeerHandler {
         }
         self.stats.records.fetch_add(records.len() as u64, Ordering::Relaxed);
 
+        // Batches that timed out and synced since: saved first, so this request (often their resend) sees them.
+        if let Some(acks) = &self.acks {
+            let late = acks.settle();
+            if !late.is_empty() {
+                self.stats.settled_late.fetch_add(late.len() as u64, Ordering::Relaxed);
+                self.save_ids(&late);
+            }
+        }
+
         let mut keep = Vec::with_capacity(records.len());
         let (mut duplicates, mut loops) = (0u64, 0u64);
         let mut seen_in_batch: HashSet<Uuid> = HashSet::new();
@@ -520,18 +758,37 @@ impl PeerHandler {
         if !keep.is_empty() {
             match (self.sink)(keep) {
                 Admitted::Accepted => {}
+                Admitted::Pending(ticket) => {
+                    let Some(acks) = &self.acks else {
+                        // A sink that queues without a way to learn the WAL synced cannot be acknowledged.
+                        tracing::error!("the peer sink queued a batch but the receiver has no WAL acks");
+                        return error_reply(500, "internal", "the receiver cannot confirm durability");
+                    };
+                    match acks.wait(ticket) {
+                        WalWait::Synced(waited) => self.stats.waited(waited),
+                        WalWait::TimedOut(waited) => {
+                            self.stats.waited(waited);
+                            self.stats.wal_timeouts.fetch_add(1, Ordering::Relaxed);
+                            // Still in the pipeline: if it syncs, its ids are saved then, and the resend is a duplicate.
+                            acks.abandon(ticket, ids);
+                            return error_reply(503, "wal_slow", "the write-ahead log has not synced the batch yet; retry")
+                                .with_header("Retry-After", &retry_after(acks.bound()));
+                        }
+                        WalWait::Closed => {
+                            self.stats.wal_closed.fetch_add(1, Ordering::Relaxed);
+                            return error_reply(503, "shutting_down", "the receiver is stopping; retry").with_header("Retry-After", "1");
+                        }
+                    }
+                }
                 Admitted::Busy => {
                     self.stats.busy.fetch_add(1, Ordering::Relaxed);
                     // Not remembered: the sender retries this batch and it must not be taken for a duplicate.
                     return error_reply(503, "busy", "the ingest pipeline is full; retry").with_header("Retry-After", "1");
                 }
             }
-            // Remembered only after the pipeline took them, and durably before the reply: a sender that hears
-            // 200 has moved on, so a restart must still recognise a late copy (see "Idempotency" above).
-            if let Err(e) = self.dedupe.insert_all(ids.iter()) {
-                self.stats.dedupe_unsaved.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(error = %e, "could not save accepted event ids; a restart may store a resent copy");
-            }
+            // Remembered only once the WAL has them, and durably before the reply: a sender that hears 200 has
+            // moved on, so a restart must still recognise a late copy (see "Idempotency" above).
+            self.save_ids(&ids);
         }
         self.stats.accepted.fetch_add(accepted, Ordering::Relaxed);
         if loops > 0 && accepted == 0 && duplicates == 0 {
@@ -539,6 +796,18 @@ impl PeerHandler {
         }
         Reply::json(200, format!(r#"{{"accepted":{accepted},"duplicates":{duplicates},"loops":{loops}}}"#))
     }
+
+    fn save_ids(&self, ids: &[Uuid]) {
+        if let Err(e) = self.dedupe.insert_all(ids.iter()) {
+            self.stats.dedupe_unsaved.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(error = %e, "could not save accepted event ids; a restart may store a resent copy");
+        }
+    }
+}
+
+/// Whole seconds, at least one: about as long as a batch that just timed out may still take to sync.
+fn retry_after(bound: Duration) -> String {
+    bound.as_secs().clamp(1, 5).to_string()
 }
 
 impl Handler for PeerHandler {
@@ -687,12 +956,20 @@ impl Receiver {
     where
         F: Fn(Vec<LogRecord>) -> Admitted + Send + Sync + 'static,
     {
-        Self::start_in(config, instance, catalog, None, sink)
+        Self::start_in(config, instance, catalog, None, None, sink)
     }
 
     /// As [`Receiver::start_with_catalog`], with the dedupe window kept in [`DEDUPE_FILE`] under `data_dir`
-    /// so it survives a restart. This is how the agent runs it.
-    pub fn start_in<F>(config: &PeerConfig, instance: String, catalog: Option<PathBuf>, data_dir: Option<&Path>, sink: F) -> Result<Self, PeerError>
+    /// so it survives a restart, and `acks` to wait on when the sink answers [`Admitted::Pending`]. This is
+    /// how the agent runs it.
+    pub fn start_in<F>(
+        config: &PeerConfig,
+        instance: String,
+        catalog: Option<PathBuf>,
+        data_dir: Option<&Path>,
+        acks: Option<Arc<WalAcks>>,
+        sink: F,
+    ) -> Result<Self, PeerError>
     where
         F: Fn(Vec<LogRecord>) -> Admitted + Send + Sync + 'static,
     {
@@ -730,6 +1007,7 @@ impl Receiver {
             dedupe,
             stats: Arc::clone(&stats),
             sink: Box::new(sink),
+            acks,
             parts,
         });
         // One thread per connection, so `workers` sets how many senders are served at once; the head
@@ -760,6 +1038,11 @@ impl Receiver {
 
     pub fn stats(&self) -> PeerStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// The live counters, for a status endpoint that outlives this handle's borrow.
+    pub fn stats_handle(&self) -> Arc<PeerStats> {
+        Arc::clone(&self.stats)
     }
 
     pub fn shutdown(self) -> PeerStatsSnapshot {
@@ -1007,7 +1290,7 @@ mod tests {
         let got = Arc::new(StdMutex::new(Vec::new()));
         let start_durable = || {
             let sink = Arc::clone(&got);
-            Receiver::start_in(&config, "self0001".into(), None, Some(dir.path()), move |records| {
+            Receiver::start_in(&config, "self0001".into(), None, Some(dir.path()), None, move |records| {
                 sink.lock().unwrap().extend(records);
                 Admitted::Accepted
             })
@@ -1044,6 +1327,150 @@ mod tests {
         let (_, forgotten) = post(third.local_addr(), INGEST_PATH, None, &ndjson(&old[..1]));
         assert_eq!(1, forgotten["accepted"], "older than the window: accepted again, as documented");
         third.shutdown();
+    }
+
+    // --- acknowledgement after the WAL ------------------------------------------------------------
+    //
+    // The sink here is the agent's shape: it queues the batch and answers Pending. The test plays the record
+    // path (bind) and the WAL writer (publish), so it decides exactly when a batch counts as synced.
+
+    type Queued = Arc<StdMutex<Vec<(Ticket, Vec<LogRecord>)>>>;
+
+    fn start_wal(dir: &Path, bound: Duration) -> (Receiver, Arc<WalAcks>, Queued) {
+        let acks = WalAcks::new(Arc::new(AtomicU64::new(0)), bound);
+        let queued: Queued = Arc::new(StdMutex::new(Vec::new()));
+        let (q, a) = (Arc::clone(&queued), Arc::clone(&acks));
+        let config = PeerConfig { enabled: true, addr: "127.0.0.1:0".into(), ..PeerConfig::default() };
+        let receiver = Receiver::start_in(&config, "self0001".into(), None, Some(dir), Some(Arc::clone(&acks)), move |records| {
+            let ticket = a.issue();
+            q.lock().unwrap().push((ticket, records));
+            Admitted::Pending(ticket)
+        })
+        .unwrap();
+        (receiver, acks, queued)
+    }
+
+    fn wait_for_batches(queued: &Queued, n: usize) {
+        let started = Instant::now();
+        while queued.lock().unwrap().len() < n {
+            assert!(started.elapsed() < Duration::from_secs(5), "the sink never got batch {n}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn dedupe_bytes(dir: &Path) -> u64 {
+        std::fs::metadata(dir.join(DEDUPE_FILE)).map(|m| m.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn the_200_comes_only_after_the_wal_synced_and_then_the_ids_are_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rx, acks, queued) = start_wal(dir.path(), Duration::from_secs(5));
+        let addr = rx.local_addr();
+        let body = ndjson(&[record("a"), record("b")]);
+        let started = Instant::now();
+        let request = std::thread::spawn(move || (post(addr, INGEST_PATH, None, &body), started.elapsed()));
+        wait_for_batches(&queued, 1);
+        // Submitted (bound to its watermark) but not synced: written is not durable.
+        let ticket = queued.lock().unwrap()[0].0;
+        acks.bind(ticket, 2);
+        acks.publish(1);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!request.is_finished(), "no reply while the WAL has not synced the whole batch");
+        assert_eq!(0, dedupe_bytes(dir.path()), "ids are not saved before the WAL has the records");
+        acks.publish(2);
+        let ((status, body), elapsed) = request.join().unwrap();
+        assert_eq!(200, status, "{body}");
+        assert_eq!(2, body["accepted"]);
+        assert!(elapsed >= Duration::from_millis(150), "answered after the sync, {elapsed:?}");
+        assert_eq!(32, dedupe_bytes(dir.path()), "both ids saved once the WAL had them");
+        let s = rx.stats();
+        assert_eq!((1, 0), (s.wal_waits, s.wal_timeouts));
+        assert!(s.wal_wait_us_max >= 150_000, "{s:?}");
+        assert_eq!(0, acks.outstanding());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn a_pipeline_that_dies_before_the_wal_syncs_never_answers_200_and_the_resend_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = vec![record("a"), record("b")];
+        {
+            let (rx, acks, queued) = start_wal(dir.path(), Duration::from_secs(5));
+            let (addr, body) = (rx.local_addr(), ndjson(&batch));
+            let request = std::thread::spawn(move || post(addr, INGEST_PATH, None, &body));
+            wait_for_batches(&queued, 1);
+            acks.bind(queued.lock().unwrap()[0].0, 2);
+            // The process goes down with the batch in memory: the WAL never syncs it.
+            acks.close();
+            let (status, body) = request.join().unwrap();
+            assert_eq!(503, status, "{body}");
+            assert_eq!("shutting_down", body["error"]);
+            assert_eq!(0, dedupe_bytes(dir.path()), "nothing remembered for a batch that never reached disk");
+            assert_eq!(1, rx.stats().wal_closed);
+            rx.shutdown();
+        }
+        // After the restart the sender's resend is new, not a duplicate of the batch the crash lost.
+        let (rx, acks, queued) = start_wal(dir.path(), Duration::from_secs(5));
+        let (addr, body) = (rx.local_addr(), ndjson(&batch));
+        let request = std::thread::spawn(move || post(addr, INGEST_PATH, None, &body));
+        wait_for_batches(&queued, 1);
+        acks.bind(queued.lock().unwrap()[0].0, 2);
+        acks.publish(2);
+        let (status, body) = request.join().unwrap();
+        assert_eq!((200, 2, 0), (status, body["accepted"].as_u64().unwrap(), body["duplicates"].as_u64().unwrap()), "{body}");
+        rx.shutdown();
+    }
+
+    #[test]
+    fn the_wait_is_bounded_and_a_late_sync_makes_the_resend_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let bound = Duration::from_millis(300);
+        let (rx, acks, queued) = start_wal(dir.path(), bound);
+        let batch = ingest_request(&[], &ndjson(&[record("a"), record("b")]));
+        let (addr, req) = (rx.local_addr(), batch.clone());
+        let started = Instant::now();
+        let request = std::thread::spawn(move || exchange(addr, &req, WAIT));
+        wait_for_batches(&queued, 1);
+        acks.bind(queued.lock().unwrap()[0].0, 2);
+        let (status, text) = request.join().unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(503, status, "{text}");
+        assert!(text.contains("wal_slow") && text.to_ascii_lowercase().contains("retry-after: 1"), "{text}");
+        assert!(elapsed >= bound && elapsed < bound + Duration::from_secs(1), "bounded by ack_wait_ms: {elapsed:?}");
+        assert_eq!(0, dedupe_bytes(dir.path()));
+        let s = rx.stats();
+        assert_eq!((1, 1, 0), (s.wal_timeouts, s.wal_waits, s.accepted), "{s:?}");
+        assert!(s.wal_wait_us_max >= 300_000, "{s:?}");
+
+        // The batch was still in the pipeline and syncs late; the resend finds its ids saved.
+        acks.publish(2);
+        let (status, text) = exchange(rx.local_addr(), &batch, WAIT);
+        assert_eq!(200, status, "{text}");
+        assert!(text.contains(r#""accepted":0,"duplicates":2"#), "{text}");
+        assert_eq!(1, queued.lock().unwrap().len(), "the pipeline got the batch once");
+        assert_eq!((2, 32), (rx.stats().settled_late, dedupe_bytes(dir.path())));
+        assert_eq!(0, acks.outstanding());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn abandoned_tickets_are_capped_and_settle_only_once_synced() {
+        let acks = WalAcks::new(Arc::new(AtomicU64::new(0)), Duration::from_millis(1));
+        let tickets: Vec<Ticket> = (0..MAX_ABANDONED + 10).map(|_| acks.issue()).collect();
+        for (i, t) in tickets.iter().enumerate() {
+            acks.bind(*t, i as u64 + 1);
+            assert!(matches!(acks.wait(*t), WalWait::TimedOut(_)));
+            acks.abandon(*t, vec![Uuid::now_v7()]);
+        }
+        assert_eq!(MAX_ABANDONED, acks.outstanding(), "the oldest abandoned tickets are dropped");
+        assert!(acks.settle().is_empty(), "nothing synced yet");
+        acks.publish(20);
+        assert_eq!(10, acks.settle().len(), "tickets 11..=20 synced; 1..=10 were evicted");
+        assert!(acks.settle().is_empty(), "settled once");
+        let forgotten = acks.issue();
+        acks.forget(forgotten);
+        assert_eq!(MAX_ABANDONED - 10, acks.outstanding());
     }
 
     #[test]

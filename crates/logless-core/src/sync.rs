@@ -182,6 +182,9 @@ pub struct SyncStatus {
     pub loops: u64,
     /// Batches the peer refused for good (malformed), dropped after being recorded here.
     pub rejected_batches: u64,
+    /// Answers of 503 or 429: the peer's queue was full or its WAL did not sync the batch in time. The batch
+    /// was kept and resent. A count that keeps climbing is a peer whose disk or pipeline is behind.
+    pub busy_answers: u64,
     /// Records shed because the tap or the spool was full.
     pub dropped_records: u64,
     pub backlog_bytes: u64,
@@ -537,6 +540,9 @@ enum Outcome {
     Rejected(String),
     /// Try again later; the frame stays.
     Retry(String),
+    /// The peer is behind (503 or 429: its queue is full or its WAL has not synced in time): as `Retry`, and
+    /// counted, so a slow peer shows as such rather than as a flaky network.
+    Busy(String),
     /// The token is wrong or missing: nothing will be accepted until it is fixed.
     Unauthorized(String),
 }
@@ -585,7 +591,8 @@ fn send_frame(instance: &str, target: &SyncTarget, ndjson: &[u8]) -> Outcome {
         508 => Outcome::Delivered { accepted: 0, duplicates: 0, loops: reply["loops"].as_u64().unwrap_or(0), bytes: body.len() as u64 },
         400 | 413 | 415 | 422 => Outcome::Rejected(format!("The peer rejected a batch (HTTP {status}): {message}").trim().to_string()),
         404 | 405 => Outcome::Retry(format!("{} is not a log-less peer endpoint (HTTP {status}).", ingest_url(target))),
-        408 | 429 | 500..=599 => Outcome::Retry(format!("The peer answered HTTP {status}. {message}").trim().to_string()),
+        429 | 503 => Outcome::Busy(format!("The peer is busy (HTTP {status}). {message}").trim().to_string()),
+        408 | 500..=599 => Outcome::Retry(format!("The peer answered HTTP {status}. {message}").trim().to_string()),
         other => Outcome::Retry(format!("The peer answered HTTP {other}. {message}").trim().to_string()),
     }
 }
@@ -888,6 +895,14 @@ fn deliver(control: &SyncControl, spool: &mut Spool) -> Pass {
             }
             Outcome::Retry(message) => {
                 control.update(|s| {
+                    s.last_error = Some(message);
+                    s.last_error_ms = Some(now_ms());
+                });
+                return Pass::Backoff(Wait::Doubling);
+            }
+            Outcome::Busy(message) => {
+                control.update(|s| {
+                    s.busy_answers += 1;
                     s.last_error = Some(message);
                     s.last_error_ms = Some(now_ms());
                 });

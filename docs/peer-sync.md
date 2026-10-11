@@ -61,16 +61,48 @@ A plain OTLP collector remains a valid destination through the OTLP receiver; th
 Accepted records are tapped off the WAL writer, filtered by `min_severity`, stamped, and appended to a durable spool
 (`sync-spool/`, capped at 256 MiB). A sender thread drains the spool and commits its cursor only after the peer answered
 2xx, so an outage, a restart or a crash resends and never drops. The tap is a bounded channel that sheds and counts when
-full; the peer never slows the write path. Status (`sent_records`, `duplicates`, `loops`, `backlog_bytes`,
-`dropped_records`, `last_error`) is on `GET /admin/v1/sync`.
+full; the peer never slows the write path. Status (`sent_records`, `duplicates`, `loops`, `busy_answers`,
+`backlog_bytes`, `dropped_records`, `last_error`) is on `GET /admin/v1/sync`.
 
 | Peer answer | Sender does |
 |---|---|
 | 200 | commit; count accepted, duplicate and loop records |
 | 401 / 403 | keep the data, report "refused the token", retry every 60 s (a settings change retries at once) |
 | 400 / 413 / 415 / 422 | drop that batch, record why |
-| 503 / 429 / 5xx / network | keep the data, back off 1 s doubling to 60 s |
+| 503 / 429 | keep the data, back off 1 s doubling to 60 s, count it in `busy_answers` (the peer's queue or WAL is behind) |
+| 5xx / network | keep the data, back off 1 s doubling to 60 s |
 | 508 | batch was all loops: counted, dropped |
+
+## What a 200 means
+
+A 200 from the peer means **the peer's WAL has the records on disk**: written and `fdatasync`ed. The sender commits
+its cursor on a 200 and forgets the batch, so nothing weaker is safe. The receiver puts the batch on a bounded queue
+ahead of the WAL writer and waits, as HEC indexer acks do, until the writer reports a sync that covers it; only then
+does it save the batch's ids (below) and answer.
+
+| Receiver state | Answer |
+|---|---|
+| WAL synced the batch | 200 `{"accepted", "duplicates", "loops"}` |
+| queue ahead of the WAL full (or the ingest queue has no room for the whole batch) | 503 `busy`, `Retry-After: 1`; nothing kept, so the resend is new |
+| WAL has not synced within `peer.ack_wait_ms` (default 5000) | 503 `wal_slow`, `Retry-After`; the batch is still on its way (see below) |
+| shutting down with the batch not yet synced | 503 `shutting_down`, `Retry-After: 1` |
+
+The wait is the next fsync: at most `storage.wal_fsync_interval` (100 ms by default) plus one writer pass (20 ms),
+since the writer syncs on that interval. Measured on one machine with the defaults, sequential 50-record batches:
+p50 6 to 8 ms and p99 17 to 27 ms before, p50 112 to 121 ms and p99 164 to 172 ms now, over three runs each
+(`docs/evidence/peer-ack-wal.md`). One sender sends its
+batches one at a time, so its throughput is about one batch (up to 1 MiB) per fsync interval; more senders share a
+sync. `ack_wait_ms` should be well above the fsync interval (a warning is logged at start when it is under twice
+that) and below the sender's 15 s request timeout.
+
+A batch that timed out stays in the pipeline. If it syncs later, the next request to arrive saves its ids first, so
+its resend (the sender retries after the backoff) is reported as duplicates rather than stored again. A resend that
+arrives before that late sync is taken again: one duplicate copy.
+
+The receiver's counters are `receiver` in `GET /admin/v1/sync` on the peer: `wal_waits`, `wal_wait_us_total` and
+`wal_wait_us_max` (time spent waiting for the fsync), `wal_timeouts` (503 `wal_slow`), `busy` (503 `busy`),
+`wal_closed`, `settled_late`. A climbing `wal_timeouts` or a `wal_wait_us_max` near `ack_wait_ms` is a peer whose disk
+is behind; on the sender it shows as `busy_answers`.
 
 The cursor commit is checked. If the spool cannot record that a batch was answered (a full or read-only disk), the
 cursor does not move, status goes to `error` with "The peer has the batch, but the sync spool could not record
@@ -86,27 +118,29 @@ The receiver remembers the event ids it accepted, the last `dedupe_window` of th
 record whose id it already holds, reporting it in `duplicates`. The window is kept in `peer-dedupe.ids` in the data
 dir (16 bytes per id), so it survives a restart:
 
-* Each accepted request's ids are appended and synced in one write, after the pipeline took the batch and before the
+* Each accepted request's ids are appended and synced in one write, after the WAL synced the batch and before the
   200 reply. Ingest pays one sync per request, not per record.
 * At start the last `dedupe_window` ids are loaded; a torn id at the end (a crash mid-append) is cut off.
 * Once the file holds twice the window it is rewritten to the window alone (temporary file, sync, rename), so it stays
   under `2 x dedupe_window x 16` bytes (16 MB at the default).
-* A batch the pipeline refused (503) is not remembered, so its retry is not taken for a duplicate.
+* A batch refused with 503 is not remembered, so its retry is not taken for a duplicate (a `wal_slow` batch is
+  remembered only once it has synced, as above).
 
-Crash ordering:
+The order is **WAL synced, then ids saved, then 200**. Crash ordering:
 
 | Crash | Effect |
 |---|---|
-| after the pipeline took the batch, before its ids were saved | the sender never heard 200 and resends; the receiver takes the batch again (a duplicate in the store if the first copy reached the WAL) |
+| before the batch reached the WAL, or reached it but was not synced | the sender never heard 200 and resends; the ids were never saved, so the resend is taken. If the unsynced WAL write survived (a process crash keeps the page cache; a power loss does not), the restart also replays it: one duplicate copy. No loss either way |
+| after the WAL sync, before the ids were saved | the WAL replays the batch and the sender resends it, which is taken: one duplicate copy in the store |
 | after the ids were saved, before the 200 | the resend is reported as duplicates and committed by the sender |
 | retry older than the window | taken again: at-least-once |
 
-**Open gap.** In the agent "the pipeline took it" means the batch entered the bounded in-memory channel ahead of the
-WAL, not that the WAL has it. The 200 (and the saved ids) can therefore precede the WAL write, and a crash in that
-window loses the batch: the sender has committed, and a resend after the ids were saved would be dropped as a
-duplicate. Closing it means replying only after the WAL synced the batch, as HEC acks do. Not built yet.
+The store does not dedupe by event id, so a duplicate copy stays as a second row with the same `event_id`; the
+receiver's window absorbs every resend whose ids it saved. `docs/evidence/peer-ack-wal.md` has a real `kill -9` of the
+central agent mid-wait: the sender's cursor did not move, every record arrived, and the batch the killed process had
+written to its WAL was stored twice.
 
-If the ids cannot be saved, the batch is still accepted (it is in the pipeline), `dedupe_unsaved` in the peer stats
+If the ids cannot be saved, the batch is still acknowledged (the WAL has it), `dedupe_unsaved` in the peer stats
 counts it and a warning is logged: this process still recognises a resend, a restart may not.
 
 ## Loops and provenance

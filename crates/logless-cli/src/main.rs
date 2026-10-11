@@ -929,6 +929,16 @@ fn run(
     // against this number and nothing else.
     let synced_records = Arc::new(AtomicU64::new(0));
     let acks = hec::AckTable::new(Arc::clone(&synced_records));
+    // The same number answers peer requests, which wait for it instead of polling (`peer` module docs).
+    // The writer publishes through this so a waiting request wakes on the fsync, not on a timer.
+    let wal_acks = logless_core::peer::WalAcks::new(Arc::clone(&synced_records), Duration::from_millis(config.peer.ack_wait_ms));
+    if config.peer.enabled && wal_acks.bound() < config.storage.wal_fsync_interval * 2 {
+        tracing::warn!(
+            ack_wait_ms = config.peer.ack_wait_ms,
+            fsync_interval_ms = config.storage.wal_fsync_interval.as_millis() as u64,
+            "peer.ack_wait_ms is under twice the WAL fsync interval: peer batches will often answer 503 and be resent"
+        );
+    }
     let stop = Arc::new(AtomicBool::new(false));
 
     // Graceful shutdown. The deployment target is a systemd unit, and systemd
@@ -964,7 +974,7 @@ fn run(
     let writer = {
         let stop = Arc::clone(&stop);
         let active = Arc::clone(&active_segment);
-        let synced = Arc::clone(&synced_records);
+        let synced = Arc::clone(&wal_acks);
         let wal_dir = config.wal_dir();
         let (segment_bytes, fsync_interval, fsync_bytes) = (
             config.storage.wal_segment_bytes,
@@ -989,10 +999,10 @@ fn run(
                         active.store(w.current_segment_id(), Ordering::Relaxed);
                     }
                     // Publish only after a sync actually happened: this is the
-                    // number a HEC ack is judged against, so it must mean
-                    // "on disk", not "appended".
+                    // number a HEC ack is judged against and a peer request
+                    // waits on, so it must mean "on disk", not "appended".
                     if w.maybe_sync()? {
-                        synced.store(w.records_written, Ordering::Release);
+                        synced.publish(w.records_written);
                     }
                     if stop.load(Ordering::Relaxed) && batch.is_empty() {
                         let tail = consumer.drain();
@@ -1001,7 +1011,7 @@ fn run(
                             writer_tap.offer(&tail);
                         }
                         w.sync()?;
-                        synced.store(w.records_written, Ordering::Release);
+                        synced.publish(w.records_written);
                         return Ok(w.records_written);
                     }
                 }
@@ -1133,6 +1143,45 @@ fn run(
         None
     };
 
+    // Records from other log-less instances take the same road as the other receivers: a bounded
+    // channel into the main loop (a full one is a 503 and the sender retries), then templating and the
+    // queue. They keep the sender's observed time and event id, so partitions and dedupe stay right.
+    // Each batch carries a ticket: the request is answered only once the WAL has synced the batch.
+    let (peer_tx, peer_rx) = if config.peer.enabled {
+        let (tx, rx) = crossbeam_channel::bounded::<(logless_core::peer::Ticket, Vec<LogRecord>)>(PEER_PENDING_BATCHES);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let mut peer_receiver = match (&peer_tx, config.peer.enabled) {
+        (Some(tx), true) => {
+            let tx = tx.clone();
+            let queue_capacity = config.ingest.queue_capacity;
+            let queue_for_room = Arc::clone(&queue);
+            let mut peer_config = config.peer.clone();
+            peer_config.advertise_s3 = config.serve_s3.enabled;
+            let data_dir = config.storage.data_dir.clone();
+            let tickets = Arc::clone(&wal_acks);
+            Some(logless_core::peer::Receiver::start_in(&peer_config, instance_id.clone(), Some(config.catalog_path()), Some(&data_dir), Some(Arc::clone(&wal_acks)), move |records| {
+                // Refuse rather than shed: the sender holds the batch and retries, which is the right answer
+                // to a peer that is outrunning us, and a shed record would be one the peer already forgot.
+                if queue_capacity.saturating_sub(queue_for_room.len()) < records.len() {
+                    return logless_core::peer::Admitted::Busy;
+                }
+                let ticket = tickets.issue();
+                match tx.try_send((ticket, records)) {
+                    Ok(()) => logless_core::peer::Admitted::Pending(ticket),
+                    Err(_) => {
+                        tickets.forget(ticket);
+                        logless_core::peer::Admitted::Busy
+                    }
+                }
+            })?)
+        }
+        _ => None,
+    };
+    drop(peer_tx);
+
     let mut admin_server = if config.admin.enabled {
         let mut listeners = Vec::new();
         let mut listen = |kind: &str, addr: &str| {
@@ -1168,45 +1217,15 @@ fn run(
             listeners,
         );
         service.set_sync(Arc::clone(&sync_control));
+        if let Some(r) = &peer_receiver {
+            service.set_peer_stats(r.stats_handle());
+        }
         let server = AdminServer::start(&config.admin, service)?;
         tracing::info!(addr = %server.local_addr(), "admin api listening");
         Some(server)
     } else {
         None
     };
-
-    // Records from other log-less instances take the same road as the other receivers: a bounded
-    // channel into the main loop (a full one is a 503 and the sender retries), then templating and the
-    // queue. They keep the sender's observed time and event id, so partitions and dedupe stay right.
-    let (peer_tx, peer_rx) = if config.peer.enabled {
-        let (tx, rx) = crossbeam_channel::bounded::<Vec<LogRecord>>(PEER_PENDING_BATCHES);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let mut peer_receiver = match (&peer_tx, config.peer.enabled) {
-        (Some(tx), true) => {
-            let tx = tx.clone();
-            let queue_capacity = config.ingest.queue_capacity;
-            let queue_for_room = Arc::clone(&queue);
-            let mut peer_config = config.peer.clone();
-            peer_config.advertise_s3 = config.serve_s3.enabled;
-            let data_dir = config.storage.data_dir.clone();
-            Some(logless_core::peer::Receiver::start_in(&peer_config, instance_id.clone(), Some(config.catalog_path()), Some(&data_dir), move |records| {
-                // Refuse rather than shed: the sender holds the batch and retries, which is the right answer
-                // to a peer that is outrunning us, and a shed record would be one the peer already forgot.
-                if queue_capacity.saturating_sub(queue_for_room.len()) < records.len() {
-                    return logless_core::peer::Admitted::Busy;
-                }
-                match tx.try_send(records) {
-                    Ok(()) => logless_core::peer::Admitted::Accepted,
-                    Err(_) => logless_core::peer::Admitted::Busy,
-                }
-            })?)
-        }
-        _ => None,
-    };
-    drop(peer_tx);
 
     // The Sentry proxy has its own channel: unlike the log receivers it carries
     // whole envelopes, and the records it produces are a *copy* for the local
@@ -1589,7 +1608,7 @@ fn run(
 
             if let Some(rx) = &peer_rx {
                 for _ in 0..PEER_BATCHES_PER_PASS {
-                    let Ok(records) = rx.try_recv() else { break };
+                    let Ok((ticket, records)) = rx.try_recv() else { break };
                     idle = false;
                     for record in records {
                         let raw_len = record.body.len() as u64 + 1;
@@ -1608,6 +1627,11 @@ fn run(
                             done = true;
                             break;
                         }
+                    }
+                    // As for HEC: the WAL record count that must be synced before the request may answer
+                    // 200. A batch cut short by the record cap is never bound, so it is never acknowledged.
+                    if !done {
+                        wal_acks.bind(ticket, stats.snapshot().enqueued);
                     }
                     if done {
                         break;
@@ -1642,7 +1666,12 @@ fn run(
     }
 
     // Stop accepting before the WAL writer is told to finish, so nothing is
-    // admitted after the queue is closed. In-flight requests complete first.
+    // admitted after the queue is closed. In-flight requests complete first:
+    // a peer request still waiting for the WAL is answered 503 at once (the
+    // record loop has stopped and the writer's last sync comes after the
+    // receiver is gone), and the sender resends it to the next incarnation;
+    // a batch the writer had already appended is then stored twice.
+    wal_acks.close();
     if let Some(r) = peer_receiver.take() {
         let s = r.shutdown();
         tracing::info!(
@@ -1652,6 +1681,12 @@ fn run(
             duplicates = s.duplicates,
             loops = s.loops,
             busy_503 = s.busy,
+            wal_waits = s.wal_waits,
+            wal_wait_ms_mean = s.wal_wait_us_total / s.wal_waits.max(1) / 1000,
+            wal_wait_ms_max = s.wal_wait_us_max / 1000,
+            wal_timeout_503 = s.wal_timeouts,
+            shutdown_503 = s.wal_closed,
+            settled_late = s.settled_late,
             unauthorized = s.unauthorized,
             bad_request = s.bad_request,
             "peer receiver stopped"
