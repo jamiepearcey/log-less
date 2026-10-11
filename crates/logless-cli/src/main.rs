@@ -186,6 +186,39 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         tolerance: u64,
     },
+    /// Rebuild a store (Parquet parts, catalog, template dictionary) from the object store alone, verifying
+    /// every part. Exits 1 if any part is damaged, unreadable, unfetchable or missing from the inventory.
+    ///
+    /// The source is `s3://bucket/prefix` (with `--endpoint`; credentials from LOGLESS_S3_ACCESS_KEY_ID and
+    /// LOGLESS_S3_SECRET_ACCESS_KEY) or a directory of `<sha256>.parquet` files. See docs/restore.md.
+    Restore {
+        #[arg(long)]
+        from: String,
+        /// The data directory to rebuild: `<to>/store` and `<to>/catalog.sqlite` are created.
+        #[arg(long)]
+        to: PathBuf,
+        /// `http(s)://host[:port]` of the S3 API, for an s3:// source.
+        #[arg(long)]
+        endpoint: Option<String>,
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+        /// Central's catalog.sqlite: its `peer_parts` is the inventory, which is the only way to find parts
+        /// that are missing from the bucket and to check sizes and row counts.
+        #[arg(long)]
+        inventory: Option<PathBuf>,
+        /// The edge's config, for its level buckets (default buckets otherwise). Only the buckets are used.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// After installing, hash every installed file again and compare the rebuilt catalog with the report.
+        #[arg(long)]
+        verify: bool,
+        /// Install into a target that already holds a store.
+        #[arg(long)]
+        force: bool,
+        /// Write the full report as JSON.
+        #[arg(long)]
+        report_json: Option<PathBuf>,
+    },
     /// Combine small per-segment files into larger ones.
     Compact {
         #[arg(long)]
@@ -540,6 +573,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 report.bytes_after,
                 report.saved_fraction() * 100.0
             );
+        }
+
+        Command::Restore { from, to, endpoint, region, inventory, config, verify, force, report_json } => {
+            use logless_core::restore as rs;
+            let buckets = match &config {
+                Some(path) => load(path)?.retention,
+                None => LevelBuckets::default(),
+            };
+            let inventory = match &inventory {
+                Some(path) => Some(rs::read_inventory(path)?),
+                None => None,
+            };
+            let source: Box<dyn rs::PartSource> = if let Some(rest) = from.strip_prefix("s3://") {
+                let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+                let Some(endpoint) = endpoint else {
+                    eprintln!("an s3:// source needs --endpoint");
+                    std::process::exit(2);
+                };
+                let (Ok(key), Ok(secret)) = (std::env::var("LOGLESS_S3_ACCESS_KEY_ID"), std::env::var("LOGLESS_S3_SECRET_ACCESS_KEY")) else {
+                    eprintln!("set LOGLESS_S3_ACCESS_KEY_ID and LOGLESS_S3_SECRET_ACCESS_KEY");
+                    std::process::exit(2);
+                };
+                Box::new(rs::S3Source::new(&endpoint, bucket, prefix, &region, &key, &secret)?)
+            } else {
+                Box::new(rs::DirSource(PathBuf::from(&from)))
+            };
+            let report = rs::restore(&*source, &rs::Options { to: &to, inventory, buckets: &buckets, force, reverify: verify })?;
+            println!("listed={} ignored_keys={} inventory={}", report.listed, report.ignored_keys, report.inventory.map_or("none".into(), |n| n.to_string()));
+            println!("restored_parts={} rows={} bytes={}", report.restored, report.rows, report.bytes);
+            println!(
+                "hash_mismatch={} size_mismatch={} rows_mismatch={} unreadable={} fetch_failed={} missing={} not_in_inventory={}",
+                report.hash_mismatch.len(), report.size_mismatch.len(), report.rows_mismatch.len(), report.unreadable.len(),
+                report.fetch_failed.len(), report.missing.len(), report.not_in_inventory.len()
+            );
+            println!("catalog_files={} catalog_rows={} catalog_bytes={}", report.catalog_files, report.catalog_rows, report.catalog_bytes);
+            println!("templates={} template_services={} dictionary_rows={} multi_partition_parts={}", report.templates, report.template_services, report.dictionary_rows, report.multi_partition);
+            if verify {
+                println!("reverify_bad={}", report.reverify_bad.len());
+            }
+            println!("elapsed_ms={}", report.elapsed.as_millis());
+            for (part, why) in &report.details {
+                println!("  {part}: {why}");
+            }
+            if let Some(path) = report_json {
+                let doc = serde_json::json!({
+                    "listed": report.listed, "ignored_keys": report.ignored_keys, "inventory": report.inventory,
+                    "restored_parts": report.restored, "rows": report.rows, "bytes": report.bytes,
+                    "hash_mismatch": report.hash_mismatch, "size_mismatch": report.size_mismatch,
+                    "rows_mismatch": report.rows_mismatch, "unreadable": report.unreadable,
+                    "fetch_failed": report.fetch_failed, "missing": report.missing,
+                    "not_in_inventory": report.not_in_inventory, "reverify_bad": report.reverify_bad,
+                    "catalog_files": report.catalog_files, "catalog_rows": report.catalog_rows, "catalog_bytes": report.catalog_bytes,
+                    "templates": report.templates, "template_services": report.template_services,
+                    "dictionary_rows": report.dictionary_rows, "elapsed_ms": report.elapsed.as_millis() as u64,
+                    "rows_by_template": report.rows_by_template.iter().map(|(k, v)| (k.map_or("none".to_string(), |k| k.to_string()), *v)).collect::<std::collections::BTreeMap<_, _>>(),
+                });
+                std::fs::write(&path, serde_json::to_string_pretty(&doc)?)?;
+            }
+            if report.ok() {
+                println!("RESTORE OK: {} parts, {} rows verified", report.restored, report.rows);
+            } else {
+                println!("RESTORE FAILED: {} damaged or missing parts (listed above); the damaged ones were not installed", report.damaged());
+                std::process::exit(1);
+            }
         }
 
         Command::Retention { config, dry_run } => {

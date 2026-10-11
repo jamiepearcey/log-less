@@ -26,6 +26,7 @@ pub mod otlp;
 pub mod parts;
 pub mod peer;
 pub mod queue;
+pub mod restore;
 pub mod scan;
 pub mod schema;
 pub mod counters;

@@ -429,6 +429,30 @@ impl Catalog {
         Ok(())
     }
 
+    /// Writes the templates and `(template, service)` sightings a restore derived from the parts
+    /// themselves, in one transaction (`crate::restore`). Merges first-seen/last-seen like a merge does.
+    pub fn restore_templates(
+        &mut self,
+        templates: &[crate::drain::Template],
+        sightings: &[TemplateSighting],
+    ) -> Result<(), CatalogError> {
+        self.save_templates(templates)?;
+        let tx = self.conn.transaction()?;
+        for s in sightings {
+            tx.execute(
+                "INSERT INTO template_services
+                    (template_id, has_service, service, first_observed, last_observed)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(template_id, has_service, service) DO UPDATE SET
+                    first_observed = MIN(first_observed, excluded.first_observed),
+                    last_observed  = MAX(last_observed, excluded.last_observed)",
+                params![s.template_id as i64, s.service.is_some(), s.service.as_deref().unwrap_or(""), s.first_observed_nanos, s.last_observed_nanos],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Every (service, template id) pair ever merged into the store, for the sync planner's "first time in this service".
     pub fn load_template_services(&self) -> Result<Vec<(Option<String>, u64)>, CatalogError> {
         let mut stmt = self.conn.prepare("SELECT template_id, has_service, service FROM template_services")?;

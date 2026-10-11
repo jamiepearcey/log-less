@@ -98,6 +98,23 @@ pub fn presign(
     expires_secs: u64,
     headers: &[(&str, &str)],
 ) -> String {
+    presign_with_query(creds, method, host, raw_path, region, now_unix_secs, expires_secs, headers, &[])
+}
+
+/// [`presign`] with extra request query parameters (for example `list-type=2`), given decoded; they are
+/// signed with the rest and appear in the returned query.
+#[allow(clippy::too_many_arguments)]
+pub fn presign_with_query(
+    creds: &Credentials,
+    method: &str,
+    host: &str,
+    raw_path: &str,
+    region: &str,
+    now_unix_secs: u64,
+    expires_secs: u64,
+    headers: &[(&str, &str)],
+    extra_query: &[(&str, &str)],
+) -> String {
     let amz_date = format_iso_basic(now_unix_secs);
     let date = &amz_date[..8];
     let mut credential = String::new();
@@ -109,9 +126,15 @@ pub fn presign(
     signed.dedup();
     let mut signed_param = String::new();
     aws_encode(signed.join(";").as_bytes(), &mut signed_param);
-    let query = format!(
+    let mut query = format!(
         "X-Amz-Algorithm={ALGORITHM}&X-Amz-Credential={credential}&X-Amz-Date={amz_date}&X-Amz-Expires={expires_secs}&X-Amz-SignedHeaders={signed_param}"
     );
+    for (k, v) in extra_query {
+        query.push('&');
+        aws_encode(k.as_bytes(), &mut query);
+        query.push('=');
+        aws_encode(v.as_bytes(), &mut query);
+    }
     let canonical = canonical_request(method, raw_path, &query, &all, &signed, "UNSIGNED-PAYLOAD")
         .expect("the query and headers built here are well formed");
     let d = signature_for(&creds.secret_key, &amz_date, date, region, &canonical);
