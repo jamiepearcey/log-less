@@ -3106,7 +3106,6 @@ mod tests {
     #[test]
     fn an_old_unconfirmed_file_is_not_pinned_and_the_limit_never_passes_a_quarter_of_the_budget() {
         let e = life_edge(&dead_url(), &[1000, 1001, 1002]);
-        let size = std::fs::metadata(&e.paths[0]).unwrap().len();
         // Files are 3, 2 and 1 minutes old; an age limit of 150 s keeps the two newest.
         let by_age = EdgePartsConfig { pin_age: Duration::from_secs(150), ..timer(60, 1 << 30) };
         let pins = parts_edge::pins_for_pass(&e.control, &by_age, e.store.path(), 0);
@@ -3116,10 +3115,12 @@ mod tests {
         want.sort();
         assert_eq!(want, pinned);
         assert_eq!(3, pins.unconfirmed.len());
-        // A budget of 8 files' bytes allows 2 pinned, whatever pin_bytes says.
-        let pins = parts_edge::pins_for_pass(&e.control, &timer(60, 1 << 30), e.store.path(), 8 * size);
+        // A quarter of the budget holds exactly the two newest files, whatever pin_bytes says. The files
+        // differ by a byte or two, so the budget is built from their real sizes.
+        let newest_two: u64 = e.paths[1..].iter().map(|p| std::fs::metadata(p).unwrap().len()).sum();
+        let pins = parts_edge::pins_for_pass(&e.control, &timer(60, 1 << 30), e.store.path(), 4 * newest_two);
         assert_eq!(2, pins.pinned.len(), "{:?}", e.control.status().edge_parts);
-        assert_eq!(2 * size, e.control.status().edge_parts.pin_limit_bytes);
+        assert_eq!(newest_two, e.control.status().edge_parts.pin_limit_bytes);
     }
 
     #[test]
