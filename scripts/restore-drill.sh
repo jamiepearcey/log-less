@@ -21,6 +21,7 @@ SYNC_TIMEOUT="${SYNC_TIMEOUT:-90}"
 KEEP="${KEEP:-0}"
 BUCKET="logless-parts"
 PREFIX="edges"
+NODE="edge1"   # parts live under <prefix>/<node>/ since node-owned prefixes (ADR 0001)
 
 for tool in "$LOGLESS_BIN" "$MINIO_BIN" "$MC_BIN" "$DUCKDB_BIN" curl python3 openssl sqlite3 shasum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing: $tool" >&2; exit 2; }
@@ -140,7 +141,7 @@ mkdir -p "$R/central"; : > "$R/central/empty.log"
 render_config "$R/central/data" "
 peer|enabled|true
 peer|addr|\"127.0.0.1:$PEER_PORT\"
-peer|tokens|[\"$PEER_TOKEN\"]
+peer|nodes|[{ id = \"$NODE\", token = \"$PEER_TOKEN\" }]
 peer.parts|enabled|true
 peer.parts|endpoint|\"http://127.0.0.1:$MINIO_PORT\"
 peer.parts|bucket|\"$BUCKET\"
@@ -285,7 +286,7 @@ check "before: every accepted record is in a part" "$(eq "$BEFORE_ROWS" "$N_RECO
 check "before: templates were mined" "$( [ "$N_TPL" -ge 3 ] && echo 1 || echo 0)" "template ids=$N_TPL (template,service) pairs=$N_PAIR"
 
 # --- objects in MinIO match the edge's files ---------------------------------------------------------------------
-OBJECTS=$("${MCA[@]}" ls --json "drill/$BUCKET/$PREFIX/" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort)
+OBJECTS=$("${MCA[@]}" ls --json "drill/$BUCKET/$PREFIX/$NODE/" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort)
 N_OBJ=$(echo "$OBJECTS" | grep -c . || true)
 EDGE_HASHES=$(find "$EDGE_STORE" -name '*.parquet' -exec shasum -a 256 {} + | cut -d' ' -f1 | sed 's/$/.parquet/' | sort)
 check "bucket holds exactly the edge's files (by sha256)" "$(eq "$OBJECTS" "$EDGE_HASHES")" "objects=$N_OBJ edge files=$EDGE_FILES"
@@ -310,7 +311,7 @@ export LOGLESS_S3_ACCESS_KEY_ID="$MINIO_USER" LOGLESS_S3_SECRET_ACCESS_KEY="$MIN
 run_restore() { # dir name
   local t0 t1
   t0=$(now_ms)
-  "$LOGLESS_BIN" restore --from "s3://$BUCKET/$PREFIX" --endpoint "http://127.0.0.1:$MINIO_PORT" --to "$1" \
+  "$LOGLESS_BIN" restore --from "s3://$BUCKET/$PREFIX/$NODE" --endpoint "http://127.0.0.1:$MINIO_PORT" --to "$1" \
     --inventory "$R/inventory.sqlite" --verify --report-json "$1.json" > "$1.out" 2>&1
   RC=$?; t1=$(now_ms); RESTORE_MS=$(( t1 - t0 ))
   cp "$1.out" "$R/$2.out" 2>/dev/null
@@ -338,34 +339,34 @@ check "RPO: records acknowledged after the last upload are not in the restore" "
 # --- case 2: one stored part has a flipped byte -------------------------------------------------------------------
 VICTIM=$(sqlite3 "$R/inventory.sqlite" "select name from peer_parts order by rows desc limit 1")
 VICTIM_ROWS=$(sqlite3 "$R/inventory.sqlite" "select rows from peer_parts where name = '$VICTIM'")
-"${MCA[@]}" cat "drill/$BUCKET/$PREFIX/$VICTIM" > "$R/victim.orig"
+"${MCA[@]}" cat "drill/$BUCKET/$PREFIX/$NODE/$VICTIM" > "$R/victim.orig"
 python3 -c '
 import sys
 b = bytearray(open(sys.argv[1], "rb").read()); b[len(b) // 2] ^= 0xFF
 open(sys.argv[2], "wb").write(b)' "$R/victim.orig" "$R/victim.flipped"
-"${MCA[@]}" cp --quiet "$R/victim.flipped" "drill/$BUCKET/$PREFIX/$VICTIM" > /dev/null
+"${MCA[@]}" cp --quiet "$R/victim.flipped" "drill/$BUCKET/$PREFIX/$NODE/$VICTIM" > /dev/null
 run_restore "$R/restored2" case2
 check "case 2 (flipped byte) exits 1" "$(eq $RC 1)" "wall ${RESTORE_MS} ms; $(tail -1 "$R/case2.out" | cut -c1-120)"
 check "case 2: the damaged part is named, nothing else is" "$( [ "$(rfield case2 hash_mismatch)" = 1 ] && grep -q "  $VICTIM: sha256" "$R/case2.out" && [ "$(rfield case2 missing)" = 0 ] && echo 1 || echo 0)" \
   "hash_mismatch=$(rfield case2 hash_mismatch) victim=${VICTIM:0:16}…"
 check "case 2: the other parts restored, the damaged one was not installed" "$( [ "$(rfield case2 restored_parts)" = $(( EDGE_FILES - 1 )) ] && [ "$(rfield case2 rows)" = $(( BEFORE_ROWS - VICTIM_ROWS )) ] && [ ! -e "$(find "$R/restored2/store" -name "$VICTIM" | head -1)" ] && echo 1 || echo 0)" \
   "restored parts=$(rfield case2 restored_parts) rows=$(rfield case2 rows) (edge $EDGE_FILES parts, $BEFORE_ROWS rows; victim had $VICTIM_ROWS rows)"
-"${MCA[@]}" cp --quiet "$R/victim.orig" "drill/$BUCKET/$PREFIX/$VICTIM" > /dev/null
+"${MCA[@]}" cp --quiet "$R/victim.orig" "drill/$BUCKET/$PREFIX/$NODE/$VICTIM" > /dev/null
 
 # --- case 3: one part deleted from the bucket ---------------------------------------------------------------------
 GONE=$(sqlite3 "$R/inventory.sqlite" "select name from peer_parts where name != '$VICTIM' order by rows asc limit 1")
 GONE_ROWS=$(sqlite3 "$R/inventory.sqlite" "select rows from peer_parts where name = '$GONE'")
-"${MCA[@]}" rm --quiet "drill/$BUCKET/$PREFIX/$GONE" > /dev/null
+"${MCA[@]}" rm --quiet "drill/$BUCKET/$PREFIX/$NODE/$GONE" > /dev/null
 run_restore "$R/restored3" case3
 check "case 3 (part deleted) exits 1" "$(eq $RC 1)" "wall ${RESTORE_MS} ms; $(tail -1 "$R/case3.out" | cut -c1-120)"
 check "case 3: the missing part is named, nothing else is" "$( [ "$(rfield case3 missing)" = 1 ] && grep -q "  $GONE: in the inventory" "$R/case3.out" && [ "$(rfield case3 hash_mismatch)" = 0 ] && echo 1 || echo 0)" \
   "missing=$(rfield case3 missing) gone=${GONE:0:16}…"
 check "case 3: every other part restored" "$( [ "$(rfield case3 restored_parts)" = $(( EDGE_FILES - 1 )) ] && [ "$(rfield case3 rows)" = $(( BEFORE_ROWS - GONE_ROWS )) ] && echo 1 || echo 0)" \
   "restored parts=$(rfield case3 restored_parts) rows=$(rfield case3 rows) (missing part had $GONE_ROWS rows)"
-"${MCA[@]}" cp --quiet "$R/victim.orig" "drill/$BUCKET/$PREFIX/$VICTIM" > /dev/null
+"${MCA[@]}" cp --quiet "$R/victim.orig" "drill/$BUCKET/$PREFIX/$NODE/$VICTIM" > /dev/null
 
 # --- case 4: a restore into a directory that already holds a store is refused --------------------------------------
-"$LOGLESS_BIN" restore --from "s3://$BUCKET/$PREFIX" --endpoint "http://127.0.0.1:$MINIO_PORT" --to "$R/restored1" > "$R/case4.out" 2>&1
+"$LOGLESS_BIN" restore --from "s3://$BUCKET/$PREFIX/$NODE" --endpoint "http://127.0.0.1:$MINIO_PORT" --to "$R/restored1" > "$R/case4.out" 2>&1
 check "case 4: restoring over an existing store is refused" "$(eq $? 1)" "$(head -1 "$R/case4.out" | cut -c1-140)"
 
 # --- report ------------------------------------------------------------------------------------------------------

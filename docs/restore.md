@@ -35,7 +35,7 @@ Plane item 119. This page records the decisions and describes `logless restore`.
 ## `logless restore`
 
 ```text
-logless restore --from s3://<bucket>/<prefix> --endpoint http://host:port --to <data dir> \
+logless restore --from s3://<bucket>/<prefix>/<node> --endpoint http://host:port --to <data dir> \
                 [--inventory <central catalog.sqlite>] [--config <edge config>] [--verify] [--force] [--report-json <file>]
 logless restore --from <directory of <sha256>.parquet files> --to <data dir> ...
 ```
