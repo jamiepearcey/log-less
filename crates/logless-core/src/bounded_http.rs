@@ -1,5 +1,5 @@
 //! A small HTTP/1.1 listener with a hard cap on the request head, for the
-//! admin API.
+//! admin API and the peer receiver.
 //!
 //! `tiny_http` buffers request headers without any limit, before a handler
 //! (and so before authentication) runs: one unauthenticated 100 MB header
@@ -8,7 +8,12 @@
 //! over it with 431, bounds how long a client may take to send it, caps
 //! concurrent connections, and answers every request with `Connection: close`
 //! so there is no connection state to abuse. Bodies need `Content-Length`;
-//! chunked requests are refused. No gzip: the admin API takes small JSON.
+//! chunked requests are refused. Gzip bodies are decoded only for a listener
+//! that asks for it ([`HeadLimits::gzip`]), under the decompressed-size cap.
+//!
+//! A handler can refuse on the head alone ([`Handler::preflight`]), so an
+//! unauthenticated client is answered before this process buffers or inflates
+//! a byte of its body.
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -17,7 +22,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::httpd::{Handler, HttpError, Incoming, Limits, Method, Reject, Reply};
+use crate::httpd::{Handler, HttpError, Incoming, Limits, Method, Reject, Reply, Streamed};
 
 #[derive(Debug, Clone, Copy)]
 pub struct HeadLimits {
@@ -27,6 +32,9 @@ pub struct HeadLimits {
     /// Wall-clock budget to receive the whole request (head and body).
     pub request_timeout: Duration,
     pub max_connections: usize,
+    /// Decode `Content-Encoding: gzip` bodies, capped by
+    /// `Limits::max_decompressed_bytes`. Off: the body reaches the handler as sent.
+    pub gzip: bool,
 }
 
 impl Default for HeadLimits {
@@ -36,6 +44,7 @@ impl Default for HeadLimits {
             max_headers: 64,
             request_timeout: Duration::from_secs(10),
             max_connections: 64,
+            gzip: false,
         }
     }
 }
@@ -68,10 +77,10 @@ impl BoundedServer {
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicUsize::new(0));
         let acceptor = {
-            let (stop, active) = (Arc::clone(&stop), Arc::clone(&active));
+            let (stop, active, name) = (Arc::clone(&stop), Arc::clone(&active), thread_name.to_string());
             std::thread::Builder::new()
                 .name(thread_name.to_string())
-                .spawn(move || accept_loop(listener, limits, head, handler, stop, active))
+                .spawn(move || accept_loop(listener, name, limits, head, handler, stop, active))
                 .expect("spawn http acceptor")
         };
         Ok(Self { acceptor, stop, active, local_addr })
@@ -104,6 +113,7 @@ impl Drop for ActiveGuard {
 
 fn accept_loop(
     listener: TcpListener,
+    thread_name: String,
     limits: Limits,
     head: HeadLimits,
     handler: Arc<dyn Handler>,
@@ -114,7 +124,7 @@ fn accept_loop(
         let stream = match listener.accept() {
             Ok((s, _)) => s,
             Err(e) => {
-                tracing::debug!(error = %e, "admin accept failed");
+                tracing::debug!(error = %e, "http accept failed");
                 if stop.load(Ordering::Acquire) {
                     return;
                 }
@@ -132,12 +142,12 @@ fn accept_loop(
         }
         let guard = ActiveGuard(Arc::clone(&active));
         let handler = Arc::clone(&handler);
-        let spawned = std::thread::Builder::new().name("admin-conn".into()).spawn(move || {
+        let spawned = std::thread::Builder::new().name(format!("{thread_name}-conn")).spawn(move || {
             let _guard = guard;
             serve(stream, limits, head, handler.as_ref());
         });
         if spawned.is_err() {
-            tracing::warn!("admin api could not spawn a connection thread");
+            tracing::warn!("http listener could not spawn a connection thread");
         }
     }
 }
@@ -146,6 +156,8 @@ enum Bad {
     /// 400 with a reason.
     Request(&'static str),
     HeadTooLarge,
+    /// The handler answered from the head alone; the body is never read.
+    Early(Reply),
     Unsupported(&'static str),
     Timeout,
     Closed,
@@ -153,18 +165,19 @@ enum Bad {
 
 fn serve(mut stream: TcpStream, limits: Limits, head: HeadLimits, handler: &dyn Handler) {
     let deadline = Instant::now() + head.request_timeout;
-    let reply = match read_request(&mut stream, limits, head, deadline) {
-        Ok(Parsed { method, path, query, headers, body }) => {
-            handler.handle(Incoming::new(method, &path, &query, &headers, body))
+    let reply = match read_request(&mut stream, limits, head, handler, deadline) {
+        Ok(Parsed { method, method_name, path, query, headers, body }) => {
+            handler.handle(Incoming::new(method, &method_name, &path, &query, &headers, body))
         }
         Err(Err(reject)) => handler.reject(reject),
         Err(Ok(Bad::Closed)) => return,
+        Err(Ok(Bad::Early(reply))) => reply,
         Err(Ok(Bad::HeadTooLarge)) => plain(431, r#"{"error":"headers_too_large"}"#),
         Err(Ok(Bad::Request(why))) => plain(400, &format!(r#"{{"error":"bad_request","message":"{why}"}}"#)),
         Err(Ok(Bad::Unsupported(why))) => plain(501, &format!(r#"{{"error":"unsupported","message":"{why}"}}"#)),
         Err(Ok(Bad::Timeout)) => plain(408, r#"{"error":"request_timeout"}"#),
     };
-    write_reply(&mut stream, &reply);
+    write_reply(&mut stream, reply);
     let _ = stream.shutdown(Shutdown::Write);
     drain(&mut stream);
 }
@@ -194,6 +207,7 @@ fn plain(status: u16, body: &str) -> Reply {
 
 struct Parsed {
     method: Method,
+    method_name: String,
     path: String,
     query: String,
     headers: Vec<(String, String)>,
@@ -228,7 +242,13 @@ fn fill(stream: &mut TcpStream, buf: &mut Vec<u8>, deadline: Instant) -> Result<
     }
 }
 
-fn read_request(stream: &mut TcpStream, limits: Limits, head: HeadLimits, deadline: Instant) -> ReadResult {
+fn read_request(
+    stream: &mut TcpStream,
+    limits: Limits,
+    head: HeadLimits,
+    handler: &dyn Handler,
+    deadline: Instant,
+) -> ReadResult {
     let mut buf: Vec<u8> = Vec::with_capacity(1024);
     let end = loop {
         if let Some(i) = find_head_end(&buf) {
@@ -261,6 +281,7 @@ fn read_request(stream: &mut TcpStream, limits: Limits, head: HeadLimits, deadli
         "GET" => Method::Get,
         "POST" => Method::Post,
         "PUT" => Method::Put,
+        "HEAD" => Method::Head,
         _ => Method::Other,
     };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
@@ -294,6 +315,10 @@ fn read_request(stream: &mut TcpStream, limits: Limits, head: HeadLimits, deadli
         },
         _ => return fail(Bad::Request("duplicate Content-Length")),
     };
+    let (path, query) = (path.to_string(), query.to_string());
+    if let Some(reply) = handler.preflight(&Incoming::new(method, m, &path, &query, &headers, Vec::new())) {
+        return fail(Bad::Early(reply));
+    }
     if declared > limits.max_body_bytes {
         return Err(Err(Reject::TooLarge));
     }
@@ -305,7 +330,21 @@ fn read_request(stream: &mut TcpStream, limits: Limits, head: HeadLimits, deadli
         }
     }
     body.truncate(declared);
-    Ok(Parsed { method, path: path.to_string(), query: query.to_string(), headers, body })
+    if head.gzip && headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-encoding") && v.eq_ignore_ascii_case("gzip")) {
+        body = inflate(&body, limits.max_decompressed_bytes)?;
+    }
+    Ok(Parsed { method, method_name: m.to_string(), path, query, headers, body })
+}
+
+/// Reads at most `limit` bytes out of the gzip stream, then one more to tell
+/// "exactly at the limit" from "over it".
+fn inflate(gz: &[u8], limit: usize) -> Result<Vec<u8>, Result<Bad, Reject>> {
+    let mut out = Vec::new();
+    match flate2::read::GzDecoder::new(gz).take(limit as u64 + 1).read_to_end(&mut out) {
+        Ok(n) if n > limit => Err(Err(Reject::TooLarge)),
+        Ok(_) => Ok(out),
+        Err(e) => Err(Err(Reject::Unreadable(format!("bad gzip: {e}")))),
+    }
 }
 
 fn find_head_end(buf: &[u8]) -> Option<usize> {
@@ -315,6 +354,8 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        206 => "Partial Content",
+        304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -322,33 +363,258 @@ fn reason(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         409 => "Conflict",
+        412 => "Precondition Failed",
         413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
         422 => "Unprocessable Content",
         428 => "Precondition Required",
+        416 => "Range Not Satisfiable",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        503 => "Service Unavailable",
+        508 => "Loop Detected",
         _ => "Status",
     }
 }
 
-fn write_reply(stream: &mut TcpStream, reply: &Reply) {
-    let mut out = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        reply.status,
-        reason(reply.status),
-        reply.content_type,
-        reply.body.len()
-    );
+fn write_reply(stream: &mut TcpStream, reply: Reply) {
+    let length = reply.stream.as_ref().map_or(reply.body.len() as u64, |s| s.len);
+    let mut out = format!("HTTP/1.1 {} {}\r\n", reply.status, reason(reply.status));
+    if !reply.content_type.is_empty() {
+        out.push_str(&format!("Content-Type: {}\r\n", reply.content_type));
+    }
+    out.push_str(&format!("Content-Length: {length}\r\nConnection: close\r\n"));
     for (k, v) in &reply.headers {
         if !k.contains(['\r', '\n']) && !v.contains(['\r', '\n']) {
             out.push_str(&format!("{k}: {v}\r\n"));
         }
     }
     out.push_str("\r\n");
+    // Each write is bounded, so a client that stops reading is dropped after this long.
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.write_all(out.as_bytes());
-    let _ = stream.write_all(&reply.body);
+    if stream.write_all(out.as_bytes()).is_err() {
+        return;
+    }
+    match reply.stream {
+        None => {
+            let _ = stream.write_all(&reply.body);
+        }
+        Some(Streamed { reader: Some(mut reader), len }) => copy_exact(&mut reader, stream, len),
+        Some(Streamed { reader: None, .. }) => {}
+    }
     let _ = stream.flush();
+}
+
+/// Copies up to `len` bytes. A source that ends early or a client that goes away stops it; the
+/// connection then closes with fewer bytes than `Content-Length` said, which the client sees.
+fn copy_exact(reader: &mut dyn Read, stream: &mut TcpStream, len: u64) {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut left = len;
+    while left > 0 {
+        let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        match reader.read(&mut buf[..want]) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => {
+                if stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+                left -= n as u64;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::httpd::Reject;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Probe {
+        handled: Mutex<Vec<Vec<u8>>>,
+        deny: bool,
+    }
+
+    impl Handler for Probe {
+        fn handle(&self, request: Incoming) -> Reply {
+            self.handled.lock().unwrap().push(request.body);
+            Reply::json(200, "{}")
+        }
+        fn reject(&self, reason: Reject) -> Reply {
+            match reason {
+                Reject::TooLarge => Reply::json(413, "{}"),
+                Reject::Unreadable(_) => Reply::json(400, "{}"),
+            }
+        }
+        fn preflight(&self, request: &Incoming) -> Option<Reply> {
+            (self.deny && request.header("x-deny").is_some()).then(|| Reply::json(401, "{}"))
+        }
+    }
+
+    fn start(head: HeadLimits, limits: Limits, deny: bool) -> (BoundedServer, Arc<Probe>) {
+        let probe = Arc::new(Probe { deny, ..Default::default() });
+        let server = BoundedServer::start("127.0.0.1:0", "test", limits, head, probe.clone() as Arc<dyn Handler>).unwrap();
+        (server, probe)
+    }
+
+    /// Sends `bytes`, returns the status code (0 for none) and whether the server closed the connection.
+    fn send(addr: SocketAddr, bytes: &[u8], wait: Duration) -> u16 {
+        let mut conn = TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(wait)).unwrap();
+        let _ = conn.write_all(bytes);
+        let mut out = Vec::new();
+        let _ = conn.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_client_that_stalls_in_the_head_or_the_body_is_cut_off_at_the_request_timeout() {
+        let head = HeadLimits { request_timeout: Duration::from_millis(300), ..Default::default() };
+        let (server, probe) = start(head, Limits::default(), false);
+        let a = server.local_addr();
+        let started = Instant::now();
+        // A head that never ends: sent a byte at a time would be the same; here it just goes quiet.
+        let mut c = TcpStream::connect(a).unwrap();
+        c.write_all(b"POST / HTTP/1.1\r\nHost: x\r\n").unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out);
+        assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 408"), "{}", String::from_utf8_lossy(&out));
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        // A body that stops half way.
+        let status = send(a, b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n0123456789", Duration::from_secs(5));
+        assert_eq!(408, status);
+        // A drip that keeps the connection busy does not extend the budget: the deadline covers the whole request.
+        let mut c = TcpStream::connect(a).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let started = Instant::now();
+        for byte in b"POST / HTTP/1.1\r\nHost: x\r\nX-Slow: yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy" {
+            if c.write_all(&[*byte]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            if started.elapsed() > Duration::from_secs(2) {
+                break;
+            }
+        }
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out);
+        assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 408"), "{}", String::from_utf8_lossy(&out));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(probe.handled.lock().unwrap().is_empty());
+        server.shutdown();
+    }
+
+    #[test]
+    fn connections_past_the_cap_are_closed_unread_and_the_slots_come_back() {
+        let head = HeadLimits { max_connections: 4, request_timeout: Duration::from_millis(800), ..Default::default() };
+        let (server, _) = start(head, Limits::default(), false);
+        let a = server.local_addr();
+        let idle: Vec<TcpStream> = (0..4).map(|_| TcpStream::connect(a).unwrap()).collect();
+        std::thread::sleep(Duration::from_millis(150));
+        // Past the cap the server hangs up at once, without waiting for a request.
+        let mut refused = 0;
+        for _ in 0..10 {
+            let mut c = TcpStream::connect(a).unwrap();
+            c.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+            let mut b = [0u8; 1];
+            if matches!(c.read(&mut b), Ok(0)) {
+                refused += 1;
+            }
+        }
+        assert_eq!(10, refused, "every connection past the cap is closed");
+        // Once the idle ones time out their slots are free again.
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(200, send(a, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", Duration::from_secs(3)));
+        drop(idle);
+        server.shutdown();
+    }
+
+    #[test]
+    fn the_head_is_capped_by_bytes_by_count_and_by_a_missing_terminator() {
+        let head = HeadLimits { max_head_bytes: 1024, max_headers: 8, ..Default::default() };
+        let (server, probe) = start(head, Limits::default(), false);
+        let a = server.local_addr();
+        let line = |extra: String| format!("GET / HTTP/1.1\r\nHost: x\r\n{extra}\r\n").into_bytes();
+        assert_eq!(431, send(a, &line(format!("X: {}\r\n", "a".repeat(2000))), Duration::from_secs(3)));
+        assert_eq!(431, send(a, &line("A: b\r\n".repeat(20)), Duration::from_secs(3)));
+        assert_eq!(431, send(a, &[b"GET / HTTP/1.1\r\nX: ".to_vec(), vec![b'z'; 1 << 20]].concat(), Duration::from_secs(3)));
+        assert_eq!(431, send(a, &[b"GET /".to_vec(), vec![b'p'; 1 << 20]].concat(), Duration::from_secs(3)));
+        assert_eq!(200, send(a, &line("A: b\r\n".repeat(5)), Duration::from_secs(3)));
+        assert_eq!(1, probe.handled.lock().unwrap().len());
+        server.shutdown();
+    }
+
+    #[test]
+    fn malformed_heads_are_400_and_never_reach_the_handler() {
+        let (server, probe) = start(HeadLimits::default(), Limits::default(), false);
+        let a = server.local_addr();
+        for bad in [
+            &b"GET\r\n\r\n"[..],
+            b"GET /\r\n\r\n",
+            b"GET / HTTP/1.1 extra\r\n\r\n",
+            b"GET / HTTP/2.0\r\nHost: x\r\n\r\n",
+            b"GET / HTTP/1.1\r\nno colon here\r\n\r\n",
+            b"GET / HTTP/1.1\r\nBad Name: v\r\n\r\n",
+            b"GET / HTTP/1.1\r\n: empty-name\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\n folded: continuation\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n",
+            b"GET /\xff HTTP/1.1\r\nHost: x\r\n\r\n",
+        ] {
+            let status = send(a, bad, Duration::from_secs(3));
+            assert_eq!(400, status, "{:?}", String::from_utf8_lossy(bad));
+        }
+        assert_eq!(501, send(a, b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", Duration::from_secs(3)));
+        assert!(probe.handled.lock().unwrap().is_empty());
+        server.shutdown();
+    }
+
+    #[test]
+    fn a_preflight_refusal_is_sent_without_waiting_for_the_body() {
+        let (server, probe) = start(HeadLimits::default(), Limits::default(), true);
+        let a = server.local_addr();
+        let started = Instant::now();
+        let status = send(a, b"POST / HTTP/1.1\r\nHost: x\r\nX-Deny: 1\r\nContent-Length: 1000000\r\n\r\n", Duration::from_secs(5));
+        assert_eq!(401, status);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(probe.handled.lock().unwrap().is_empty());
+        server.shutdown();
+    }
+
+    fn gz(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn post_gz(addr: SocketAddr, body: &[u8]) -> u16 {
+        let head = format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n", body.len());
+        send(addr, &[head.as_bytes(), body].concat(), Duration::from_secs(5))
+    }
+
+    #[test]
+    fn gzip_is_decoded_only_when_asked_for_and_only_up_to_the_cap() {
+        let limits = Limits { max_body_bytes: 1 << 20, max_decompressed_bytes: 4096 };
+        let (on, probe) = start(HeadLimits { gzip: true, ..Default::default() }, limits, false);
+        let a = on.local_addr();
+        assert_eq!(200, post_gz(a, &gz(b"hello")));
+        assert_eq!(b"hello", probe.handled.lock().unwrap()[0].as_slice());
+        assert_eq!(200, post_gz(a, &gz(&vec![b'a'; 4096])), "exactly at the cap");
+        assert_eq!(413, post_gz(a, &gz(&vec![b'a'; 4097])), "one byte over");
+        assert_eq!(413, post_gz(a, &gz(&vec![0u8; 64 * 1024 * 1024])), "a bomb");
+        assert_eq!(400, post_gz(a, b"not gzip"));
+        assert_eq!(2, probe.handled.lock().unwrap().len());
+        on.shutdown();
+
+        // Off, the bytes arrive as sent and the handler decides what they are.
+        let (off, probe) = start(HeadLimits::default(), limits, false);
+        let packed = gz(b"hello");
+        assert_eq!(200, post_gz(off.local_addr(), &packed));
+        assert_eq!(packed, probe.handled.lock().unwrap()[0]);
+        off.shutdown();
+    }
 }

@@ -37,7 +37,7 @@ Sentry proxy example uses; set `--serve-s3-addr` if both run.
 enabled = false          # off unless asked for
 addr = "127.0.0.1:9000"
 bucket = "logs"          # the only bucket name served
-workers = 8
+workers = 8              # connections served at once = workers x 16, at least 64
 access_key = "..."       # or LOGLESS_S3_ACCESS_KEY
 secret_key = "..."       # or LOGLESS_S3_SECRET_KEY
 ```
@@ -50,6 +50,15 @@ With neither set the endpoint serves anonymously, which is accepted on loopback
 only: log-less refuses to start on a non-loopback address without credentials,
 so a misconfiguration cannot publish the store to the network. There is no TLS;
 put a proxy in front for anything beyond loopback.
+
+## Limits
+
+The listener is `bounded_http.rs`, the same small HTTP/1.1 server as the admin API: the request line and headers
+together are capped at 16 KiB and 64 headers (a longer one is a 431, which also bounds the query string and a `Range`
+header), a client has 15 s to send its request, and connections past `workers` x 16 (at least 64) are closed unread. Every
+reply is `Connection: close`, so each request is its own connection (DuckDB opens many; that is cheap on loopback and a
+LAN). A download is streamed from the file; a client that stops reading is cut off after 10 s of no progress on a write.
+A listing is at most 1000 entries a page whatever `max-keys` says. The threat model is `docs/threat-model.md`.
 
 ## DuckDB
 

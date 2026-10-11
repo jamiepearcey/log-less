@@ -50,12 +50,15 @@ pub enum Method {
     Get,
     Post,
     Put,
+    Head,
     Other,
 }
 
 /// A request whose body has already been read and decompressed within limits.
 pub struct Incoming<'a> {
     pub method: Method,
+    /// The method as sent (`DELETE`, `PROPFIND`), for a handler that has to name it.
+    pub method_name: &'a str,
     /// Path with the query string removed.
     pub path: &'a str,
     pub query: &'a str,
@@ -66,12 +69,17 @@ pub struct Incoming<'a> {
 impl<'a> Incoming<'a> {
     pub(crate) fn new(
         method: Method,
+        method_name: &'a str,
         path: &'a str,
         query: &'a str,
         headers: &'a [(String, String)],
         body: Vec<u8>,
     ) -> Self {
-        Self { method, path, query, headers, body }
+        Self { method, method_name, path, query, headers, body }
+    }
+
+    pub(crate) fn headers(&self) -> &'a [(String, String)] {
+        self.headers
     }
 
     /// How many headers carry this name. A header that must be unique (Host)
@@ -115,6 +123,17 @@ pub struct Reply {
     pub content_type: String,
     pub body: Vec<u8>,
     pub headers: Vec<(String, String)>,
+    /// Sent instead of `body` by `crate::bounded_http`, which ignores `body`
+    /// then. The `tiny_http` listeners here do not stream and ignore this.
+    pub(crate) stream: Option<Streamed>,
+}
+
+/// A reply body read from `reader` while it is written, so a large file is
+/// never held in memory. `reader` is `None` for a `HEAD`: `len` is advertised
+/// in `Content-Length` and nothing is sent.
+pub struct Streamed {
+    pub reader: Option<Box<dyn Read + Send>>,
+    pub len: u64,
 }
 
 impl Reply {
@@ -124,6 +143,7 @@ impl Reply {
             content_type: content_type.to_string(),
             body,
             headers: Vec::new(),
+            stream: None,
         }
     }
 
@@ -147,6 +167,14 @@ pub trait Handler: Send + Sync + 'static {
     /// here — OTLP wants a protobuf `Status`, HEC wants its own JSON — and a
     /// client parsing a fixed shape must not receive a foreign one.
     fn reject(&self, reason: Reject) -> Reply;
+
+    /// Called with the request head before the body is read, by listeners that
+    /// can (`crate::bounded_http`). `Some` answers the request there and then,
+    /// so a refusal that needs no body (authentication) never buffers or
+    /// inflates one. `request.body` is empty here.
+    fn preflight(&self, _request: &Incoming) -> Option<Reply> {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -265,8 +293,10 @@ fn dispatch(mut request: tiny_http::Request, limits: Limits, handler: &dyn Handl
         tiny_http::Method::Get => Method::Get,
         tiny_http::Method::Post => Method::Post,
         tiny_http::Method::Put => Method::Put,
+        tiny_http::Method::Head => Method::Head,
         _ => Method::Other,
     };
+    let method_name = request.method().as_str().to_string();
     let headers: Vec<(String, String)> = request
         .headers()
         .iter()
@@ -310,6 +340,7 @@ fn dispatch(mut request: tiny_http::Request, limits: Limits, handler: &dyn Handl
 
     let reply = handler.handle(Incoming {
         method,
+        method_name: &method_name,
         path: &path,
         query: &query,
         headers: &headers,

@@ -8,7 +8,7 @@ one URL. The peer is addressed as itself; what it can do is advertised, not conf
 [peer]
 enabled = true
 addr = "0.0.0.0:9300"
-tokens = ["<long random token>"]     # required on any non-loopback address
+tokens = ["<long random token>"]     # required on any non-loopback address, each at least 24 characters there
 
 # On an edge instance
 [[destinations]]
@@ -23,6 +23,18 @@ anomaly_boost = true                  # send extra detail by itself when somethi
 The admin API (`GET`/`PUT /admin/v1/sync`, `POST /admin/v1/sync/test`) edits the same setting at run time. Its copy
 is kept in `sync.json` (and the token in `sync-token`, mode 0600) in the data dir, outranks the config file, and applies
 to the running sender with no restart. The console's Admin > Sync screen drives it.
+
+## What the receiver refuses
+
+The listener is `bounded_http.rs`, shared with the admin API. The token and (without tokens) the `Host` header are
+checked from the request head, before any body is read or decompressed: an unauthenticated client gets a 401 and costs
+no memory. Then: head over 16 KiB or 64 headers is a 431; the whole request must arrive within 30 s; connections past
+`workers` x 32 (at least 64) are closed; chunked bodies are a 501; `Content-Type` must be `application/x-ndjson` or
+`application/json` (a request with none is a 415, which is also what keeps a web page from posting here without asking)
+and `Content-Encoding` must be `gzip` or absent; a body over `max_body_bytes` is a 413, and so is one that inflates past
+`max_decompressed_bytes`; one bad line rejects the whole batch with a 400 and stores nothing. Without tokens the
+listener binds loopback only and refuses a `Host` that is not a loopback name (DNS rebinding). Two `Authorization`
+headers count as none. The full list, with the test that covers each, is in `docs/threat-model.md`.
 
 ## The handshake
 

@@ -55,6 +55,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::bounded_http::{BoundedServer, HeadLimits};
 use crate::httpd::{self, Handler, Incoming, Limits, Method, Reject, Reply};
 use crate::model::{Attr, AttrValue, LogRecord};
 
@@ -66,8 +67,12 @@ pub const MAX_HOPS: u32 = 8;
 pub const ATTR_ORIGIN: &str = "logless.origin";
 pub const ATTR_HOPS: &str = "logless.hops";
 const INSTANCE_ID_FILE: &str = "instance-id";
+const CONNECTIONS_PER_WORKER: usize = 32;
+const MIN_CONNECTIONS: usize = 64;
+/// Wall-clock budget for a sender to deliver one request, head and body: a 4 MiB batch over a slow link fits.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerConfig {
     /// Opt-in, like every listener here.
@@ -128,10 +133,29 @@ impl Default for PeerConfig {
     }
 }
 
+// Hand-written so a logged config never carries a token.
+impl std::fmt::Debug for PeerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerConfig")
+            .field("enabled", &self.enabled)
+            .field("addr", &self.addr)
+            .field("workers", &self.workers)
+            .field("tokens", &format_args!("<{} redacted>", self.tokens.len()))
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("max_decompressed_bytes", &self.max_decompressed_bytes)
+            .field("dedupe_window", &self.dedupe_window)
+            .field("advertise_s3", &self.advertise_s3)
+            .field("parts", &self.parts)
+            .finish()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PeerError {
     #[error("the peer listener on {addr} has no tokens; refusing to accept unauthenticated records on a non-loopback address")]
     OpenOnPublicAddress { addr: String },
+    #[error("a peer token is {len} characters; binding the non-loopback address {addr} needs at least {min}", min = crate::admin_api::MIN_REMOTE_TOKEN_LEN)]
+    WeakToken { addr: String, len: usize },
     #[error(transparent)]
     Http(#[from] httpd::HttpError),
     #[error("the peer dedupe log could not be opened: {0}")]
@@ -383,8 +407,10 @@ impl PeerHandler {
         if self.config.tokens.is_empty() {
             return Ok(());
         }
+        // Two Authorization headers are ambiguous (a proxy may pick the other one), so neither counts.
         let presented = request
             .header("authorization")
+            .filter(|_| request.header_count("authorization") == 1)
             .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
             .map(str::trim);
         let Some(token) = presented else {
@@ -402,6 +428,36 @@ impl PeerHandler {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
             Err(error_reply(403, "forbidden", "the token is not accepted").with_header("WWW-Authenticate", "Bearer"))
         }
+    }
+
+    fn refuse_head(&self, head: &Incoming, ingest: bool) -> Option<Reply> {
+        // Without tokens the listener is loopback only, and the only thing left between it and a web
+        // page is the name the page used: DNS rebinding makes a page's own origin point here.
+        if self.config.tokens.is_empty() && (head.header_count("host") != 1 || !crate::admin_api::host_allowed(head.header("host"), &[])) {
+            self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
+            return Some(error_reply(403, "forbidden_host", "the Host header is not a loopback name"));
+        }
+        if let Err(denied) = self.authorized(head) {
+            return Some(denied);
+        }
+        if !ingest {
+            return None;
+        }
+        // A request a browser may send cross-origin without asking first has no Content-Type, or a form
+        // one; the wire format is neither.
+        let kind = head.content_type();
+        let encoding = head.header("content-encoding").map(|v| v.trim().to_ascii_lowercase());
+        let bad = if kind != "application/x-ndjson" && kind != "application/json" {
+            Some(format!("send {WIRE_FORMAT} as application/x-ndjson"))
+        } else if !matches!(encoding.as_deref(), None | Some("" | "identity" | "gzip")) {
+            Some("Content-Encoding must be gzip or absent".to_string())
+        } else {
+            None
+        };
+        bad.map(|why| {
+            self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
+            error_reply(415, "unsupported_media_type", &why)
+        })
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -425,11 +481,6 @@ impl PeerHandler {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         if let Err(denied) = self.authorized(request) {
             return denied;
-        }
-        let kind = request.content_type();
-        if !kind.is_empty() && kind != "application/x-ndjson" && kind != "application/json" {
-            self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
-            return error_reply(415, "unsupported_media_type", &format!("send {WIRE_FORMAT} as application/x-ndjson"));
         }
 
         let mut records: Vec<LogRecord> = Vec::new();
@@ -520,6 +571,22 @@ impl Handler for PeerHandler {
         }
     }
 
+    /// Everything that needs only the head is decided here, so a refused client is answered before its
+    /// body is buffered or inflated: who may talk (Host, token), and in what encoding.
+    fn preflight(&self, head: &Incoming) -> Option<Reply> {
+        let (counted, ingest) = match (head.method, head.path) {
+            (Method::Get, CAPABILITY_PATH) => (false, false),
+            (Method::Post, INGEST_PATH) => (true, true),
+            (Method::Post, crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH) => (true, false),
+            _ => return None,
+        };
+        let refused = self.refuse_head(head, ingest);
+        if refused.is_some() && counted {
+            self.stats.requests.fetch_add(1, Ordering::Relaxed);
+        }
+        refused
+    }
+
     fn reject(&self, reason: Reject) -> Reply {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         match reason {
@@ -582,7 +649,7 @@ pub fn stamp_for_send(record: &mut LogRecord, own_instance: &str) {
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() ^ b.len()) as u8;
+    let mut diff = u8::from(a.len() != b.len());
     for i in 0..a.len().max(b.len()) {
         diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
     }
@@ -599,7 +666,7 @@ fn is_loopback(addr: &str) -> bool {
 }
 
 pub struct Receiver {
-    server: httpd::Server,
+    server: BoundedServer,
     stats: Arc<PeerStats>,
     instance: String,
 }
@@ -650,6 +717,12 @@ impl Receiver {
         if config.tokens.is_empty() && !is_loopback(&config.addr) {
             return Err(PeerError::OpenOnPublicAddress { addr: config.addr.clone() });
         }
+        // A token that can be guessed online is no better than none once the listener is reachable.
+        if !is_loopback(&config.addr) {
+            if let Some(weak) = config.tokens.iter().find(|t| t.len() < crate::admin_api::MIN_REMOTE_TOKEN_LEN) {
+                return Err(PeerError::WeakToken { addr: config.addr.clone(), len: weak.len() });
+            }
+        }
         let stats = Arc::new(PeerStats::default());
         let handler = Arc::new(PeerHandler {
             config: config.clone(),
@@ -659,11 +732,19 @@ impl Receiver {
             sink: Box::new(sink),
             parts,
         });
-        let server = httpd::Server::start(
+        // One thread per connection, so `workers` sets how many senders are served at once; the head
+        // and body must arrive within `REQUEST_TIMEOUT`, so a client that stalls frees its slot.
+        let head = HeadLimits {
+            max_connections: (config.workers * CONNECTIONS_PER_WORKER).max(MIN_CONNECTIONS),
+            request_timeout: REQUEST_TIMEOUT,
+            gzip: true,
+            ..HeadLimits::default()
+        };
+        let server = BoundedServer::start(
             &config.addr,
-            config.workers,
             "peer",
             Limits { max_body_bytes: config.max_body_bytes, max_decompressed_bytes: config.max_decompressed_bytes },
+            head,
             handler,
         )?;
         Ok(Self { server, stats, instance })
@@ -972,4 +1053,402 @@ mod tests {
         assert_eq!(32, first.len());
         assert_eq!(first, instance_id(dir.path()));
     }
+
+    // --- hostile input -----------------------------------------------------------------------------
+    //
+    // These speak raw bytes on a socket: the point is what the receiver does with input a real sender
+    // would never produce, so an HTTP client library that tidies the request would hide it.
+
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    /// Sends `request` as is and returns the status line's code (0 when nothing came back before
+    /// `wait`) and the whole response text.
+    fn exchange(addr: SocketAddr, request: &[u8], wait: Duration) -> (u16, String) {
+        let mut conn = std::net::TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(wait)).unwrap();
+        // The server may answer and hang up before a big request is fully written.
+        let _ = conn.write_all(request);
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match conn.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let status = text.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        (status, text)
+    }
+
+    fn request(method: &str, path: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
+        for (k, v) in headers {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+        head.push_str("\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn ingest_request(headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+        let mut all = vec![("Content-Type", "application/x-ndjson".to_string())];
+        all.extend(headers.iter().cloned());
+        request("POST", INGEST_PATH, &all, body)
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+    const GZ: (&str, &str) = ("Content-Encoding", "gzip");
+
+    fn gz_header() -> Vec<(&'static str, String)> {
+        vec![(GZ.0, GZ.1.to_string())]
+    }
+
+    #[test]
+    fn a_gzipped_batch_is_accepted_like_a_plain_one() {
+        let (rx, got) = start(PeerConfig::default(), false);
+        let (status, text) = exchange(rx.local_addr(), &ingest_request(&gz_header(), &gzip(&ndjson(&[record("zipped")]))), WAIT);
+        assert_eq!(200, status, "{text}");
+        assert_eq!(1, got.lock().unwrap().len());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn an_oversized_body_is_413_whether_declared_or_sent_and_stores_nothing() {
+        let (rx, got) = start(PeerConfig { max_body_bytes: 1024, ..PeerConfig::default() }, false);
+        let a = rx.local_addr();
+        let (status, text) = exchange(a, &ingest_request(&[], &vec![b'x'; 100_000]), WAIT);
+        assert_eq!(413, status, "{text}");
+        // A declared length far past the limit is refused before any of the body is awaited.
+        let lie = b"POST /v1/ingest HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-ndjson\r\nContent-Length: 1099511627776\r\nConnection: close\r\n\r\n";
+        let started = Instant::now();
+        assert_eq!(413, exchange(a, lie, WAIT).0);
+        assert!(started.elapsed() < Duration::from_secs(2), "answered from the head, not after a timeout");
+        assert!(got.lock().unwrap().is_empty());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn a_gzip_bomb_is_capped_at_the_decompressed_limit() {
+        let (rx, got) = start(PeerConfig { max_decompressed_bytes: 64 * 1024, ..PeerConfig::default() }, false);
+        // 16 MiB of newlines: blank lines are skipped, so only the size cap can stop it.
+        let bomb = gzip(&vec![b'\n'; 16 * 1024 * 1024]);
+        assert!(bomb.len() < 64 * 1024, "the compressed form fits under the body limit ({} bytes)", bomb.len());
+        let (status, text) = exchange(rx.local_addr(), &ingest_request(&gz_header(), &bomb), WAIT);
+        assert_eq!(413, status, "{text}");
+        assert!(got.lock().unwrap().is_empty());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn a_truncated_gzip_stream_is_refused_even_when_its_complete_lines_decode() {
+        let (rx, got) = start(PeerConfig::default(), false);
+        let full = gzip(&ndjson(&(0..200).map(|i| record(&format!("line {i}"))).collect::<Vec<_>>()));
+        for cut in [full.len() / 2, full.len() - 8, full.len() - 1, 5] {
+            let (status, text) = exchange(rx.local_addr(), &ingest_request(&gz_header(), &full[..cut]), WAIT);
+            assert_eq!(400, status, "cut at {cut}: {text}");
+        }
+        assert!(got.lock().unwrap().is_empty(), "a damaged batch stores nothing");
+        rx.shutdown();
+    }
+
+    #[test]
+    fn bytes_that_are_not_gzip_but_claim_to_be_are_400() {
+        let (rx, got) = start(PeerConfig::default(), false);
+        for junk in [&b"plain text"[..], &[0x1f, 0x8b][..], &[0x1f, 0x8b, 0x08, 0xff, 0xff][..], &[0u8; 64][..]] {
+            let (status, text) = exchange(rx.local_addr(), &ingest_request(&gz_header(), junk), WAIT);
+            assert_eq!(400, status, "{junk:?}: {text}");
+        }
+        assert!(got.lock().unwrap().is_empty());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn malformed_and_partial_ndjson_stores_nothing_and_is_never_a_crash() {
+        let (rx, got) = start(PeerConfig::default(), false);
+        let good = String::from_utf8(ndjson(&[record("ok")])).unwrap();
+        let cut_mid_record = &good[..good.len() / 2];
+        let deep = format!("{}{}", "[".repeat(200_000), "]".repeat(200_000));
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("partial last line", format!("{good}\n{cut_mid_record}").into_bytes()),
+            ("only half a record", cut_mid_record.as_bytes().to_vec()),
+            ("nul bytes", b"{\"a\":\0}\n".to_vec()),
+            ("invalid utf-8", [&good.as_bytes()[..10], &[0xff, 0xfe, 0xc0], &good.as_bytes()[10..]].concat()),
+            ("a json array, not an object", b"[1,2,3]".to_vec()),
+            ("a bare string", b"\"hello\"".to_vec()),
+            ("two records on one line", format!("{good}{good}").into_bytes()),
+            ("deeply nested json", deep.into_bytes()),
+            ("a lone brace", b"{".to_vec()),
+        ];
+        for (name, body) in cases {
+            let (status, text) = exchange(rx.local_addr(), &ingest_request(&[], &body), WAIT);
+            assert_eq!(400, status, "{name}: {text}");
+            assert!(text.contains("bad_record"), "{name}: {text}");
+        }
+        assert!(got.lock().unwrap().is_empty(), "no partial batch was kept");
+        assert!(rx.stats().bad_request >= 9);
+        // Still serving afterwards.
+        assert_eq!(200, post(rx.local_addr(), INGEST_PATH, None, &ndjson(&[record("after")])).0);
+        rx.shutdown();
+    }
+
+    #[test]
+    fn crlf_line_endings_and_blank_lines_are_fine() {
+        let (rx, got) = start(PeerConfig::default(), false);
+        let body = String::from_utf8(ndjson(&[record("a"), record("b")])).unwrap().replace('\n', "\r\n\r\n");
+        assert_eq!(200, exchange(rx.local_addr(), &ingest_request(&[], body.as_bytes()), WAIT).0);
+        assert_eq!(2, got.lock().unwrap().len());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn only_the_wire_content_types_and_encodings_are_accepted() {
+        let (rx, got) = start(PeerConfig::default(), false);
+        let body = ndjson(&[record("x")]);
+        let a = rx.local_addr();
+        for kind in ["text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "application/octet-stream", "text/html"] {
+            let req = request("POST", INGEST_PATH, &[("Content-Type", kind.to_string())], &body);
+            assert_eq!(415, exchange(a, &req, WAIT).0, "{kind}");
+        }
+        // No Content-Type is what a browser sends for a Blob with no type; it is a CORS-safelisted
+        // request, so it must not reach the parser.
+        assert_eq!(415, exchange(a, &request("POST", INGEST_PATH, &[], &body), WAIT).0, "no content type");
+        for encoding in ["br", "deflate", "compress", "gzip, gzip", "gzip, br", "zstd", "identity, gzip"] {
+            let (status, text) = exchange(a, &ingest_request(&[("Content-Encoding", encoding.to_string())], &body), WAIT);
+            assert_eq!(415, status, "{encoding}: {text}");
+        }
+        assert_eq!(200, exchange(a, &ingest_request(&[("Content-Encoding", "identity".to_string())], &body), WAIT).0);
+        assert_eq!(1, got.lock().unwrap().len(), "only the identity-encoded request was kept");
+        rx.shutdown();
+    }
+
+    fn secured() -> (Receiver, Arc<StdMutex<Vec<LogRecord>>>) {
+        start(PeerConfig { tokens: vec!["s3cret-token-value".into(), "second-token".into()], ..PeerConfig::default() }, false)
+    }
+
+    #[test]
+    fn a_missing_wrong_short_long_or_oddly_presented_token_never_ingests() {
+        let (rx, got) = secured();
+        let a = rx.local_addr();
+        let body = ndjson(&[record("x")]);
+        let padded = format!("Bearer s3cret-token-value{}", "\0".repeat(256));
+        let attempts: Vec<(&str, Option<String>, u16)> = vec![
+            ("no header", None, 401),
+            ("empty bearer", Some("Bearer ".into()), 401),
+            ("wrong scheme", Some("Basic czNjcmV0LXRva2VuLXZhbHVl".into()), 401),
+            ("token without a scheme", Some("s3cret-token-value".into()), 401),
+            ("wrong token", Some("Bearer nope-nope-nope-nope".into()), 403),
+            ("a prefix of the token", Some("Bearer s3cret-token-valu".into()), 403),
+            ("one character", Some("Bearer s".into()), 403),
+            ("the token plus a suffix", Some("Bearer s3cret-token-value!".into()), 403),
+            ("the token plus 256 NULs", Some(padded), 403),
+            ("two Authorization headers, the good one first", Some("Bearer s3cret-token-value\r\nAuthorization: Bearer second-token".into()), 401),
+            ("the token in another case", Some("Bearer S3CRET-TOKEN-VALUE".into()), 403),
+            ("a 64 KiB token", Some(format!("Bearer {}", "a".repeat(8 * 1024))), 403),
+        ];
+        for (name, auth, want) in attempts {
+            let headers: Vec<(&str, String)> = auth.into_iter().map(|v| ("Authorization", v)).collect();
+            let (status, text) = exchange(a, &ingest_request(&headers, &body), WAIT);
+            assert_eq!(want, status, "{name}: {text}");
+        }
+        // A token in the URL is not a token.
+        let q = request("POST", "/v1/ingest?token=s3cret-token-value&access_token=s3cret-token-value", &[("Content-Type", "application/x-ndjson".into())], &body);
+        assert_eq!(401, exchange(a, &q, WAIT).0);
+        assert!(got.lock().unwrap().is_empty());
+        // Both configured tokens work, and the lower-case scheme.
+        for token in ["Bearer s3cret-token-value", "bearer second-token"] {
+            let req = ingest_request(&[("Authorization", token.to_string())], &body);
+            assert_eq!(200, exchange(a, &req, WAIT).0, "{token}");
+        }
+        rx.shutdown();
+    }
+
+    #[test]
+    fn the_token_comparison_looks_at_every_byte_and_cannot_be_fooled_by_length() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(constant_time_eq(b"", b""));
+        for other in [&b"abd"[..], b"xbc", b"abcd", b"ab", b"", b"ABC"] {
+            assert!(!constant_time_eq(b"abc", other), "{other:?}");
+            assert!(!constant_time_eq(other, b"abc"), "{other:?}");
+        }
+        // A length difference that is a multiple of 256 vanishes if it is narrowed to a byte, and the
+        // NUL padding then compares equal to the missing bytes.
+        for extra in [256usize, 512, 65_536] {
+            let padded = [&b"abc"[..], &vec![0u8; extra]].concat();
+            assert!(!constant_time_eq(b"abc", &padded), "+{extra} NULs");
+            assert!(!constant_time_eq(&padded, b"abc"), "+{extra} NULs");
+        }
+    }
+
+    #[test]
+    fn unauthenticated_requests_are_answered_from_the_head_before_any_body_is_buffered() {
+        let (rx, got) = secured();
+        let a = rx.local_addr();
+        // Declares 3 MiB and sends none of it: a server that reads the body first waits for it.
+        let head = b"POST /v1/ingest HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-ndjson\r\nContent-Length: 3145728\r\nConnection: close\r\n\r\n";
+        let started = Instant::now();
+        assert_eq!(401, exchange(a, head, WAIT).0);
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        // A bomb with no token learns nothing about the size limits: 401, not 413, and it is never inflated.
+        let bomb = gzip(&vec![b'\n'; 64 * 1024 * 1024]);
+        let (status, text) = exchange(a, &ingest_request(&gz_header(), &bomb), WAIT);
+        assert_eq!(401, status, "{text}");
+        let oversized = ingest_request(&[], &vec![b'x'; 5 * 1024 * 1024]);
+        assert_eq!(401, exchange(a, &oversized, WAIT).0);
+        assert!(got.lock().unwrap().is_empty());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn a_client_that_never_finishes_its_body_does_not_use_up_the_receiver() {
+        let (rx, got) = start(PeerConfig { workers: 2, ..PeerConfig::default() }, false);
+        let a = rx.local_addr();
+        // More stalled senders than there are workers: each has sent a head and ten bytes of 100000.
+        let stalled: Vec<std::net::TcpStream> = (0..6)
+            .map(|_| {
+                let mut c = std::net::TcpStream::connect(a).unwrap();
+                c.write_all(b"POST /v1/ingest HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-ndjson\r\nContent-Length: 100000\r\n\r\n0123456789").unwrap();
+                c
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        let (status, text) = exchange(a, &ingest_request(&[], &ndjson(&[record("still served")])), Duration::from_secs(3));
+        assert_eq!(200, status, "{text}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(1, got.lock().unwrap().len());
+        drop(stalled);
+        rx.shutdown();
+    }
+
+    #[test]
+    fn huge_or_numerous_header_lines_are_refused_with_431_and_the_receiver_keeps_serving() {
+        let (rx, got) = start(PeerConfig::default(), false);
+        let a = rx.local_addr();
+        let big = "a".repeat(2 * 1024 * 1024);
+        let one_line = request("GET", CAPABILITY_PATH, &[("X-Big", big.clone())], b"");
+        assert_eq!(431, exchange(a, &one_line, WAIT).0, "one 2 MiB header");
+        let many: Vec<(&str, String)> = (0..200).map(|_| ("X-A", "b".to_string())).collect();
+        assert_eq!(431, exchange(a, &request("GET", CAPABILITY_PATH, &many, b""), WAIT).0, "200 headers");
+        let long_target = format!("/{}", "p".repeat(200_000));
+        assert_eq!(431, exchange(a, &request("GET", &long_target, &[], b""), WAIT).0, "200 kB request line");
+        // A head that never ends is cut off at the budget instead of being buffered.
+        let endless = [b"GET / HTTP/1.1\r\nX: ".to_vec(), vec![b'z'; 4 * 1024 * 1024]].concat();
+        assert_eq!(431, exchange(a, &endless, WAIT).0, "head with no end");
+        assert_eq!(200, get(a, CAPABILITY_PATH, None).0);
+        assert!(got.lock().unwrap().is_empty());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn framing_tricks_are_refused_rather_than_guessed_at() {
+        let (rx, got) = start(PeerConfig::default(), false);
+        let a = rx.local_addr();
+        let line = String::from_utf8(ndjson(&[record("smuggled")])).unwrap();
+        let chunked = format!("POST /v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{line}\r\n0\r\n\r\n", line.len());
+        assert_eq!(501, exchange(a, chunked.as_bytes(), WAIT).0, "chunked");
+        let both = format!("POST /v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nTransfer-Encoding: chunked\r\n\r\n{line}", line.len());
+        assert_eq!(501, exchange(a, both.as_bytes(), WAIT).0, "length and chunked together");
+        let two = format!("POST /v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nContent-Length: 2\r\n\r\n{line}", line.len());
+        assert_eq!(400, exchange(a, two.as_bytes(), WAIT).0, "two Content-Length");
+        for bad in ["-1", "+5", "1e3", "0x10", " ", "99999999999999999999999"] {
+            let req = format!("POST /v1/ingest HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-ndjson\r\nContent-Length: {bad}\r\n\r\n{line}");
+            let (status, text) = exchange(a, req.as_bytes(), WAIT);
+            assert!(matches!(status, 400 | 413), "Content-Length {bad:?}: {text}");
+        }
+        // A second request pipelined behind the first is not read as a request.
+        let pipelined = [ingest_request(&[], line.as_bytes()), ingest_request(&[], line.as_bytes())].concat();
+        assert_eq!(200, exchange(a, &pipelined, WAIT).0);
+        assert_eq!(1, got.lock().unwrap().len(), "the first request only");
+        rx.shutdown();
+    }
+
+    #[test]
+    fn only_the_documented_method_and_exact_path_reach_a_handler() {
+        let (rx, got) = secured();
+        let a = rx.local_addr();
+        let auth = [("Authorization", "Bearer s3cret-token-value".to_string()), ("Content-Type", "application/x-ndjson".to_string())];
+        let body = ndjson(&[record("x")]);
+        for path in ["/v1/ingest/", "//v1/ingest", "/v1//ingest", "/V1/INGEST", "/v1/./ingest", "/v1/x/../ingest", "/v1/%69ngest", "/v1/ingest%2f", "/v1/ingest%00", "/v1/ingest;x", "http://127.0.0.1/v1/ingest", "/ingest", "*"] {
+            let (status, text) = exchange(a, &request("POST", path, &auth, &body), WAIT);
+            assert!(matches!(status, 400 | 404), "{path}: {status} {text}");
+        }
+        for (method, path, want) in [
+            ("GET", INGEST_PATH, 405), ("PUT", INGEST_PATH, 404), ("DELETE", INGEST_PATH, 404), ("PATCH", INGEST_PATH, 404),
+            ("HEAD", INGEST_PATH, 404), ("OPTIONS", INGEST_PATH, 404), ("TRACE", INGEST_PATH, 404), ("CONNECT", INGEST_PATH, 404),
+            ("POST", CAPABILITY_PATH, 405), ("DELETE", CAPABILITY_PATH, 404),
+        ] {
+            let (status, text) = exchange(a, &request(method, path, &auth, &body), WAIT);
+            assert_eq!(want, status, "{method} {path}: {text}");
+            assert!(!text.to_ascii_lowercase().contains("access-control-"), "{method} {path} must not grant cross-origin access");
+        }
+        // A query string does not change what a path is.
+        assert_eq!(200, exchange(a, &request("POST", "/v1/ingest?x=1&y=2", &auth, &body), WAIT).0);
+        assert_eq!(1, got.lock().unwrap().len());
+        rx.shutdown();
+    }
+
+    #[test]
+    fn a_tokenless_loopback_listener_refuses_a_foreign_host_header() {
+        // DNS rebinding: a web page re-points its own name at 127.0.0.1 and then talks to the listener
+        // as same-origin. Its requests carry its own name in Host.
+        let (rx, got) = start(PeerConfig::default(), false);
+        let a = rx.local_addr();
+        let body = ndjson(&[record("x")]);
+        for host in ["evil.example", "evil.example:9300", "127.0.0.1.evil.example", "localhost:80@evil.example", ""] {
+            let req = format!("POST /v1/ingest HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let (status, text) = exchange(a, &[req.as_bytes(), &body].concat(), WAIT);
+            assert_eq!(403, status, "Host {host:?}: {text}");
+        }
+        let no_host = [&b"GET /.well-known/logless HTTP/1.1\r\nConnection: close\r\n\r\n"[..]].concat();
+        assert_eq!(403, exchange(a, &no_host, WAIT).0, "no Host at all");
+        assert!(got.lock().unwrap().is_empty());
+        for host in ["127.0.0.1", "localhost:9300", "[::1]:9300"] {
+            let req = format!("GET /.well-known/logless HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+            assert_eq!(200, exchange(a, req.as_bytes(), WAIT).0, "Host {host}");
+        }
+        rx.shutdown();
+    }
+
+    #[test]
+    fn the_capability_document_does_not_leak_secrets() {
+        let (rx, _) = secured();
+        let (status, text) = exchange(rx.local_addr(), &request("GET", CAPABILITY_PATH, &[("Authorization", "Bearer second-token".into())], b""), WAIT);
+        assert_eq!(200, status);
+        assert!(!text.contains("s3cret-token-value") && !text.contains("second-token"), "{text}");
+        rx.shutdown();
+    }
+
+    #[test]
+    fn a_logged_config_never_carries_a_token() {
+        let config = PeerConfig { tokens: vec!["SENTINEL-TOKEN-ONE".into(), "SENTINEL-TOKEN-TWO".into()], ..PeerConfig::default() };
+        for shown in [format!("{config:?}"), format!("{config:#?}")] {
+            assert!(!shown.contains("SENTINEL"), "{shown}");
+            assert!(shown.contains("tokens"), "the field is still named, with a count: {shown}");
+        }
+    }
+
+
+    #[test]
+    fn a_short_token_is_refused_on_a_non_loopback_bind_only() {
+        let weak = |addr: &str, tokens: Vec<String>| {
+            Receiver::start(&PeerConfig { enabled: true, addr: addr.into(), tokens, ..PeerConfig::default() }, "x".into(), |_| Admitted::Accepted).err()
+        };
+        let long = "t".repeat(crate::admin_api::MIN_REMOTE_TOKEN_LEN);
+        assert!(matches!(weak("0.0.0.0:0", vec!["short".into()]), Some(PeerError::WeakToken { len: 5, .. })));
+        assert!(matches!(weak("0.0.0.0:0", vec![long.clone(), "short".into()]), Some(PeerError::WeakToken { len: 5, .. })), "every token counts");
+        assert!(matches!(weak("0.0.0.0:0", vec![String::new()]), Some(PeerError::WeakToken { len: 0, .. })), "an empty token is not a token");
+        assert!(weak("0.0.0.0:0", vec![long]).is_none());
+        assert!(weak("127.0.0.1:0", vec!["short".into()]).is_none(), "loopback is for local testing");
+    }
+
 }

@@ -941,7 +941,7 @@ fn token_matches(expected: &[u8; 32], presented: &str) -> bool {
 /// Strict `host[:port]` / `[v6][:port]` check. Anything that is not exactly
 /// that (userinfo, trailing junk, odd characters) is refused rather than
 /// prefix-matched, so `localhost:80@evil.com` is not loopback.
-fn host_allowed(host_header: Option<&str>, allowed: &[String]) -> bool {
+pub(crate) fn host_allowed(host_header: Option<&str>, allowed: &[String]) -> bool {
     let Some(value) = host_header else { return false };
     let value = value.trim().to_ascii_lowercase();
     let port_ok = |p: &str| p.is_empty() || (p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()));
@@ -998,8 +998,10 @@ impl Handler for Api {
         if req.header_count("host") != 1 || !host_allowed(req.header("host"), &self.allowed_hosts) {
             return reply(err(403, "forbidden_host", "Host header is not loopback and not in [admin].allowed_hosts"));
         }
+        // Two Authorization headers are ambiguous (a proxy may pick the other one), so neither counts.
         let presented = req
             .header("authorization")
+            .filter(|_| req.header_count("authorization") == 1)
             .and_then(|v| v.trim().strip_prefix("Bearer ").or_else(|| v.trim().strip_prefix("bearer ")))
             .map(str::trim);
         if !presented.is_some_and(|t| token_matches(&self.token, t)) {
@@ -2269,4 +2271,155 @@ mod tests {
         // It needs the admin token like every other route.
         assert_eq!(401, r.agent.get(&format!("{}/admin/v1/templates/merge-suggestions", r.base)).call().unwrap().status().as_u16());
     }
+
+    // --- hostile input ---------------------------------------------------
+
+    fn status_of(resp: &str) -> u16 {
+        resp.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+    }
+
+    fn admin_raw(r: &Rig, request_line: &str, headers: &str, body: &[u8]) -> String {
+        let addr = r.server.as_ref().unwrap().local_addr();
+        let req = format!("{request_line}\r\nHost: 127.0.0.1\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let mut conn = std::net::TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let _ = conn.write_all(&[req.as_bytes(), body].concat());
+        let mut out = Vec::new();
+        let _ = conn.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn authed() -> String {
+        format!("Authorization: Bearer {TOKEN}\r\n")
+    }
+
+    #[test]
+    fn an_oversized_body_is_413_declared_or_sent_and_changes_nothing() {
+        let r = rig();
+        let addr = r.server.as_ref().unwrap().local_addr();
+        let big = vec![b' '; MAX_BODY_BYTES + 1];
+        let resp = admin_raw(&r, "PUT /admin/v1/policies HTTP/1.1", &format!("{}If-Match: \"0\"\r\n", authed()), &big);
+        assert_eq!(413, status_of(&resp), "{}", &resp[..resp.len().min(120)]);
+        // Declared and never sent: answered from the head, not after the request timeout.
+        let started = std::time::Instant::now();
+        let resp = raw(addr, &format!("PUT /admin/v1/policies HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Content-Length: 1099511627776\r\nConnection: close\r\n\r\n", authed()));
+        assert_eq!(413, status_of(&resp), "{resp}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        // Exactly at the limit is read (and then judged on its content).
+        let at = vec![b' '; MAX_BODY_BYTES];
+        let resp = admin_raw(&r, "PUT /admin/v1/policies HTTP/1.1", &format!("{}If-Match: \"0\"\r\n", authed()), &at);
+        assert_ne!(413, status_of(&resp));
+        assert_eq!(r.policies()["version"], 0, "nothing was applied");
+    }
+
+    #[test]
+    fn a_compressed_body_is_never_inflated_by_the_admin_listener() {
+        let r = rig();
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![b' '; 64 * 1024 * 1024]).unwrap();
+        let bomb = enc.finish().unwrap();
+        let resp = admin_raw(&r, "POST /admin/v1/policies/preview HTTP/1.1", &format!("{}Content-Encoding: gzip\r\n", authed()), &bomb);
+        assert!((400..500).contains(&status_of(&resp)), "{}", &resp[..resp.len().min(120)]);
+        assert_eq!(r.call("GET", "/admin/v1/info", &[], None).0, 200);
+    }
+
+    #[test]
+    fn every_method_but_the_documented_one_is_refused_and_the_override_headers_do_nothing() {
+        let r = rig();
+        let paths = ["/admin/v1/info", "/admin/v1/policies", "/admin/v1/policies/preview", "/admin/v1/policies/restore", "/admin/v1/policies/history", "/admin/v1/sync", "/admin/v1/sync/backfill"];
+        for path in paths {
+            for method in ["DELETE", "PATCH", "TRACE", "CONNECT", "OPTIONS", "HEAD", "PURGE", "get", "Get"] {
+                let with = admin_raw(&r, &format!("{method} {path} HTTP/1.1"), &authed(), b"");
+                assert!(matches!(status_of(&with), 404 | 405), "{method} {path}: {}", &with[..with.len().min(80)]);
+                let without = admin_raw(&r, &format!("{method} {path} HTTP/1.1"), "", b"");
+                assert_eq!(401, status_of(&without), "{method} {path} without a token");
+            }
+        }
+        // A POST cannot be turned into a PUT (which applies a change) by a header or a query parameter.
+        for headers in ["X-HTTP-Method-Override: PUT\r\n", "X-HTTP-Method: PUT\r\n", "X-Method-Override: PUT\r\n"] {
+            let resp = admin_raw(&r, "POST /admin/v1/policies HTTP/1.1", &format!("{}{headers}If-Match: \"0\"\r\n", authed()), b"{}");
+            assert_eq!(405, status_of(&resp), "{headers}");
+        }
+        let resp = admin_raw(&r, "POST /admin/v1/policies?_method=PUT HTTP/1.1", &format!("{}If-Match: \"0\"\r\n", authed()), b"{}");
+        assert_eq!(405, status_of(&resp));
+        // A body on a GET is ignored, not parsed.
+        let resp = admin_raw(&r, "GET /admin/v1/info HTTP/1.1", &authed(), b"{\"x\":1}");
+        assert_eq!(200, status_of(&resp));
+        assert_eq!(r.policies()["version"], 0);
+    }
+
+    #[test]
+    fn only_the_exact_path_is_routed() {
+        let r = rig();
+        for path in [
+            "/admin/v1/info/", "//admin/v1/info", "/admin//v1/info", "/admin/v1/./info", "/admin/v1/x/../info", "/ADMIN/V1/INFO",
+            "/admin/v1/%69nfo", "/admin/v1/info%2f", "/admin/v1/info%00", "/admin/v1/info;x=1", "/admin/v1/info.json", "/admin/v1",
+            "/admin/v1/", "/v1/info", "http://127.0.0.1/admin/v1/info", "*", "/admin/v1/info%20",
+        ] {
+            let resp = admin_raw(&r, &format!("GET {path} HTTP/1.1"), &authed(), b"");
+            assert!(matches!(status_of(&resp), 400 | 404), "{path}: {}", &resp[..resp.len().min(80)]);
+        }
+        // Path matching ignores the query, and a query cannot smuggle a path.
+        assert_eq!(200, status_of(&admin_raw(&r, "GET /admin/v1/info?x=/../policies HTTP/1.1", &authed(), b"")));
+        assert_eq!(200, status_of(&admin_raw(&r, "GET /admin/v1/info?limit=999999999999999999999 HTTP/1.1", &authed(), b"")));
+        for q in ["limit=0", "limit=-1", "limit=1001", "limit=abc", "limit=99999999999999999999999", "limit="] {
+            assert_eq!(400, status_of(&admin_raw(&r, &format!("GET /admin/v1/policies/history?{q} HTTP/1.1"), &authed(), b"")), "{q}");
+        }
+        let huge = format!("GET /admin/v1/policies/history?{} HTTP/1.1", "a=b&".repeat(10_000));
+        assert_eq!(431, status_of(&admin_raw(&r, &huge, &authed(), b"")), "a 40 kB query string is over the head budget");
+    }
+
+    #[test]
+    fn a_token_has_to_arrive_in_exactly_one_authorization_header() {
+        let r = rig();
+        let good = authed();
+        let bad = "Authorization: Bearer wrong-token-wrong-token-wrong\r\n";
+        let nul_padded = format!("Authorization: Bearer {TOKEN}{}\r\n", "\0".repeat(256));
+        for (name, headers, want) in [
+            ("good then bad", format!("{good}{bad}"), 401),
+            ("bad then good", format!("{bad}{good}"), 401),
+            ("good twice", format!("{good}{good}"), 401),
+            ("the token plus 256 NULs", nul_padded, 401),
+            ("a 32 kB token", format!("Authorization: Bearer {}\r\n", "a".repeat(8000)), 401),
+            ("token in a cookie", format!("Cookie: token={TOKEN}\r\n"), 401),
+            ("token in the query only", String::new(), 401),
+            ("good once", good.clone(), 200),
+        ] {
+            let target = if name == "token in the query only" { format!("/admin/v1/info?token={TOKEN}&access_token={TOKEN}") } else { "/admin/v1/info".to_string() };
+            let resp = admin_raw(&r, &format!("GET {target} HTTP/1.1"), &headers, b"");
+            assert_eq!(want, status_of(&resp), "{name}: {}", &resp[..resp.len().min(80)]);
+        }
+    }
+
+    #[test]
+    fn host_names_that_merely_resolve_to_loopback_are_not_loopback_names() {
+        // Conservative on purpose: only the literal loopback spellings pass, so a name an attacker
+        // controls cannot be a way in however its DNS is set up.
+        for host in ["localhost.", "127.1", "2130706433", "0x7f.0.0.1", "[::ffff:127.0.0.1]", "127.0.0.1.nip.io", "localhost.localdomain", "0.0.0.0", "[::]", "127.0.0.2.evil.example", "xn--localhost"] {
+            assert!(!host_allowed(Some(host), &[]), "{host}");
+        }
+        assert!(host_allowed(Some("127.0.0.2"), &[]), "any 127/8 address is loopback");
+        let r = rig();
+        let addr = r.server.as_ref().unwrap().local_addr();
+        // Absolute-form: the request-target's host is not what is checked, the Host header is, and the
+        // path is the whole target, which matches no route.
+        let resp = raw(addr, &format!("GET http://localhost/admin/v1/info HTTP/1.1\r\nHost: evil.example\r\n{}Connection: close\r\n\r\n", authed()));
+        assert_eq!(403, status_of(&resp));
+        let resp = raw(addr, &format!("GET http://evil.example/admin/v1/info HTTP/1.1\r\nHost: 127.0.0.1\r\n{}Connection: close\r\n\r\n", authed()));
+        assert_eq!(404, status_of(&resp));
+        // HTTP/1.0 with no Host header is refused too, not treated as the default host.
+        let resp = raw(addr, &format!("GET /admin/v1/info HTTP/1.0\r\n{}\r\n", authed()));
+        assert_eq!(403, status_of(&resp));
+    }
+
+    #[test]
+    fn replies_carry_no_cross_origin_grants_and_are_not_cacheable() {
+        let r = rig();
+        let resp = admin_raw(&r, "GET /admin/v1/policies HTTP/1.1", &format!("{}Origin: http://evil.example\r\n", authed()), b"");
+        let lower = resp.to_ascii_lowercase();
+        assert!(!lower.contains("access-control-"), "{resp}");
+        assert!(lower.contains("cache-control: no-store"), "{resp}");
+        assert!(lower.contains("connection: close"));
+    }
+
 }
