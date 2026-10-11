@@ -1360,7 +1360,7 @@ fn run(
 
     // Records from other log-less instances take the same road as the other receivers: a bounded
     // channel into the main loop (a full one is a 503 and the sender retries), then templating and the
-    // queue. They keep the sender's observed time and event id, so partitions and dedupe stay right.
+    // queue. They keep the sender's event time, observed time and event id, so partitions and dedupe stay right.
     // Each batch carries a ticket: the request is answered only once the WAL has synced the batch.
     let (peer_tx, peer_rx) = if config.peer.enabled {
         let (tx, rx) = crossbeam_channel::bounded::<(logless_core::peer::Ticket, Vec<LogRecord>)>(PEER_PENDING_BATCHES);
