@@ -2270,7 +2270,7 @@ mod tests {
             c.decision = crate::decision::DecisionConfig { url: Some(url), token: Some("model-token".into()), ..Default::default() };
         });
         let mut catalog = Catalog::open(&r.config.catalog_path()).unwrap();
-        let t = |id: u64, text: &str, count: u64| crate::drain::Template { id, tokens: text.split(' ').map(str::to_string).collect(), count, first_seen_unix_secs: 0, last_seen_unix_secs: 0 };
+        let t = |id: u64, text: &str, count: u64| crate::drain::Template { id, tokens: text.split(' ').map(str::to_string).collect(), count, first_seen_unix_secs: 0, last_seen_unix_secs: 0, lineage_id: id };
         catalog
             .save_templates(&[
                 t(1, "redis timeout after <*> ms on GET session", 900),

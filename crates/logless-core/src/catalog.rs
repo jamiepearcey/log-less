@@ -54,6 +54,8 @@ pub struct DictionaryEntry {
     pub template_id: u64,
     pub service: Option<String>,
     pub text: String,
+    /// `Template::lineage_id`: survives widening, unlike a hash of `text`.
+    pub lineage_id: u64,
     pub first_observed_nanos: i64,
     pub last_observed_nanos: i64,
 }
@@ -128,7 +130,8 @@ impl Catalog {
                 tokens     TEXT    NOT NULL,
                 count      INTEGER NOT NULL,
                 first_seen INTEGER NOT NULL,
-                last_seen  INTEGER NOT NULL
+                last_seen  INTEGER NOT NULL,
+                lineage_id INTEGER
             );
 
             -- Which services each template has been seen in, and when (by the
@@ -181,6 +184,7 @@ impl Catalog {
             );
             "#,
         )?;
+        Self::migrate_lineage(&conn)?;
         // Minted once, with the templates table it qualifies. A lost catalog
         // restarts template ids at 1 and gets a new space with them, which is
         // exactly right: the old ids and the new ones are different namespaces.
@@ -189,6 +193,38 @@ impl Catalog {
             params![uuid::Uuid::now_v7().to_string()],
         )?;
         Ok(Self { conn })
+    }
+
+    /// Additive migration: catalogs created before `lineage_id` get the column,
+    /// and every template without one is given the fingerprint of its current
+    /// text. That is the identity the Sentry forwarder already used for it, so
+    /// the migration moves no existing issue; only widenings from here on are
+    /// followed. The text it was born with is not recoverable. Idempotent.
+    fn migrate_lineage(conn: &Connection) -> Result<(), CatalogError> {
+        let has: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('templates') WHERE name = 'lineage_id'")?
+            .exists([])?;
+        if !has {
+            conn.execute("ALTER TABLE templates ADD COLUMN lineage_id INTEGER", [])?;
+        }
+        let mut stmt = conn.prepare("SELECT id, text FROM templates WHERE lineage_id IS NULL ORDER BY id")?;
+        let missing: Vec<(i64, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut used: std::collections::HashSet<i64> = conn
+            .prepare("SELECT lineage_id FROM templates WHERE lineage_id IS NOT NULL")?
+            .query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        for (id, text) in missing {
+            let mut lineage = crate::drain::fingerprint_of(&text) as i64;
+            if !used.insert(lineage) {
+                lineage = crate::drain::fingerprint_of(&format!("{text}\u{1f}{id}")) as i64;
+                used.insert(lineage);
+            }
+            conn.execute("UPDATE templates SET lineage_id = ?1 WHERE id = ?2", params![lineage, id])?;
+        }
+        Ok(())
     }
 
     /// The namespace this catalog's template ids are minted in (a UUID). Two
@@ -408,8 +444,10 @@ impl Catalog {
         let tx = self.conn.transaction()?;
         for t in templates {
             tx.execute(
-                "INSERT INTO templates (id, text, tokens, count, first_seen, last_seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                // `lineage_id` is written once and never updated: widening
+                // changes `text`, not the identity.
+                "INSERT INTO templates (id, text, tokens, count, first_seen, last_seen, lineage_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                     text = excluded.text, tokens = excluded.tokens,
                     count = excluded.count, last_seen = excluded.last_seen",
@@ -422,6 +460,7 @@ impl Catalog {
                     t.count as i64,
                     t.first_seen_unix_secs as i64,
                     t.last_seen_unix_secs as i64,
+                    t.lineage_id as i64,
                 ],
             )?;
         }
@@ -441,7 +480,7 @@ impl Catalog {
 
     pub fn load_templates(&self) -> Result<Vec<crate::drain::Template>, CatalogError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, tokens, count, first_seen, last_seen FROM templates ORDER BY id",
+            "SELECT id, tokens, count, first_seen, last_seen, lineage_id FROM templates ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
             let tokens: String = row.get(1)?;
@@ -451,6 +490,7 @@ impl Catalog {
                 count: row.get::<_, i64>(2)? as u64,
                 first_seen_unix_secs: row.get::<_, i64>(3)? as u64,
                 last_seen_unix_secs: row.get::<_, i64>(4)? as u64,
+                lineage_id: row.get::<_, i64>(5)? as u64,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -462,7 +502,7 @@ impl Catalog {
     pub fn template_dictionary(&self) -> Result<Vec<DictionaryEntry>, CatalogError> {
         let mut stmt = self.conn.prepare(
             "SELECT s.template_id, s.has_service, s.service, t.tokens,
-                    s.first_observed, s.last_observed
+                    s.first_observed, s.last_observed, t.lineage_id
              FROM template_services s JOIN templates t ON t.id = s.template_id
              ORDER BY s.template_id, s.has_service, s.service",
         )?;
@@ -478,6 +518,7 @@ impl Catalog {
                 text: tokens.split('\t').collect::<Vec<_>>().join(" "),
                 first_observed_nanos: row.get(4)?,
                 last_observed_nanos: row.get(5)?,
+                lineage_id: row.get::<_, i64>(6)? as u64,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -794,5 +835,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(only_info, vec![late]);
+    }
+
+    #[test]
+    fn lineage_is_stored_once_and_survives_widening_and_reload() {
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let mut d = crate::drain::Drain::new(crate::drain::DrainConfig { similarity_threshold: 0.5, ..Default::default() });
+        let id = d.add_line("job run alpha finished ok in cache", 1).unwrap().template_id;
+        let born = d.template(id).unwrap().lineage_id;
+        cat.save_templates(&d.templates().cloned().collect::<Vec<_>>()).unwrap();
+        d.add_line("job run beta finished ok in cache", 2).unwrap();
+        cat.save_templates(&d.templates().cloned().collect::<Vec<_>>()).unwrap();
+        let t = &cat.load_templates().unwrap()[0];
+        assert_eq!(t.text(), "job run <*> finished ok in cache");
+        assert_eq!(t.lineage_id, born);
+        assert_ne!(t.fingerprint(), born);
+    }
+
+    #[test]
+    fn a_catalog_from_before_lineage_is_migrated_additively() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE templates (id INTEGER PRIMARY KEY, text TEXT NOT NULL, tokens TEXT NOT NULL,
+                    count INTEGER NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+                 INSERT INTO templates VALUES (4, 'a <*> c', 'a\t<*>\tc', 9, 1, 2);",
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let cat = Catalog::open(&path).unwrap();
+            let t = &cat.load_templates().unwrap()[0];
+            assert_eq!((t.id, t.count), (4, 9), "existing rows untouched");
+            assert_eq!(t.lineage_id, crate::drain::fingerprint_of("a <*> c"), "backfilled with today's issue identity");
+        }
     }
 }

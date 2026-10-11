@@ -1395,6 +1395,7 @@ mod tests {
             last_seen_micros: 2,
             agent: "space".into(),
             global_id: crate::drain::fingerprint_of("user <*> logged in"),
+            lineage_id: crate::drain::fingerprint_of("user <*> logged in"),
         }];
         crate::template_dict::write(&f.store, &rows).unwrap();
         let meta = f.store.join("_meta");
