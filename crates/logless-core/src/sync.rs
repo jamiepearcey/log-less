@@ -1277,7 +1277,7 @@ mod tests {
         let buckets = crate::config::LevelBuckets::default();
         let mut by_partition: std::collections::HashMap<_, Vec<LogRecord>> = std::collections::HashMap::new();
         for record in records {
-            let key = crate::partition::PartitionKey { epoch_hour: record.observed_unix_nano / 3_600_000_000_000, bucket: buckets.bucket_for(record.severity).name.clone() };
+            let key = crate::partition::PartitionKey::at(record.observed_unix_nano / 3_600_000_000_000, &buckets.bucket_for(record.severity).name);
             by_partition.entry(key).or_default().push(record);
         }
         for (key, mut records) in by_partition {

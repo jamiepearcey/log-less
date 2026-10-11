@@ -98,6 +98,8 @@ pub struct IngestProbe {
     pub written: Arc<AtomicU64>,
     /// DEBUG refused at the door under critical disk pressure.
     pub refused_debug_pressure: Arc<AtomicU64>,
+    /// Records that named an index their tenant does not have.
+    pub routes: Arc<crate::config::RouteStats>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -133,6 +135,8 @@ pub struct AdminService {
     store_dir: PathBuf,
     wal_dir: PathBuf,
     catalog_path: PathBuf,
+    /// The config file's tenants and indexes, with this instance's node id.
+    tenancy: crate::config::Tenancy,
     file_defaults: Policies,
     handle: Arc<PolicyHandle>,
     ingest: IngestProbe,
@@ -315,6 +319,9 @@ impl AdminService {
             store_dir: config.store_dir(),
             wal_dir: config.wal_dir(),
             catalog_path: config.catalog_path(),
+            // The caller validated the config and resolved the node id before
+            // starting anything, so both hold here.
+            tenancy: config.tenancy().expect("a validated config with a node id"),
             file_defaults: start.file_defaults,
             handle,
             ingest,
@@ -683,7 +690,7 @@ impl AdminService {
     }
 
     fn locations(&self) -> Locations<'_> {
-        Locations { store_dir: &self.store_dir, wal_dir: &self.wal_dir }
+        Locations { store_dir: &self.store_dir, wal_dir: &self.wal_dir, tenancy: &self.tenancy }
     }
 
     fn catalog(&self) -> Result<Catalog, Resp> {
@@ -760,6 +767,18 @@ impl AdminService {
                         "closed": s.closed,
                         "refused_debug_pressure": self.ingest.refused_debug_pressure.load(Ordering::Relaxed),
                     },
+                    // Records that named an index the tenant does not have:
+                    // sent to the default index, or refused (`unknown_index`).
+                    "unknown_index": {
+                        "defaulted": self.ingest.routes.defaulted.load(Ordering::Relaxed),
+                        "refused": self.ingest.routes.refused.load(Ordering::Relaxed),
+                    },
+                },
+                "node": {
+                    "id": self.tenancy.node(),
+                    "tenant": self.tenancy.tenant(),
+                    "default_index": self.tenancy.default_index(),
+                    "indexes": self.tenancy.indexes().map(|(tenant, index, _)| json!({"tenant": tenant, "index": index})).collect::<Vec<_>>(),
                 },
                 "store": {"files": files, "rows": rows, "bytes": bytes},
             }),
@@ -1288,6 +1307,7 @@ mod tests {
             stats: Arc::new(IngestStats::default()),
             written: Arc::new(AtomicU64::new(0)),
             refused_debug_pressure: Arc::new(AtomicU64::new(0)),
+            routes: Default::default(),
         };
         let service =
             AdminService::with_clock(&config, start, Arc::clone(&handle), probe, vec![], clock);
@@ -1379,10 +1399,11 @@ mod tests {
         }
 
         fn partition(&self, hour: u64, bucket: &str, bytes: usize) -> PathBuf {
-            let dir = PartitionKey { epoch_hour: hour, bucket: bucket.into() }.dir(&self.config.store_dir());
+            let dir = PartitionKey::at(hour, bucket).dir(&self.config.store_dir());
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("000001.parquet"), vec![0u8; bytes]).unwrap();
-            dir
+            // The directory retention deletes; the file is in the writer's leaf under it.
+            PartitionKey::at(hour, bucket).level_dir(&self.config.store_dir())
         }
     }
 
@@ -1480,6 +1501,7 @@ mod tests {
             stats: Arc::new(IngestStats::default()),
             written: Arc::new(AtomicU64::new(0)),
             refused_debug_pressure: Arc::new(AtomicU64::new(0)),
+            routes: Default::default(),
         };
         let svc = AdminService::new(&config, start, handle, probe, vec![]);
         for token in [None, Some(String::new())] {
@@ -1499,6 +1521,7 @@ mod tests {
             stats: Arc::new(IngestStats::default()),
             written: Arc::new(AtomicU64::new(0)),
             refused_debug_pressure: Arc::new(AtomicU64::new(0)),
+            routes: Default::default(),
         };
         let svc = AdminService::new(&config, start, handle, probe, vec![]);
 
@@ -1561,9 +1584,13 @@ mod tests {
         let r = rig();
         let (status, v) = r.call("GET", "/admin/v1/info", &[], None);
         assert_eq!(status, 200);
-        for key in ["version", "started_at_ms", "uptime_secs", "listeners", "disk", "ingest", "store"] {
+        for key in ["version", "started_at_ms", "uptime_secs", "listeners", "disk", "ingest", "store", "node"] {
             assert!(v.get(key).is_some(), "missing {key}: {v}");
         }
+        assert_eq!(v["ingest"]["unknown_index"], json!({"defaulted": 0, "refused": 0}));
+        assert_eq!(v["node"]["tenant"], "default");
+        assert_eq!(v["node"]["indexes"], json!([{"tenant": "default", "index": "default"}]));
+        assert!(v["node"]["id"].as_str().unwrap().starts_with("node-"));
         assert_eq!(v["listeners"][0]["kind"], "admin");
         assert_eq!(v["disk"]["pressure"], "normal");
         assert_eq!(v["disk"]["budget_bytes"], 32u64 * 1024 * 1024 * 1024);
@@ -1760,6 +1787,7 @@ mod tests {
             stats: Arc::new(IngestStats::default()),
             written: Arc::new(AtomicU64::new(0)),
             refused_debug_pressure: Arc::new(AtomicU64::new(0)),
+            routes: Default::default(),
         };
         let svc = AdminService::new(&r.config, start, handle, probe, vec![]);
         let (_, v) = svc.get_policies();
@@ -1896,11 +1924,11 @@ mod tests {
         // The pass exactly as maintenance_pass runs it: policy re-read each time.
         let pass = |catalog: &mut Catalog| {
             let rt = r.handle.runtime();
-            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, now, &Default::default())
+            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.tenancy(&Default::default()), rt.disk_budget_bytes, &rt.watermarks, now, &Default::default())
         };
 
         // Dry check under the file defaults: only debug is due (1d), info keeps 7d.
-        let before = crate::retention::enforce(&store, &r.handle.runtime().buckets, now, true);
+        let before = crate::retention::enforce(&store, &r.handle.runtime().tenancy(&Default::default()), now, true);
         assert_eq!(
             before.expired.iter().map(|e| e.key.bucket.as_str()).collect::<Vec<_>>(),
             vec!["debug"]
@@ -1939,17 +1967,17 @@ mod tests {
         r.partition(1_000_000, "warn_plus", 1000); // far future: never expires
         // The catalog needs to know the bytes for DiskUsage.
         let mut catalog = Catalog::open(&r.config.catalog_path()).unwrap();
-        let path = PartitionKey { epoch_hour: 1_000_000, bucket: "warn_plus".into() }.dir(&store).join("000001.parquet");
+        let path = PartitionKey::at(1_000_000, "warn_plus").dir(&store).join("000001.parquet");
         catalog
             .commit_merge(1, uuid::Uuid::from_u128(1), &[crate::catalog::FileEntry {
                 path,
-                key: PartitionKey { epoch_hour: 1_000_000, bucket: "warn_plus".into() },
-                stats: crate::store::FileStats { rows: 1, bytes: 1000, min_observed_nanos: 0, max_observed_nanos: 0 },
+                key: PartitionKey::at(1_000_000, "warn_plus"),
+                stats: crate::store::FileStats { rows: 1, bytes: 1000, min_ts_nanos: 0, max_ts_nanos: 0, min_observed_nanos: 0, max_observed_nanos: 0 },
             }], &[], 0)
             .unwrap();
         let pass = |catalog: &mut Catalog| {
             let rt = r.handle.runtime();
-            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.buckets, rt.disk_budget_bytes, &rt.watermarks, 0, &Default::default())
+            budget::expire_and_relieve(&store, &wal_dir, catalog, &rt.tenancy(&Default::default()), rt.disk_budget_bytes, &rt.watermarks, 0, &Default::default())
         };
         assert_eq!(pass(&mut catalog).pressure, Pressure::Normal);
 
@@ -2144,9 +2172,9 @@ mod tests {
         }
         // The file later edits the untouched bucket: it reaches the process.
         let mut cfg = r.config.clone();
-        let mut b: Vec<_> = cfg.retention.iter().cloned().collect();
+        let mut b: Vec<_> = cfg.default_buckets().iter().cloned().collect();
         b[2].retention = Duration::from_secs(99 * 86_400);
-        cfg.retention = crate::config::LevelBuckets::new(b).unwrap();
+        cfg.set_default_buckets(crate::config::LevelBuckets::new(b).unwrap());
         let start = startup(&cfg).unwrap();
         assert_eq!(start.effective.retention[2].retention_secs, 99 * 86_400);
         assert_eq!(start.effective.retention[1].retention_secs, doc.retention[1].retention_secs);

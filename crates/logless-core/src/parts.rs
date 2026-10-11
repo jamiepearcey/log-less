@@ -1819,7 +1819,7 @@ mod tests {
                     r
                 })
                 .collect();
-            let key = crate::partition::PartitionKey { epoch_hour: *hour, bucket: "info".into() };
+            let key = crate::partition::PartitionKey::at(*hour, "info");
             let dir = key.dir(store);
             std::fs::create_dir_all(&dir).unwrap();
             crate::store::write_partition_file(&dir.join(crate::store::file_name_for_segment(i as u64 + 1, uuid::Uuid::now_v7())), &records).unwrap();
@@ -2968,7 +2968,7 @@ mod tests {
         let now = std::time::SystemTime::now();
         for (i, path) in paths.iter().enumerate() {
             let stats = crate::store::read_file_stats(path).unwrap();
-            let key = crate::partition::PartitionKey { epoch_hour: hours[i], bucket: "info".into() };
+            let key = crate::partition::PartitionKey::at(hours[i], "info");
             catalog.commit_merge(i as u64 + 1, uuid::Uuid::from_u128(i as u128 + 1), &[crate::catalog::FileEntry { path: path.clone(), key, stats }], &[], 0).unwrap();
             // Written (paths.len() - i) minutes ago: a strict order for "newest first".
             let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
@@ -3010,7 +3010,7 @@ mod tests {
     fn pass(e: &mut Life, budget: u64, now_secs: u64, config: &EdgePartsConfig) -> crate::budget::PassOutcome {
         let pins = parts_edge::pins_for_pass(&e.control, config, e.store.path(), budget);
         let wal = e.data.path().join("wal");
-        let out = crate::budget::expire_and_relieve(e.store.path(), &wal, &mut e.catalog, &crate::config::LevelBuckets::default(), budget, &crate::budget::Watermarks::default(), now_secs, &pins);
+        let out = crate::budget::expire_and_relieve(e.store.path(), &wal, &mut e.catalog, &crate::config::Tenancy::default(), budget, &crate::budget::Watermarks::default(), now_secs, &pins);
         parts_edge::note_gave_up(&e.control, out.gave_up);
         out
     }

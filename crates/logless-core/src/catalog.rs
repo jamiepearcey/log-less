@@ -106,20 +106,62 @@ pub struct PartsAuditRow {
     pub detail: String,
 }
 
-/// Reads `hour=…/level=…` back out of a path. The catalog is derived state, so
-/// the path is the authority here, not the other way round.
-fn partition_from_path(path: &Path) -> (u64, String) {
-    let mut hour = 0;
-    let mut bucket = String::new();
-    for component in path.components() {
-        let text = component.as_os_str().to_string_lossy();
-        if let Some(value) = text.strip_prefix("hour=") {
-            hour = super::partition::parse_hour(value).unwrap_or(0);
-        } else if let Some(value) = text.strip_prefix("level=") {
-            bucket = value.to_string();
-        }
-    }
-    (hour, bucket)
+const FILE_COLUMNS: &str = "path, tenant, idx, node, event_hour, bucket, rows, bytes, min_ts, max_ts, min_observed, max_observed";
+
+fn read_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileEntry> {
+    Ok(FileEntry {
+        path: PathBuf::from(row.get::<_, String>(0)?),
+        key: PartitionKey {
+            tenant: row.get(1)?,
+            index: row.get(2)?,
+            node: row.get(3)?,
+            epoch_hour: row.get::<_, i64>(4)? as u64,
+            bucket: row.get(5)?,
+        },
+        stats: FileStats {
+            rows: row.get::<_, i64>(6)? as u64,
+            bytes: row.get::<_, i64>(7)? as u64,
+            min_ts_nanos: row.get(8)?,
+            max_ts_nanos: row.get(9)?,
+            min_observed_nanos: row.get(10)?,
+            max_observed_nanos: row.get(11)?,
+        },
+    })
+}
+
+/// The time-range query of [`Catalog::files_overlapping`]. `INDEXED BY` so it
+/// is an error, not a silent table scan, if the index is ever dropped.
+fn overlap_sql(level: &str) -> String {
+    format!(
+        "SELECT {FILE_COLUMNS} FROM files INDEXED BY files_by_ts
+         WHERE tenant = ? AND idx = ? AND max_ts >= ? AND min_ts <= ?{level}
+         ORDER BY min_ts, path"
+    )
+}
+
+/// Inserts a file row, or replaces the numbers of the row already at its path.
+fn upsert_file(conn: &Connection, f: &FileEntry) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO files (path, tenant, idx, node, event_hour, bucket, rows, bytes, min_ts, max_ts, min_observed, max_observed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(path) DO UPDATE SET
+            rows = excluded.rows, bytes = excluded.bytes, min_ts = excluded.min_ts, max_ts = excluded.max_ts,
+            min_observed = excluded.min_observed, max_observed = excluded.max_observed",
+        params![
+            f.path.to_string_lossy(),
+            f.key.tenant,
+            f.key.index,
+            f.key.node,
+            f.key.epoch_hour as i64,
+            f.key.bucket,
+            f.stats.rows as i64,
+            f.stats.bytes as i64,
+            f.stats.min_ts_nanos,
+            f.stats.max_ts_nanos,
+            f.stats.min_observed_nanos,
+            f.stats.max_observed_nanos,
+        ],
+    )
 }
 
 fn read_peer_part(r: &rusqlite::Row<'_>) -> rusqlite::Result<PeerPartRow> {
@@ -164,19 +206,38 @@ impl Catalog {
         if flat {
             conn.execute_batch("ALTER TABLE peer_parts RENAME TO peer_parts_flat_legacy")?;
         }
+        // `files` from before tenants and indexes describes a tree this build
+        // refuses to open (`partition::is_old_layout`). Its rows are derived
+        // state, so the table is dropped and rebuilt from the new tree; the
+        // tables that are not derivable (templates, peer_parts) are untouched.
+        let old_files: bool = conn.query_row("SELECT COUNT(*) FROM pragma_table_info('files')", [], |r| r.get::<_, i64>(0))? > 0
+            && conn.query_row("SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'tenant'", [], |r| r.get::<_, i64>(0))? == 0;
+        if old_files {
+            conn.execute_batch("DROP TABLE files")?;
+        }
         conn.execute_batch(
             r#"
+            -- One row per Parquet file of this instance's own store
+            -- (`tenant=/index=/hour=/level=/node=/<file>`). `event_hour` and
+            -- `min_ts`/`max_ts` are event time (the row's `timestamp`), which
+            -- is what a query's time range is on; `observed` is kept beside it.
+            -- `idx` because "index" is a keyword.
             CREATE TABLE IF NOT EXISTS files (
                 path           TEXT PRIMARY KEY,
-                epoch_hour     INTEGER NOT NULL,
+                tenant         TEXT    NOT NULL,
+                idx            TEXT    NOT NULL,
+                node           TEXT    NOT NULL,
+                event_hour     INTEGER NOT NULL,
                 bucket         TEXT    NOT NULL,
                 rows           INTEGER NOT NULL,
                 bytes          INTEGER NOT NULL,
+                min_ts         INTEGER NOT NULL,
+                max_ts         INTEGER NOT NULL,
                 min_observed   INTEGER NOT NULL,
                 max_observed   INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS files_by_partition ON files (epoch_hour, bucket);
-            CREATE INDEX IF NOT EXISTS files_by_time ON files (min_observed, max_observed);
+            CREATE INDEX IF NOT EXISTS files_by_partition ON files (tenant, idx, event_hour, bucket);
+            CREATE INDEX IF NOT EXISTS files_by_ts ON files (tenant, idx, max_ts, min_ts);
 
             -- Keyed by the segment's UUID, never its numeric id: ids restart
             -- at 1 whenever the WAL drains, and keying on them made a fresh
@@ -359,22 +420,7 @@ impl Catalog {
             )?;
         }
         for f in files {
-            tx.execute(
-                "INSERT INTO files (path, epoch_hour, bucket, rows, bytes, min_observed, max_observed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(path) DO UPDATE SET
-                    rows = excluded.rows, bytes = excluded.bytes,
-                    min_observed = excluded.min_observed, max_observed = excluded.max_observed",
-                params![
-                    f.path.to_string_lossy(),
-                    f.key.epoch_hour as i64,
-                    f.key.bucket,
-                    f.stats.rows as i64,
-                    f.stats.bytes as i64,
-                    f.stats.min_observed_nanos,
-                    f.stats.max_observed_nanos,
-                ],
-            )?;
+            upsert_file(&tx, f)?;
         }
         tx.execute(
             "INSERT OR REPLACE INTO merged_segments (segment_uuid, segment_id, merged_at)
@@ -394,30 +440,9 @@ impl Catalog {
     /// One transaction, because the intermediate state — the replacement
     /// recorded while its inputs are still listed — would double-count every
     /// row in that partition for anything reading the catalog's totals.
-    pub fn record_compaction(
-        &mut self,
-        path: &Path,
-        stats: &FileStats,
-        replaced: &[PathBuf],
-    ) -> Result<(), CatalogError> {
-        let (epoch_hour, bucket) = partition_from_path(path);
+    pub fn record_compaction(&mut self, output: &FileEntry, replaced: &[PathBuf]) -> Result<(), CatalogError> {
         let tx = self.conn.transaction()?;
-        tx.execute(
-            "INSERT INTO files (path, epoch_hour, bucket, rows, bytes, min_observed, max_observed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(path) DO UPDATE SET
-                rows = excluded.rows, bytes = excluded.bytes,
-                min_observed = excluded.min_observed, max_observed = excluded.max_observed",
-            params![
-                path.to_string_lossy(),
-                epoch_hour as i64,
-                bucket,
-                stats.rows as i64,
-                stats.bytes as i64,
-                stats.min_observed_nanos,
-                stats.max_observed_nanos,
-            ],
-        )?;
+        upsert_file(&tx, output)?;
         for old in replaced {
             tx.execute("DELETE FROM files WHERE path = ?1", params![old.to_string_lossy()])?;
         }
@@ -437,47 +462,50 @@ impl Catalog {
         Ok(found.is_some())
     }
 
+    /// Every file row. For the operations that are about the whole store
+    /// (reclaim's global ordering, `logless catalog`); a query for a time
+    /// range goes through [`Catalog::files_overlapping`] instead.
     pub fn list_files(&self) -> Result<Vec<FileEntry>, CatalogError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, epoch_hour, bucket, rows, bytes, min_observed, max_observed
-             FROM files ORDER BY epoch_hour, bucket, path",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(FileEntry {
-                path: PathBuf::from(row.get::<_, String>(0)?),
-                key: PartitionKey {
-                    epoch_hour: row.get::<_, i64>(1)? as u64,
-                    bucket: row.get(2)?,
-                },
-                stats: FileStats {
-                    rows: row.get::<_, i64>(3)? as u64,
-                    bytes: row.get::<_, i64>(4)? as u64,
-                    min_observed_nanos: row.get(5)?,
-                    max_observed_nanos: row.get(6)?,
-                },
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!("SELECT {FILE_COLUMNS} FROM files ORDER BY tenant, idx, event_hour, bucket, path"))?;
+        let rows = stmt.query_map([], read_file)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Files overlapping `[from, to]` on `observed`, optionally restricted to
-    /// buckets. This is the pruning step the replay scanner rides on: it opens
-    /// only the files that can contain matching rows.
+    /// Files of `(tenant, index)` whose event-time span overlaps `[from, to]`,
+    /// optionally only in `buckets` (the level buckets that can hold the
+    /// severities asked for, `LevelBuckets::names_from`). One indexed query
+    /// (`files_by_ts`), oldest data first: the planning step for a time-range
+    /// read, which never loads the table.
     pub fn files_overlapping(
         &self,
+        tenant: &str,
+        index: &str,
         from_nanos: i64,
         to_nanos: i64,
         buckets: Option<&[String]>,
     ) -> Result<Vec<FileEntry>, CatalogError> {
-        let all = self.list_files()?;
-        Ok(all
-            .into_iter()
-            .filter(|f| f.stats.min_observed_nanos <= to_nanos && f.stats.max_observed_nanos >= from_nanos)
-            .filter(|f| match buckets {
-                Some(list) => list.contains(&f.key.bucket),
-                None => true,
-            })
-            .collect())
+        // Bucket names are bound, never spliced: one placeholder each.
+        let level = match buckets {
+            Some(list) => format!(" AND bucket IN ({})", vec!["?"; list.len()].join(", ")),
+            None => String::new(),
+        };
+        let mut stmt = self.conn.prepare(&overlap_sql(&level))?;
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(tenant.to_string()), Box::new(index.to_string()), Box::new(from_nanos), Box::new(to_nanos)];
+        for b in buckets.unwrap_or_default() {
+            args.push(Box::new(b.clone()));
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), read_file)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The files of one `(tenant, index, event hour, level)` partition, every
+    /// writer's, by the `files_by_partition` index.
+    pub fn files_in_partition(&self, key: &PartitionKey) -> Result<Vec<FileEntry>, CatalogError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {FILE_COLUMNS} FROM files WHERE tenant = ?1 AND idx = ?2 AND event_hour = ?3 AND bucket = ?4 ORDER BY path"
+        ))?;
+        let rows = stmt.query_map(params![key.tenant, key.index, key.epoch_hour as i64, key.bucket], read_file)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Records a part `node` uploaded. Returns false when that node already committed the name: a repeated
@@ -647,6 +675,32 @@ impl Catalog {
                 "DELETE FROM files WHERE path = ?1",
                 params![path.to_string_lossy()],
             )?;
+        }
+        tx.commit()?;
+        Ok(gone.len())
+    }
+
+    /// Drops the rows of files that were just deleted by name.
+    pub fn forget_files(&mut self, paths: &[PathBuf]) -> Result<(), CatalogError> {
+        let tx = self.conn.transaction()?;
+        for path in paths {
+            tx.execute("DELETE FROM files WHERE path = ?1", params![path.to_string_lossy()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// [`Catalog::forget_missing_files`] for the partitions retention just
+    /// expired: only their rows are read and their files checked, so a pass
+    /// costs the partitions it touched and not the table.
+    pub fn forget_missing_in(&mut self, partitions: &[PartitionKey]) -> Result<usize, CatalogError> {
+        let mut gone = Vec::new();
+        for key in partitions {
+            gone.extend(self.files_in_partition(key)?.into_iter().filter(|e| !e.path.exists()).map(|e| e.path));
+        }
+        let tx = self.conn.transaction()?;
+        for path in &gone {
+            tx.execute("DELETE FROM files WHERE path = ?1", params![path.to_string_lossy()])?;
         }
         tx.commit()?;
         Ok(gone.len())
@@ -831,7 +885,9 @@ impl Catalog {
         let mut entries = Vec::new();
         let mut typed = Vec::new();
         for path in store::list_parquet_files(store_dir) {
-            let Some(key) = key_from_path(store_dir, &path) else {
+            // A Parquet file that is not at a partition leaf is not a file of
+            // this store (somebody's scratch copy); it gets no row.
+            let Some(key) = crate::partition::key_of_path(&path) else {
                 continue;
             };
             let stats = store::read_file_stats(&path).map_err(|source| CatalogError::Store {
@@ -848,37 +904,17 @@ impl Catalog {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM files", [])?;
         for e in &entries {
-            tx.execute(
-                "INSERT INTO files (path, epoch_hour, bucket, rows, bytes, min_observed, max_observed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    e.path.to_string_lossy(),
-                    e.key.epoch_hour as i64,
-                    e.key.bucket,
-                    e.stats.rows as i64,
-                    e.stats.bytes as i64,
-                    e.stats.min_observed_nanos,
-                    e.stats.max_observed_nanos,
-                ],
-            )?;
+            upsert_file(&tx, e)?;
         }
         tx.commit()?;
         Ok(entries.len())
     }
 }
 
-/// Recover a partition key from a file's location under the store root.
-fn key_from_path(store_dir: &Path, path: &Path) -> Option<PartitionKey> {
-    let rel = path.strip_prefix(store_dir).ok()?;
-    let mut parts = rel.components();
-    let hour = parts.next()?.as_os_str().to_str()?;
-    let level = parts.next()?.as_os_str().to_str()?;
-    crate::partition::parse_partition_dirs(hour, level)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::LevelBuckets;
     use crate::model::{LogRecord, Severity};
 
     /// Deterministic per-segment UUID so tests can re-derive the same paths.
@@ -887,10 +923,7 @@ mod tests {
     }
 
     fn write_file(store: &Path, hour: u64, bucket: &str, segment: u64, n: usize) -> FileEntry {
-        let key = PartitionKey {
-            epoch_hour: hour,
-            bucket: bucket.into(),
-        };
+        let key = PartitionKey::at(hour, bucket);
         let path = key
             .dir(store)
             .join(store::file_name_for_segment(segment, seg_uuid(segment)));
@@ -974,7 +1007,7 @@ mod tests {
         assert_eq!(cat.typed_layout().unwrap().columns(), &[col("latency_ms", ColumnType::Int64)]);
 
         // A file declaring a column; a fresh catalog learns it from the footer.
-        let key = PartitionKey { epoch_hour: 5, bucket: "info".into() };
+        let key = PartitionKey::at(5, "info");
         let path = key.dir(tmp.path()).join(store::file_name_for_segment(1, seg_uuid(1)));
         let mut r = LogRecord::new(5 * 3600 * 1_000_000_000, Severity::INFO, "x");
         r.observed_unix_nano = r.timestamp_unix_nano;
@@ -999,7 +1032,7 @@ mod tests {
         assert_eq!(cat.rebuild(&store).unwrap(), 1);
 
         // Retention removes the directory; rebuild must not resurrect the row.
-        std::fs::remove_dir_all(a.key.dir(&store)).unwrap();
+        std::fs::remove_dir_all(a.key.level_dir(&store)).unwrap();
         assert_eq!(cat.rebuild(&store).unwrap(), 0);
         assert_eq!(cat.list_files().unwrap().len(), 0);
     }
@@ -1013,8 +1046,11 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         cat.commit_merge(1, seg_uuid(1), &[a.clone(), b.clone()], &[], 0).unwrap();
 
-        std::fs::remove_dir_all(a.key.dir(&store)).unwrap();
-        assert_eq!(cat.forget_missing_files().unwrap(), 1);
+        std::fs::remove_dir_all(a.key.level_dir(&store)).unwrap();
+        // Scoped to a partition that lost nothing: nothing is forgotten.
+        assert_eq!(cat.forget_missing_in(std::slice::from_ref(&b.key)).unwrap(), 0);
+        assert_eq!(cat.forget_missing_in(std::slice::from_ref(&a.key)).unwrap(), 1);
+        assert_eq!(cat.forget_missing_files().unwrap(), 0);
         assert_eq!(cat.list_files().unwrap(), vec![b]);
     }
 
@@ -1059,19 +1095,80 @@ mod tests {
         cat.commit_merge(1, seg_uuid(1), std::slice::from_ref(&early), &[], 0).unwrap();
         cat.commit_merge(2, seg_uuid(2), &[late.clone(), debug.clone()], &[], 0).unwrap();
 
-        let window = cat
-            .files_overlapping(late.stats.min_observed_nanos, late.stats.max_observed_nanos, None)
-            .unwrap();
+        let (lo, hi) = (late.stats.min_ts_nanos, late.stats.max_ts_nanos);
+        let window = cat.files_overlapping("default", "default", lo, hi, None).unwrap();
         assert_eq!(window.len(), 2, "hour 200 has two buckets");
 
-        let only_info = cat
-            .files_overlapping(
-                late.stats.min_observed_nanos,
-                late.stats.max_observed_nanos,
-                Some(&["info".to_string()]),
+        let only_info = cat.files_overlapping("default", "default", lo, hi, Some(&["info".to_string()])).unwrap();
+        assert_eq!(only_info, vec![late.clone()]);
+        // Warn and above, by the index's buckets: no such file in the window.
+        let warn_up = LevelBuckets::default().names_from(Severity::WARN);
+        assert_eq!(warn_up, ["warn_plus"]);
+        assert!(cat.files_overlapping("default", "default", lo, hi, Some(&warn_up)).unwrap().is_empty());
+        // Another tenant or index sees none of it.
+        assert!(cat.files_overlapping("other", "default", lo, hi, None).unwrap().is_empty());
+        assert!(cat.files_overlapping("default", "payments", lo, hi, None).unwrap().is_empty());
+        assert_eq!(cat.files_in_partition(&late.key).unwrap(), vec![late]);
+    }
+
+    #[test]
+    fn a_time_range_is_answered_from_the_event_time_index_not_a_table_scan() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let plan: Vec<String> = cat
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", overlap_sql(" AND bucket IN (?)")))
+            .unwrap()
+            .query_map(params!["a", "b", 5, 9, "x"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(plan.iter().any(|l| l.contains("USING INDEX files_by_ts")), "{plan:?}");
+        assert!(plan.iter().any(|l| l.contains("tenant=? AND idx=? AND max_ts>?")), "the range is an index seek: {plan:?}");
+    }
+
+    #[test]
+    fn event_time_and_observed_time_are_both_recorded_and_the_range_is_on_event_time() {
+        // A replay: events of hour 100 observed in hour 300.
+        let tmp = tempfile::tempdir().unwrap();
+        let key = PartitionKey::at(100, "info");
+        let path = key.dir(tmp.path()).join(store::file_name_for_segment(1, seg_uuid(1)));
+        let hour = 3600 * 1_000_000_000u64;
+        let records: Vec<_> = (0..5u64)
+            .map(|i| {
+                let mut r = LogRecord::new(100 * hour + i, Severity::INFO, "replayed");
+                r.observed_unix_nano = 300 * hour + i;
+                r
+            })
+            .collect();
+        let stats = store::write_partition_file(&path, &records).unwrap();
+        let mut cat = Catalog::open_in_memory().unwrap();
+        cat.commit_merge(1, seg_uuid(1), &[FileEntry { path, key, stats }], &[], 0).unwrap();
+        let at = |h: u64| cat.files_overlapping("default", "default", (h * hour) as i64, ((h + 1) * hour - 1) as i64, None).unwrap().len();
+        assert_eq!((at(100), at(300)), (1, 0));
+        let f = &cat.list_files().unwrap()[0];
+        assert_eq!((f.stats.min_ts_nanos, f.stats.min_observed_nanos), ((100 * hour) as i64, (300 * hour) as i64));
+    }
+
+    #[test]
+    fn a_files_table_from_before_tenants_is_dropped_and_the_parts_inventory_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (path TEXT PRIMARY KEY, epoch_hour INTEGER NOT NULL, bucket TEXT NOT NULL, rows INTEGER NOT NULL,
+                    bytes INTEGER NOT NULL, min_observed INTEGER NOT NULL, max_observed INTEGER NOT NULL);
+                 INSERT INTO files VALUES ('/s/hour=2026-01-01T00/level=info/a.parquet', 1, 'info', 1, 1, 1, 1);",
             )
             .unwrap();
-        assert_eq!(only_info, vec![late]);
+        }
+        let cat = Catalog::open(&path).unwrap();
+        let part = crate::parts::CommittedPart { name: format!("{}.parquet", "a".repeat(64)), size: 1, sha256: "a".repeat(64), rows: 1, min_unix_nano: 1, max_unix_nano: 2, origin: "o".into(), node: None };
+        assert!(cat.record_peer_part("edge-a", &part, 1).unwrap());
+        assert_eq!(cat.file_count().unwrap(), 0);
+        drop(cat);
+        let again = Catalog::open(&path).unwrap();
+        assert_eq!((again.file_count().unwrap(), again.peer_part_count().unwrap()), (0, 1));
     }
 
     #[test]

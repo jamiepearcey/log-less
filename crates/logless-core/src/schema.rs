@@ -13,10 +13,10 @@ use std::collections::HashMap;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, BooleanBuilder, FixedSizeBinaryArray, FixedSizeBinaryBuilder,
     Float64Array, Float64Builder, Int64Array, Int64Builder, RecordBatch, StringArray,
-    StringBuilder, TimestampNanosecondArray, TimestampNanosecondBuilder, UInt64Array,
-    UInt64Builder, UInt8Array,
+    StringBuilder, StringDictionaryBuilder, TimestampNanosecondArray, TimestampNanosecondBuilder,
+    UInt64Array, UInt64Builder, UInt8Array,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Int32Type, Schema, SchemaRef, TimeUnit};
 
 use crate::model::{Attr, AttrValue, LogRecord};
 use crate::typed::{self, Cell, ColumnType, TypedColumn, TypedLayout};
@@ -25,7 +25,9 @@ use crate::typed::{self, Cell, ColumnType, TypedColumn, TypedLayout};
 /// so a reader can tell which generation produced a file.
 ///
 /// 2: typed `attr_*` columns after the base columns (`crate::typed`).
-pub const SCHEMA_VERSION: &str = "2";
+/// 3: the `origin` column; files are cut on the event hour and sorted
+/// `(service, trace_id, timestamp, event_id)`.
+pub const SCHEMA_VERSION: &str = "3";
 
 /// Timestamps are UTC and say so. See the note on the `timestamp` field.
 const UTC: &str = "UTC";
@@ -43,8 +45,8 @@ pub fn schema() -> SchemaRef {
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC.into())),
             false,
         ),
-        // Partitioning and retention use this one, not `timestamp`: replayed and
-        // clock-skewed sources must land in the partition we actually wrote.
+        // When we received it. Partitioning, retention and the sort use
+        // `timestamp`; this stays so a replay or a skewed clock can be seen.
         Field::new(
             "observed",
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC.into())),
@@ -63,7 +65,16 @@ pub fn schema() -> SchemaRef {
         // to its column's type. Typed columns follow the base columns, vary
         // per file, and are discovered from field metadata.
         Field::new("attributes", DataType::Utf8, true),
+        // The instance that first received the row: the `logless.origin`
+        // attribute of a row relayed by another instance, otherwise the node
+        // that wrote the file. Not the hive `node=` of the path, which is the
+        // file's writer; the two differ for rows that arrived over `/v1/ingest`.
+        Field::new("origin", origin_type(), true),
     ]))
+}
+
+fn origin_type() -> DataType {
+    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))
 }
 
 /// The Arrow field for a typed attribute column, carrying the original key
@@ -122,7 +133,7 @@ pub fn sort_records(records: &mut [LogRecord]) {
         a.service
             .cmp(&b.service)
             .then_with(|| a.trace_id.cmp(&b.trace_id))
-            .then_with(|| a.observed_unix_nano.cmp(&b.observed_unix_nano))
+            .then_with(|| a.timestamp_unix_nano.cmp(&b.timestamp_unix_nano))
             // Tie-break on the time-ordered id so the sort is total and file
             // contents are reproducible for a given input.
             .then_with(|| a.event_id.cmp(&b.event_id))
@@ -264,7 +275,19 @@ pub fn to_record_batch(
     records: &[LogRecord],
     layout: &TypedLayout,
 ) -> Result<RecordBatch, arrow::error::ArrowError> {
+    to_record_batch_from(records, layout, None)
+}
+
+/// [`to_record_batch`] for a file written by `node`: the `origin` of a row
+/// that carries no `logless.origin` attribute. Without a node such rows have
+/// a NULL origin.
+pub fn to_record_batch_from(
+    records: &[LogRecord],
+    layout: &TypedLayout,
+    node: Option<&str>,
+) -> Result<RecordBatch, arrow::error::ArrowError> {
     let n = records.len();
+    let mut origin = StringDictionaryBuilder::<Int32Type>::new();
     let mut typed_cells: Vec<Sparse<'_>> = vec![Vec::new(); layout.len()];
     let mut used: Vec<usize> = Vec::new();
     let mut rest: Vec<&Attr> = Vec::new();
@@ -300,6 +323,14 @@ pub fn to_record_batch(
         match r.template_id {
             Some(t) => template_id.append_value(t),
             None => template_id.append_null(),
+        }
+        let relayed = r.attributes.iter().find_map(|a| match (&a.value, a.key == crate::peer::ATTR_ORIGIN) {
+            (AttrValue::Str(s), true) if !s.is_empty() => Some(s.as_str()),
+            _ => None,
+        });
+        match relayed.or(node) {
+            Some(o) => origin.append_value(o),
+            None => origin.append_null(),
         }
         used.clear();
         rest.clear();
@@ -346,6 +377,7 @@ pub fn to_record_batch(
         Arc::new(span_id.finish()),
         Arc::new(template_id.finish()),
         Arc::new(attributes.finish()),
+        Arc::new(origin.finish()),
     ];
 
     let mut fields: Vec<Field> = schema().fields().iter().map(|f| f.as_ref().clone()).collect();
@@ -386,7 +418,7 @@ mod tests {
 
         let order: Vec<_> = records
             .iter()
-            .map(|r| (r.service.clone().unwrap(), r.trace_id.unwrap()[0], r.observed_unix_nano))
+            .map(|r| (r.service.clone().unwrap(), r.trace_id.unwrap()[0], r.timestamp_unix_nano))
             .collect();
         assert_eq!(
             order,
@@ -410,7 +442,7 @@ mod tests {
 
         let batch = to_record_batch(&records, &TypedLayout::default()).unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.schema().fields().len(), 11);
+        assert_eq!(batch.schema().fields().len(), 12);
 
         let service = batch
             .column_by_name("service")
@@ -497,8 +529,8 @@ mod tests {
         let batch = to_record_batch(&[a.clone(), b.clone(), c.clone()], &layout).unwrap();
         let schema = batch.schema();
         let names: Vec<_> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        assert_eq!(&names[..11], &schema_names()[..]);
-        assert_eq!(&names[11..], &["attr_at", "attr_latency_ms", "attr_ok"], "absent keys get no column");
+        assert_eq!(&names[..12], &schema_names()[..]);
+        assert_eq!(&names[12..], &["attr_at", "attr_latency_ms", "attr_ok"], "absent keys get no column");
 
         let lat = batch.column_by_name("attr_latency_ms").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
         assert_eq!(lat.value(0), 812);
@@ -554,8 +586,37 @@ mod tests {
     fn schema_names() -> Vec<&'static str> {
         vec![
             "event_id", "timestamp", "observed", "severity", "severity_text", "body", "service",
-            "trace_id", "span_id", "template_id", "attributes",
+            "trace_id", "span_id", "template_id", "attributes", "origin",
         ]
+    }
+
+    #[test]
+    fn the_sort_uses_event_time_not_observed_time() {
+        // A replayed row: observed late, event early. It sorts by its event time.
+        let mut replayed = rec(Some("a"), Some(1), 10);
+        replayed.observed_unix_nano = 9_000;
+        let mut records = vec![rec(Some("a"), Some(1), 20), replayed];
+        sort_records(&mut records);
+        assert_eq!(records.iter().map(|r| r.timestamp_unix_nano).collect::<Vec<_>>(), [10, 20]);
+    }
+
+    #[test]
+    fn origin_is_the_relayed_attribute_or_else_the_writing_node() {
+        let local = rec(Some("svc"), None, 1);
+        let mut relayed = rec(Some("svc"), None, 2);
+        relayed.attributes = attrs(vec![(crate::peer::ATTR_ORIGIN, AttrValue::Str("edge-9".into()))]);
+        let origins = |node| {
+            let batch = to_record_batch_from(&[local.clone(), relayed.clone()], &TypedLayout::default(), node).unwrap();
+            let col = arrow::compute::cast(batch.column_by_name("origin").unwrap(), &DataType::Utf8).unwrap();
+            let col = col.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..2).map(|i| (!col.is_null(i)).then(|| col.value(i).to_string())).collect::<Vec<_>>()
+        };
+        assert_eq!(origins(Some("central-1")), [Some("central-1".to_string()), Some("edge-9".to_string())]);
+        assert_eq!(origins(None), [None, Some("edge-9".to_string())]);
+        // The attribute stays on the record: reading a row back changes nothing about it.
+        let batch = to_record_batch_from(std::slice::from_ref(&relayed), &TypedLayout::default(), Some("central-1")).unwrap();
+        assert_eq!(from_record_batch(&batch)[0].attributes, relayed.attributes);
+        assert!(from_record_batch(&to_record_batch_from(std::slice::from_ref(&local), &TypedLayout::default(), Some("n-1")).unwrap())[0].attributes.is_empty());
     }
 
     #[test]

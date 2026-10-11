@@ -10,10 +10,14 @@
 //!
 //! 1. **Partition directories.** `hour=…/level=…` is in the path, so a query
 //!    for the last hour of errors never opens a debug file from yesterday.
-//! 2. **Row-group statistics.** Each group's min/max `observed` is in the
+//! 2. **Row-group statistics.** Each group's min/max `timestamp` is in the
 //!    footer, so a file spanning an hour is skipped whole when the window is a
 //!    minute.
 //! 3. **Rows.** Only what survives the first two is decoded.
+//!
+//! The time window is on **event time** (`timestamp`), the same clock the
+//! `hour=` directory is cut on. A replayed row is therefore found in the hour
+//! it happened, and a window never has to open later hours "in case".
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +32,7 @@ use crate::store::{self, StoreError};
 /// which is occasionally what you want and always what you get if you forget.
 #[derive(Debug, Clone, Default)]
 pub struct Query {
-    /// Inclusive lower bound on `observed`, unix nanoseconds.
+    /// Inclusive lower bound on `timestamp` (event time), unix nanoseconds.
     pub from_unix_nano: Option<u64>,
     /// Exclusive upper bound.
     pub until_unix_nano: Option<u64>,
@@ -72,10 +76,9 @@ pub fn scan(store_dir: &Path, query: &Query) -> Result<ScanResult, StoreError> {
     let mut records = Vec::new();
     let mut truncated = false;
 
-    let mut files = store::list_parquet_files(store_dir);
+    let mut files = files_by_hour(store_dir);
     // Newest first: a replay is nearly always about what just happened, and it
     // means `limit` cuts the oldest rows rather than the most relevant ones.
-    files.sort();
     files.reverse();
 
     for path in files {
@@ -95,13 +98,16 @@ pub fn scan(store_dir: &Path, query: &Query) -> Result<ScanResult, StoreError> {
         }
     }
 
-    records.sort_by_key(|r| r.observed_unix_nano);
+    records.sort_by_key(|r| r.timestamp_unix_nano);
     Ok(ScanResult { records, stats, truncated })
 }
 
 /// Streams every matching record to `sink` in chunks of at most `chunk`, oldest partition first, without a row
 /// limit and without holding more than one file's matches. `sink` returns `false` to stop. For a bulk read
 /// (sending a range to a peer) where [`scan`]'s newest-first, limited result would drop the wrong end.
+///
+/// A record read from an index other than `default` gets its `logless.index` attribute back (the index is
+/// only in the path), so the instance it is sent to files it under the same index.
 pub fn scan_each(
     store_dir: &Path,
     query: &Query,
@@ -109,9 +115,7 @@ pub fn scan_each(
     mut sink: impl FnMut(Vec<LogRecord>) -> bool,
 ) -> Result<ScanStats, StoreError> {
     let mut stats = ScanStats::default();
-    let mut files = store::list_parquet_files(store_dir);
-    files.sort();
-    for path in files {
+    for path in files_by_hour(store_dir) {
         stats.files_considered += 1;
         if !partition_matches(&path, query) {
             stats.files_pruned_by_partition += 1;
@@ -121,7 +125,12 @@ pub fn scan_each(
         stats.row_groups_pruned += group_skips;
         stats.rows_scanned += rows;
         stats.rows_matched += found.len() as u64;
-        found.sort_by_key(|r| r.observed_unix_nano);
+        if let Some(key) = partition::key_of_path(&path).filter(|k| k.index != partition::DEFAULT_INDEX) {
+            for r in &mut found {
+                r.attributes.push(crate::model::Attr { key: crate::config::ATTR_INDEX.into(), value: crate::model::AttrValue::Str(key.index.clone()) });
+            }
+        }
+        found.sort_by_key(|r| r.timestamp_unix_nano);
         let mut rest = found;
         while !rest.is_empty() {
             let tail = rest.split_off(chunk.min(rest.len()));
@@ -133,18 +142,20 @@ pub fn scan_each(
     Ok(stats)
 }
 
-/// Uses the `hour=…/level=…` path to skip whole files without opening them.
+/// The store's files, oldest event hour first across every tenant and index
+/// (the path alone would order by tenant and index before the hour).
+fn files_by_hour(store_dir: &Path) -> Vec<PathBuf> {
+    let mut files = store::list_parquet_files(store_dir);
+    files.sort_by_cached_key(|p| (partition::key_of_path(p).map(|k| k.epoch_hour), p.clone()));
+    files
+}
+
+/// Uses the `hour=…/level=…` of the path to skip whole files without opening
+/// them. The hour is the event hour, so both bounds prune.
 fn partition_matches(path: &Path, query: &Query) -> bool {
-    let mut hour = None;
-    let mut level = None;
-    for component in path.components() {
-        let text = component.as_os_str().to_string_lossy();
-        if let Some(value) = text.strip_prefix("hour=") {
-            hour = partition::parse_hour(value);
-        } else if let Some(value) = text.strip_prefix("level=") {
-            level = Some(value.to_string());
-        }
-    }
+    let key = partition::key_of_path(path);
+    let hour = key.as_ref().map(|k| k.epoch_hour);
+    let level = key.map(|k| k.bucket);
 
     if let (Some(epoch_hour), Some(from)) = (hour, query.from_unix_nano) {
         // The last nanosecond of this partition's hour.
@@ -178,7 +189,7 @@ fn partition_matches(path: &Path, query: &Query) -> bool {
     true
 }
 
-/// Scans one file, pruning row groups by their `observed` statistics.
+/// Scans one file, pruning row groups by their `timestamp` statistics.
 fn scan_file(
     path: &Path,
     query: &Query,
@@ -244,7 +255,7 @@ fn group_overlaps(
     until: u64,
 ) -> bool {
     for column in group.columns() {
-        if column.column_path().string() != "observed" {
+        if column.column_path().string() != "timestamp" {
             continue;
         }
         if let Some(Statistics::Int64(s)) = column.statistics() {
@@ -259,10 +270,10 @@ fn group_overlaps(
 }
 
 fn matches(record: &LogRecord, query: &Query) -> bool {
-    if query.from_unix_nano.is_some_and(|t| record.observed_unix_nano < t) {
+    if query.from_unix_nano.is_some_and(|t| record.timestamp_unix_nano < t) {
         return false;
     }
-    if query.until_unix_nano.is_some_and(|t| record.observed_unix_nano >= t) {
+    if query.until_unix_nano.is_some_and(|t| record.timestamp_unix_nano >= t) {
         return false;
     }
     if let Some(service) = &query.service {
@@ -317,6 +328,7 @@ mod tests {
     use super::*;
     use crate::config::LevelBuckets;
     use crate::model::Severity;
+    use crate::partition::PartitionKey;
 
     const HOUR_NS: u64 = 3_600 * 1_000_000_000;
 
@@ -333,10 +345,7 @@ mod tests {
         let mut by_partition: std::collections::HashMap<_, Vec<LogRecord>> =
             std::collections::HashMap::new();
         for record in records {
-            let key = crate::partition::PartitionKey {
-                epoch_hour: record.observed_unix_nano / HOUR_NS,
-                bucket: buckets.bucket_for(record.severity).name.clone(),
-            };
+            let key = PartitionKey::at(record.timestamp_unix_nano / HOUR_NS, &buckets.bucket_for(record.severity).name);
             by_partition.entry(key).or_default().push(record);
         }
         for (key, mut records) in by_partition {
@@ -387,6 +396,40 @@ mod tests {
         let result = scan(tmp.path(), &query).unwrap();
         assert!(result.stats.files_pruned_by_partition >= 4, "{:?}", result.stats);
         assert_eq!(plan(tmp.path(), &query).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_window_is_on_event_time_and_finds_a_replayed_row_in_the_hour_it_happened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut replayed = record(2 * HOUR_NS + 5, Severity::ERROR, "api", "replayed");
+        replayed.observed_unix_nano = 50 * HOUR_NS;
+        write_store(tmp.path(), vec![replayed, record(50 * HOUR_NS + 1, Severity::ERROR, "api", "live")]);
+        let window = |from: u64, until: u64| Query { from_unix_nano: Some(from), until_unix_nano: Some(until), limit: 100, ..Default::default() };
+        let early = scan(tmp.path(), &window(2 * HOUR_NS, 3 * HOUR_NS)).unwrap();
+        assert_eq!(early.records.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(), ["replayed"]);
+        assert_eq!(early.stats.files_pruned_by_partition, 1, "the later hour is not opened");
+        // The hour it was observed in holds only what happened then.
+        let late = scan(tmp.path(), &window(50 * HOUR_NS, 51 * HOUR_NS)).unwrap();
+        assert_eq!(late.records.iter().map(|r| r.body.as_str()).collect::<Vec<_>>(), ["live"]);
+        assert_eq!(plan(tmp.path(), &window(50 * HOUR_NS, 51 * HOUR_NS)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_bulk_read_gives_rows_of_another_index_their_index_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rows = |n: u64| vec![record(HOUR_NS + n, Severity::INFO, "api", "x")];
+        for (index, n) in [("default", 1), ("payments", 2)] {
+            let key = PartitionKey::new("default", index, 1, "info", "node-a");
+            store::write_partition_file(&key.dir(tmp.path()).join(store::file_name_for_segment(n, uuid::Uuid::now_v7())), &rows(n)).unwrap();
+        }
+        let mut got = Vec::new();
+        scan_each(tmp.path(), &Query::new(), 10, |c| {
+            got.extend(c);
+            true
+        })
+        .unwrap();
+        let index_of = |r: &LogRecord| r.attributes.iter().find(|a| a.key == crate::config::ATTR_INDEX).map(|a| a.value.clone());
+        assert_eq!(got.iter().map(index_of).collect::<Vec<_>>(), [None, Some(crate::model::AttrValue::Str("payments".into()))]);
     }
 
     #[test]
@@ -494,10 +537,7 @@ mod tests {
         // Buckets are configurable; skipping one we do not recognise would
         // silently omit data from a store the user configured themselves.
         let tmp = tempfile::tempdir().unwrap();
-        let key = crate::partition::PartitionKey {
-            epoch_hour: 1,
-            bucket: "audit".to_string(),
-        };
+        let key = crate::partition::PartitionKey::at(1, "audit");
         let partition_dir = key.dir(tmp.path());
         std::fs::create_dir_all(&partition_dir).unwrap();
         store::write_partition_file(

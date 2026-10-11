@@ -20,8 +20,10 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub ingest: IngestConfig,
+    /// This instance's id as a writer: the `node=` leaf of every file it
+    /// writes and the `origin` of the rows it receives itself.
     #[serde(default)]
-    pub retention: LevelBuckets,
+    pub node: NodeConfig,
     #[serde(default)]
     pub pushdown: PushdownConfig,
     /// Which attribute keys get their own typed Parquet column
@@ -57,6 +59,13 @@ pub struct Config {
     /// An optional decision model that suggests which templates are the same failure (`docs/decision-model.md`). Off unless `url` is set.
     #[serde(default)]
     pub decision: crate::decision::DecisionConfig,
+    /// Tenants and their indexes (`[[tenants]]`, `[[tenants.indexes]]`): the
+    /// first two directories of the store and where retention is set. Left
+    /// out, the install is one tenant `default` with one index `default`. The
+    /// first tenant listed is the one this instance writes its own records
+    /// under.
+    #[serde(default = "default_tenants")]
+    pub tenants: Vec<TenantConfig>,
     /// File tailing sources (`[[tail]]`). Combined with any `--tail` flags.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail: Vec<crate::tail::TailSource>,
@@ -168,6 +177,22 @@ pub struct StorageConfig {
     pub wal_fsync_interval: Duration,
     #[serde(default = "default_fsync_bytes")]
     pub wal_fsync_bytes: u64,
+    /// A record whose event time is older than this when it is written goes
+    /// to the late spool (`wal-late/`) instead of the main WAL, so a replay
+    /// spread over many event hours makes one file per partition per late
+    /// segment rather than one per main segment (`docs/architecture.md` §2).
+    #[serde(default = "default_late_threshold", with = "humantime_serde")]
+    pub late_threshold: Duration,
+    /// The late spool rolls its segment after this long or `late_segment_bytes`,
+    /// whichever comes first. Late rows reach Parquet when their segment rolls.
+    #[serde(default = "default_late_roll", with = "humantime_serde")]
+    pub late_roll: Duration,
+    #[serde(default = "default_late_segment_bytes")]
+    pub late_segment_bytes: u64,
+    /// Compaction leaves alone a partition whose newest file is younger than
+    /// this: under event-time partitioning any partition can still gain a file.
+    #[serde(default = "default_compact_quiet", with = "humantime_serde")]
+    pub compact_quiet: Duration,
 }
 
 fn default_disk_budget() -> u64 {
@@ -190,6 +215,237 @@ fn default_fsync_interval() -> Duration {
 }
 fn default_fsync_bytes() -> u64 {
     4 * 1024 * 1024
+}
+pub fn default_late_threshold() -> Duration {
+    Duration::from_secs(2 * 3600)
+}
+pub fn default_late_roll() -> Duration {
+    Duration::from_secs(30 * 60)
+}
+pub fn default_late_segment_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+pub fn default_compact_quiet() -> Duration {
+    Duration::from_secs(10 * 60)
+}
+
+/// `[node]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeConfig {
+    /// 1 to 64 of `A-Za-z0-9._-` with at least one letter. Left out, an id is
+    /// generated once and kept in `<data_dir>/node-id` ([`Config::node_id`]).
+    /// For an edge that uploads parts it must equal its `[[peer.nodes]] id`
+    /// on central.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+/// What happens to a record that names an index its tenant does not have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UnknownIndex {
+    /// The record is not stored (HEC answers code 7, "Incorrect index").
+    Refuse,
+    /// The record goes to the tenant's default index.
+    #[default]
+    Default,
+}
+
+/// `[[tenants]]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TenantConfig {
+    pub id: String,
+    #[serde(default)]
+    pub unknown_index: UnknownIndex,
+    #[serde(default = "default_indexes")]
+    pub indexes: Vec<IndexConfig>,
+}
+
+/// `[[tenants.indexes]]`: a dataset inside a tenant, and the unit of retention.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndexConfig {
+    pub name: String,
+    /// The index's level buckets and how long each is kept
+    /// (`[[tenants.indexes.retention]]`).
+    #[serde(default)]
+    pub retention: LevelBuckets,
+}
+
+fn default_indexes() -> Vec<IndexConfig> {
+    vec![IndexConfig { name: crate::partition::DEFAULT_INDEX.into(), retention: LevelBuckets::default() }]
+}
+
+pub fn default_tenants() -> Vec<TenantConfig> {
+    vec![TenantConfig { id: crate::partition::DEFAULT_TENANT.into(), unknown_index: UnknownIndex::default(), indexes: default_indexes() }]
+}
+
+/// The record attribute that names the index a record is for: set from the
+/// OTLP resource attribute of the same name, from a HEC event's `index`, and
+/// from `[[tail]] index`. It routes the record and is not stored: the index is
+/// a directory, not a column.
+pub const ATTR_INDEX: &str = "logless.index";
+
+/// Where one record goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route<'a> {
+    /// It named no index (the default one) or one the tenant has.
+    Known(&'a str),
+    /// It named an unknown index and the tenant sends those to its default.
+    Defaulted(&'a str),
+    /// It named an unknown index and the tenant refuses those.
+    Refused,
+}
+
+/// The tenants and indexes this instance stores, and its own place among
+/// them: what the write path, retention and reclaim resolve a partition's
+/// policy from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tenancy {
+    tenants: Vec<TenantConfig>,
+    node: String,
+}
+
+impl Default for Tenancy {
+    fn default() -> Self {
+        Self::single(LevelBuckets::default())
+    }
+}
+
+impl Tenancy {
+    pub fn new(tenants: Vec<TenantConfig>, node: impl Into<String>) -> Result<Self, ConfigError> {
+        let node = node.into();
+        if !crate::partition::valid_ident(&node) {
+            return Err(ConfigError::BadIdent { what: "node id", value: node });
+        }
+        if tenants.is_empty() {
+            return Err(ConfigError::NoTenants);
+        }
+        let mut seen = Vec::new();
+        for t in &tenants {
+            if !crate::partition::valid_ident(&t.id) {
+                return Err(ConfigError::BadIdent { what: "tenant id", value: t.id.clone() });
+            }
+            // Ignoring case: ids are directories, and `Acme` and `acme` are
+            // one directory on a case-insensitive filesystem.
+            if seen.contains(&t.id.to_lowercase()) {
+                return Err(ConfigError::DuplicateIdent { what: "tenant id", value: t.id.clone() });
+            }
+            seen.push(t.id.to_lowercase());
+            if t.indexes.is_empty() {
+                return Err(ConfigError::NoIndexes(t.id.clone()));
+            }
+            let mut names = Vec::new();
+            for i in &t.indexes {
+                if !crate::partition::valid_ident(&i.name) {
+                    return Err(ConfigError::BadIdent { what: "index name", value: i.name.clone() });
+                }
+                if names.contains(&i.name.to_lowercase()) {
+                    return Err(ConfigError::DuplicateIdent { what: "index name", value: i.name.clone() });
+                }
+                names.push(i.name.to_lowercase());
+                LevelBuckets::new(i.retention.buckets.clone())?;
+            }
+        }
+        Ok(Self { tenants, node })
+    }
+
+    /// One tenant `default` with one index `default` holding `buckets`,
+    /// written by `node-a`: a single-tenant install, and what tests use.
+    pub fn single(buckets: LevelBuckets) -> Self {
+        let mut tenants = default_tenants();
+        tenants[0].indexes[0].retention = buckets;
+        Self { tenants, node: "node-a".into() }
+    }
+
+    fn own(&self) -> &TenantConfig {
+        &self.tenants[0]
+    }
+
+    /// The tenant this instance writes under: the first one configured.
+    pub fn tenant(&self) -> &str {
+        &self.own().id
+    }
+
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// The own tenant's default index: the one named `default`, or else the
+    /// first listed.
+    pub fn default_index(&self) -> &str {
+        let t = self.own();
+        let at = t.indexes.iter().position(|i| i.name == crate::partition::DEFAULT_INDEX).unwrap_or(0);
+        &t.indexes[at].name
+    }
+
+    /// The buckets of `(tenant, index)`; `None` when either is not configured.
+    pub fn buckets(&self, tenant: &str, index: &str) -> Option<&LevelBuckets> {
+        self.tenants.iter().find(|t| t.id == tenant)?.indexes.iter().find(|i| i.name == index).map(|i| &i.retention)
+    }
+
+    /// The buckets of the own tenant's default index.
+    pub fn default_buckets(&self) -> &LevelBuckets {
+        self.buckets(self.tenant(), self.default_index()).expect("the default index exists")
+    }
+
+    /// Replaces the default index's buckets: the runtime policy document
+    /// edits these and only these (`crate::policy`).
+    pub fn set_default_buckets(&mut self, buckets: LevelBuckets) {
+        let name = self.default_index().to_string();
+        if let Some(i) = self.tenants[0].indexes.iter_mut().find(|i| i.name == name) {
+            i.retention = buckets;
+        }
+    }
+
+    /// Every `(tenant, index, buckets)` configured.
+    pub fn indexes(&self) -> impl Iterator<Item = (&str, &str, &LevelBuckets)> {
+        self.tenants.iter().flat_map(|t| t.indexes.iter().map(move |i| (t.id.as_str(), i.name.as_str(), &i.retention)))
+    }
+
+    /// Routes a record of the own tenant that asked for `requested`.
+    pub fn route(&self, requested: Option<&str>) -> Route<'_> {
+        let Some(requested) = requested else { return Route::Known(self.default_index()) };
+        match self.own().indexes.iter().find(|i| i.name == requested) {
+            Some(i) => Route::Known(&i.name),
+            None if self.own().unknown_index == UnknownIndex::Default => Route::Defaulted(self.default_index()),
+            None => Route::Refused,
+        }
+    }
+
+    /// Routes `record` by its [`ATTR_INDEX`] attribute (or `key`, for a
+    /// receiver whose protocol names it otherwise) and rewrites the attribute
+    /// to the index chosen: absent for the default index, so the common case
+    /// costs no bytes in the WAL. Returns `Refused` with the record untouched.
+    pub fn route_record(&self, record: &mut crate::model::LogRecord, key: &str) -> Route<'_> {
+        let requested = record.attributes.iter().find(|a| a.key == key || a.key == ATTR_INDEX).map(|a| match &a.value {
+            crate::model::AttrValue::Str(s) => s.clone(),
+            crate::model::AttrValue::I64(n) => n.to_string(),
+            crate::model::AttrValue::F64(n) => n.to_string(),
+            crate::model::AttrValue::Bool(b) => b.to_string(),
+        });
+        let route = self.route(requested.as_deref());
+        let chosen = match route {
+            Route::Known(i) | Route::Defaulted(i) => i,
+            Route::Refused => return route,
+        };
+        record.attributes.retain(|a| a.key != key && a.key != ATTR_INDEX);
+        if chosen != self.default_index() {
+            record.attributes.push(crate::model::Attr { key: ATTR_INDEX.into(), value: crate::model::AttrValue::Str(chosen.to_string()) });
+        }
+        route
+    }
+}
+
+/// Counts of index routing decisions, for `GET /admin/v1/info`.
+#[derive(Debug, Default)]
+pub struct RouteStats {
+    /// Records that named an unknown index and went to the default one.
+    pub defaulted: std::sync::atomic::AtomicU64,
+    /// Records that named an unknown index and were refused.
+    pub refused: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -340,6 +596,13 @@ impl LevelBuckets {
         self.buckets.iter().find(|b| b.name == name)
     }
 
+    /// Names of the buckets that can hold a record of `severity` or above:
+    /// the `level=` directories a "this level and up" read has to open.
+    pub fn names_from(&self, severity: Severity) -> Vec<String> {
+        let first = self.buckets.partition_point(|b| b.min_severity <= severity.0).saturating_sub(1);
+        self.buckets[first..].iter().map(|b| b.name.clone()).collect()
+    }
+
     /// Longest retention of any bucket — the horizon the store must plan for.
     pub fn max_retention(&self) -> Duration {
         self.buckets
@@ -364,6 +627,16 @@ pub enum ConfigError {
     BadBucketName(String),
     #[error("level bucket {0:?} has zero retention; remove the bucket instead")]
     ZeroRetention(String),
+    #[error("configure at least one [[tenants]] entry, or none at all for the single tenant `default`")]
+    NoTenants,
+    #[error("tenant {0:?} has no indexes; give it at least one [[tenants.indexes]]")]
+    NoIndexes(String),
+    #[error("{what} {value:?} is not usable: 1 to 64 of A-Za-z0-9._-, not starting with a dot, with at least one letter (it is a directory name, and a number-only name is read back as a number)")]
+    BadIdent { what: &'static str, value: String },
+    #[error("{what} {value:?} is used twice (names are compared ignoring case: they are directories)")]
+    DuplicateIdent { what: &'static str, value: String },
+    #[error("cannot keep the generated node id in {path}: {message}")]
+    NodeId { path: String, message: String },
     #[error("unsupported config schema_version {found}, expected {expected}")]
     UnsupportedSchema { found: u32, expected: u32 },
     #[error("invalid policy value at {path}: {message}")]
@@ -379,9 +652,9 @@ impl Config {
             });
         }
         self.sync_parts.check().map_err(|message| ConfigError::Policy { path: "sync_parts.interval".into(), message })?;
-        // Re-run bucket invariants: a config deserialised from TOML bypasses
-        // LevelBuckets::new.
-        LevelBuckets::new(self.retention.buckets.clone())?;
+        // Re-run tenant, index and bucket invariants: a config deserialised
+        // from TOML bypasses `Tenancy::new` and `LevelBuckets::new`.
+        Tenancy::new(self.tenants.clone(), self.node.id.clone().unwrap_or_else(|| "node-a".into()))?;
         // The runtime policy API edits these same values, so the file must
         // satisfy the same rules or the first API read would be an invalid
         // document nobody can PUT back.
@@ -401,6 +674,54 @@ impl Config {
 
     pub fn store_dir(&self) -> PathBuf {
         self.storage.data_dir.join("store")
+    }
+
+    /// The late spool: a second WAL for records whose event time was already
+    /// old when they arrived (`storage.late_threshold`).
+    pub fn wal_late_dir(&self) -> PathBuf {
+        crate::wal::late_dir_beside(&self.wal_dir())
+    }
+
+    /// This instance's node id: `[node] id`, or one generated on first use
+    /// and kept in `<data_dir>/node-id` so it never changes afterwards
+    /// (`node-` and twelve hex digits of the instance id).
+    pub fn node_id(&self) -> Result<String, ConfigError> {
+        if let Some(id) = &self.node.id {
+            return Ok(id.clone());
+        }
+        let path = self.storage.data_dir.join("node-id");
+        if let Ok(existing) = std::fs::read_to_string(&path) {
+            let existing = existing.trim();
+            if crate::partition::valid_ident(existing) {
+                return Ok(existing.to_string());
+            }
+        }
+        let instance = crate::peer::instance_id(&self.storage.data_dir);
+        let id = format!("node-{}", &instance[instance.len().saturating_sub(12)..]);
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &id)
+            .and_then(|()| std::fs::rename(&tmp, &path))
+            .map_err(|e| ConfigError::NodeId { path: path.display().to_string(), message: e.to_string() })?;
+        Ok(id)
+    }
+
+    /// The tenants and indexes of this config with this instance's node id.
+    pub fn tenancy(&self) -> Result<Tenancy, ConfigError> {
+        Tenancy::new(self.tenants.clone(), self.node_id()?)
+    }
+
+    /// The buckets of the own tenant's default index, which is what the
+    /// runtime policy document calls `retention`.
+    pub fn default_buckets(&self) -> &LevelBuckets {
+        let t = &self.tenants[0];
+        let at = t.indexes.iter().position(|i| i.name == crate::partition::DEFAULT_INDEX).unwrap_or(0);
+        &t.indexes[at].retention
+    }
+
+    pub fn set_default_buckets(&mut self, buckets: LevelBuckets) {
+        let t = &mut self.tenants[0];
+        let at = t.indexes.iter().position(|i| i.name == crate::partition::DEFAULT_INDEX).unwrap_or(0);
+        t.indexes[at].retention = buckets;
     }
 }
 
@@ -423,9 +744,13 @@ mod tests {
                 wal_segment_bytes: 1,
                 wal_fsync_interval: Duration::from_millis(1),
                 wal_fsync_bytes: 1,
+                late_threshold: default_late_threshold(),
+                late_roll: default_late_roll(),
+                late_segment_bytes: default_late_segment_bytes(),
+                compact_quiet: default_compact_quiet(),
             },
             ingest: IngestConfig::default(),
-            retention: LevelBuckets::default(),
+            node: NodeConfig::default(),
             pushdown: PushdownConfig::default(),
             typed_columns: crate::typed::TypedColumnsConfig::default(),
             otlp: crate::otlp::ReceiverConfig::default(),
@@ -436,6 +761,7 @@ mod tests {
             peer: crate::peer::PeerConfig::default(),
             sync_parts: Default::default(),
             decision: crate::decision::DecisionConfig::default(),
+            tenants: default_tenants(),
             tail: Vec::new(),
             destinations: Vec::new(),
         })
@@ -450,6 +776,98 @@ mod tests {
         );
         let parsed: Config = toml::from_str(&extended).expect("appended config must parse");
         assert_eq!(parsed.destinations.len(), 1);
+        // The generated file spells out the single default tenant and index.
+        assert!(generated.contains("[[tenants]]\nid = \"default\""), "{generated}");
+        assert!(generated.contains("[[tenants.indexes]]\nname = \"default\""), "{generated}");
+        assert!(generated.contains("[[tenants.indexes.retention]]\nname = \"debug\""), "{generated}");
+        assert_eq!(parsed.tenants, default_tenants());
+    }
+
+    #[test]
+    fn a_config_without_tenants_is_one_default_tenant_and_index() {
+        let c: Config = toml::from_str(MINIMAL).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.tenants, default_tenants());
+        assert_eq!(c.default_buckets(), &LevelBuckets::default());
+        assert_eq!(c.storage.late_threshold, Duration::from_secs(7200));
+        assert_eq!(c.storage.compact_quiet, Duration::from_secs(600));
+        // The old global table is gone, not silently ignored.
+        assert!(toml::from_str::<Config>(&format!("{MINIMAL}\n[[retention]]\nname = \"debug\"\nmin_severity = 0\nretention = \"1d\"\n")).is_err());
+    }
+
+    const TWO_INDEXES: &str = r#"
+[node]
+id = "edge-1"
+
+[[tenants]]
+id = "acme"
+unknown_index = "refuse"
+
+[[tenants.indexes]]
+name = "default"
+
+[[tenants.indexes]]
+name = "payments"
+
+[[tenants.indexes.retention]]
+name = "all"
+min_severity = 0
+retention = "400d"
+"#;
+
+    #[test]
+    fn tenants_indexes_and_node_parse_and_route() {
+        let c: Config = toml::from_str(&format!("{MINIMAL}{TWO_INDEXES}")).unwrap();
+        c.validate().unwrap();
+        let t = c.tenancy().unwrap();
+        assert_eq!((t.tenant(), t.node(), t.default_index()), ("acme", "edge-1", "default"));
+        assert_eq!(t.buckets("acme", "payments").unwrap().iter().map(|b| b.name.as_str()).collect::<Vec<_>>(), ["all"]);
+        assert_eq!(t.buckets("acme", "default"), Some(&LevelBuckets::default()));
+        assert_eq!(t.buckets("acme", "absent"), None);
+        assert_eq!(t.buckets("other", "default"), None);
+        assert_eq!(t.route(None), Route::Known("default"));
+        assert_eq!(t.route(Some("payments")), Route::Known("payments"));
+        assert_eq!(t.route(Some("nope")), Route::Refused);
+
+        let lenient: Config = toml::from_str(&format!("{MINIMAL}{}", TWO_INDEXES.replace("refuse", "default"))).unwrap();
+        assert_eq!(lenient.tenancy().unwrap().route(Some("nope")), Route::Defaulted("default"));
+
+        // Routing a record leaves the attribute only for a non-default index.
+        let attr = |v: &str| crate::model::Attr { key: "index".into(), value: crate::model::AttrValue::Str(v.into()) };
+        let mut r = crate::model::LogRecord::new(1, Severity::INFO, "x");
+        r.attributes = vec![attr("payments")];
+        assert_eq!(t.route_record(&mut r, "index"), Route::Known("payments"));
+        assert_eq!(r.attributes, vec![crate::model::Attr { key: ATTR_INDEX.into(), value: crate::model::AttrValue::Str("payments".into()) }]);
+        r.attributes = vec![attr("default")];
+        assert_eq!(t.route_record(&mut r, "index"), Route::Known("default"));
+        assert!(r.attributes.is_empty());
+        r.attributes = vec![attr("nope")];
+        assert_eq!(t.route_record(&mut r, "index"), Route::Refused);
+        assert_eq!(r.attributes.len(), 1, "a refused record is left as it came");
+    }
+
+    #[test]
+    fn bad_tenant_index_and_node_names_are_refused() {
+        let with = |from: &str, to: &str| toml::from_str::<Config>(&format!("{MINIMAL}{}", TWO_INDEXES.replace(from, to))).unwrap().validate();
+        assert!(matches!(with("id = \"acme\"", "id = \"1234\""), Err(ConfigError::BadIdent { what: "tenant id", .. })));
+        assert!(matches!(with("name = \"payments\"", "name = \"a/b\""), Err(ConfigError::BadIdent { what: "index name", .. })));
+        assert!(matches!(with("name = \"payments\"", "name = \"DEFAULT\""), Err(ConfigError::DuplicateIdent { .. })));
+        assert!(matches!(with("id = \"edge-1\"", "id = \"42\""), Err(ConfigError::BadIdent { what: "node id", .. })));
+        assert!(toml::from_str::<Config>(&format!("{MINIMAL}{}", TWO_INDEXES.replace("refuse", "sometimes"))).is_err());
+    }
+
+    #[test]
+    fn the_node_id_is_generated_once_and_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let c: Config = toml::from_str(&format!("[storage]\ndata_dir = {:?}\n", tmp.path())).unwrap();
+        let first = c.node_id().unwrap();
+        assert!(first.starts_with("node-") && crate::partition::valid_ident(&first), "{first}");
+        assert_eq!(first, c.node_id().unwrap());
+        assert_eq!(first, std::fs::read_to_string(tmp.path().join("node-id")).unwrap());
+        // A configured id wins and writes nothing.
+        let named: Config = toml::from_str(&format!("[storage]\ndata_dir = {:?}\n[node]\nid = \"edge-7\"\n", tmp.path().join("b"))).unwrap();
+        assert_eq!("edge-7", named.node_id().unwrap());
+        assert!(!tmp.path().join("b").exists());
     }
 
     const MINIMAL: &str = "[storage]\ndata_dir = \"/tmp/x\"\n";

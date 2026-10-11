@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{Catalog, CatalogError, FileEntry};
-use crate::config::LevelBuckets;
+use crate::config::Tenancy;
 use crate::partition::PartitionKey;
 use crate::parts_edge::{gave_up_of, GaveUp, PinSet};
 use crate::retention::{self, RetentionReport};
@@ -76,7 +76,8 @@ impl DiskUsage {
     pub fn measure(wal_dir: &Path, catalog: &Catalog, budget_bytes: u64) -> Self {
         let store_bytes = catalog.totals().map(|(_, b)| b).unwrap_or(0);
         Self {
-            wal_bytes: wal::dir_bytes(wal_dir),
+            // The late spool is WAL too, and counts against the same budget.
+            wal_bytes: wal::dir_bytes(wal_dir) + wal::dir_bytes(&wal::late_dir_beside(wal_dir)),
             store_bytes,
             budget_bytes,
         }
@@ -134,12 +135,12 @@ pub struct ReclaimReport {
 pub fn reclaim(
     store_dir: &Path,
     catalog: &mut Catalog,
-    buckets: &LevelBuckets,
+    tenancy: &Tenancy,
     usage: DiskUsage,
     wm: &Watermarks,
     dry_run: bool,
 ) -> Result<ReclaimReport, CatalogError> {
-    reclaim_pinned(store_dir, catalog, buckets, usage, wm, dry_run, &PinSet::default())
+    reclaim_pinned(store_dir, catalog, tenancy, usage, wm, dry_run, &PinSet::default())
 }
 
 /// [`reclaim`], never choosing a pinned file. When only pinned files are left the report is `exhausted`: the pin
@@ -147,19 +148,19 @@ pub fn reclaim(
 pub fn reclaim_pinned(
     store_dir: &Path,
     catalog: &mut Catalog,
-    buckets: &LevelBuckets,
+    tenancy: &Tenancy,
     usage: DiskUsage,
     wm: &Watermarks,
     dry_run: bool,
     pins: &PinSet,
 ) -> Result<ReclaimReport, CatalogError> {
     let (pinned, files): (Vec<_>, Vec<_>) = catalog.list_files()?.into_iter().partition(|f| pins.contains(&f.path));
-    let mut report = reclaim_files(files, store_dir, buckets, usage, wm, |path| {
+    let mut report = reclaim_files(files, store_dir, tenancy, usage, wm, |path| {
         dry_run || std::fs::remove_file(path).is_ok()
     });
     report.pinned_kept = pinned.len();
     if !dry_run && !report.files_dropped.is_empty() {
-        catalog.forget_missing_files()?;
+        catalog.forget_files(&report.files_dropped)?;
     }
     Ok(report)
 }
@@ -171,7 +172,7 @@ pub fn reclaim_pinned(
 pub fn reclaim_files(
     mut files: Vec<FileEntry>,
     store_dir: &Path,
-    buckets: &LevelBuckets,
+    tenancy: &Tenancy,
     usage: DiskUsage,
     wm: &Watermarks,
     mut delete: impl FnMut(&Path) -> bool,
@@ -183,14 +184,16 @@ pub fn reclaim_files(
         return report;
     }
 
-    // Cheapest bucket first, then oldest data within it. A bucket missing from
-    // the config sorts last: we do not know its policy, so we do not spend it.
+    // Cheapest bucket first, across every tenant and index, then oldest data
+    // (by event time) within it. A tenant, index or bucket missing from the
+    // config sorts last: we do not know its policy, so we do not spend it.
     files.sort_by_key(|f| {
-        let retention = buckets
-            .by_name(&f.key.bucket)
+        let retention = tenancy
+            .buckets(&f.key.tenant, &f.key.index)
+            .and_then(|b| b.by_name(&f.key.bucket))
             .map(|b| b.retention.as_secs())
             .unwrap_or(u64::MAX);
-        (retention, f.stats.min_observed_nanos, f.path.clone())
+        (retention, f.stats.min_ts_nanos, f.path.clone())
     });
 
     let mut touched: BTreeMap<PartitionKey, ()> = BTreeMap::new();
@@ -245,7 +248,7 @@ pub fn expire_and_relieve(
     store_dir: &Path,
     wal_dir: &Path,
     catalog: &mut Catalog,
-    buckets: &LevelBuckets,
+    tenancy: &Tenancy,
     budget_bytes: u64,
     wm: &Watermarks,
     now_unix_secs: u64,
@@ -257,16 +260,18 @@ pub fn expire_and_relieve(
     } else {
         catalog.list_files().unwrap_or_default().into_iter().filter(|f| pins.unconfirmed.contains(&f.path)).collect()
     };
-    let expiry = retention::enforce_pinned(store_dir, buckets, now_unix_secs, false, pins);
+    let expiry = retention::enforce_pinned(store_dir, tenancy, now_unix_secs, false, pins);
     if !expiry.expired.is_empty() {
-        if let Err(e) = catalog.forget_missing_files() {
+        // Only the partitions that expired are re-checked, not the table.
+        let keys: Vec<PartitionKey> = expiry.expired.iter().map(|e| e.key.clone()).collect();
+        if let Err(e) = catalog.forget_missing_in(&keys) {
             tracing::error!(error = %e, "catalog cleanup after retention failed");
         }
     }
     let usage = DiskUsage::measure(wal_dir, catalog, budget_bytes);
     let pressure = usage.pressure(wm);
     let reclaim = (pressure != Pressure::Normal)
-        .then(|| reclaim_pinned(store_dir, catalog, buckets, usage, wm, false, pins));
+        .then(|| reclaim_pinned(store_dir, catalog, tenancy, usage, wm, false, pins));
     let gave_up = gave_up_of(&unconfirmed);
     PassOutcome { expiry, usage, pressure, reclaim, gave_up }
 }
@@ -290,10 +295,7 @@ mod tests {
         segment: u64,
         n: usize,
     ) -> FileStats {
-        let key = PartitionKey {
-            epoch_hour: hour,
-            bucket: bucket.into(),
-        };
+        let key = PartitionKey::at(hour, bucket);
         let path = key
             .dir(store)
             .join(store::file_name_for_segment(segment, seg_uuid(segment)));
@@ -322,10 +324,7 @@ mod tests {
     }
 
     fn seed(store: &Path, cat: &mut Catalog, hour: u64, bucket: &str, n: usize) -> FileStats {
-        let key = PartitionKey {
-            epoch_hour: hour,
-            bucket: bucket.into(),
-        };
+        let key = PartitionKey::at(hour, bucket);
         let path = key
             .dir(store)
             .join(store::file_name_for_segment(hour, seg_uuid(hour)));
@@ -393,7 +392,7 @@ mod tests {
             store_bytes: s.bytes,
             budget_bytes: s.bytes * 100,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
+        let report = reclaim(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), false).unwrap();
         assert_eq!(report, ReclaimReport::default());
         assert_eq!(cat.list_files().unwrap().len(), 1);
     }
@@ -422,7 +421,7 @@ mod tests {
             budget_bytes: (total as f64 / 0.75) as u64,
         };
 
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
+        let report = reclaim(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), false).unwrap();
 
         assert!(!report.files_dropped.is_empty());
         assert!(
@@ -465,7 +464,7 @@ mod tests {
             budget_bytes: (total as f64 / 0.85) as u64,
         };
 
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
+        let report = reclaim(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), false).unwrap();
 
         assert!(!report.files_dropped.is_empty());
         let first = &report.partitions_touched[0];
@@ -497,7 +496,7 @@ mod tests {
             store_bytes: total,
             budget_bytes: (total as f64 / 0.85) as u64,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
+        let report = reclaim(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), false).unwrap();
 
         assert_eq!(report.partitions_touched[0].bucket, "debug");
         assert!(
@@ -519,7 +518,7 @@ mod tests {
             store_bytes: s.bytes,
             budget_bytes: 1000,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
+        let report = reclaim(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), false).unwrap();
         assert!(report.exhausted, "must surface that relief failed");
         assert_eq!(cat.list_files().unwrap().len(), 0);
     }
@@ -534,10 +533,7 @@ mod tests {
 
         // A catalog row is just text; a corrupt or tampered one must not turn
         // into an unlink of an arbitrary path.
-        let real_path = PartitionKey {
-            epoch_hour: 1,
-            bucket: "debug".into(),
-        }
+        let real_path = PartitionKey::at(1, "debug")
         .dir(&store)
         .join(store::file_name_for_segment(1, seg_uuid(1)));
         std::fs::copy(&real_path, &outside).unwrap();
@@ -546,7 +542,7 @@ mod tests {
             seg_uuid(2),
             &[FileEntry {
                 path: outside.clone(),
-                key: PartitionKey { epoch_hour: 1, bucket: "debug".into() },
+                key: PartitionKey::at(1, "debug"),
                 stats: real.clone(),
             }],
             &[],
@@ -560,7 +556,7 @@ mod tests {
             store_bytes: total,
             budget_bytes: (total as f64 / 0.99) as u64,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false).unwrap();
+        let report = reclaim(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), false).unwrap();
 
         assert!(outside.exists(), "must not delete outside the store");
         assert!(report.files_dropped.iter().all(|p| p.starts_with(&store)));
@@ -579,7 +575,7 @@ mod tests {
             store_bytes: total,
             budget_bytes: (total as f64 / 0.99) as u64,
         };
-        let report = reclaim(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), true).unwrap();
+        let report = reclaim(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), true).unwrap();
         assert!(!report.files_dropped.is_empty());
         assert_eq!(cat.list_files().unwrap().len(), 1, "dry run must not delete");
     }
@@ -591,21 +587,21 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         let old = seed(&store, &mut cat, 100, "debug", 50);
         seed(&store, &mut cat, 101, "debug", 50);
-        let oldest_path = cat.list_files().unwrap().into_iter().min_by_key(|f| f.stats.min_observed_nanos).unwrap().path;
+        let oldest_path = cat.list_files().unwrap().into_iter().min_by_key(|f| f.stats.min_ts_nanos).unwrap().path;
         let usage = DiskUsage { wal_bytes: 0, store_bytes: 2 * old.bytes, budget_bytes: 2 * old.bytes };
         let mut pins = PinSet::default();
         pins.pinned.insert(oldest_path.clone());
 
-        let report = reclaim_pinned(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false, &pins).unwrap();
+        let report = reclaim_pinned(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), false, &pins).unwrap();
         assert!(oldest_path.exists(), "the pinned file is the oldest and cheapest, and stays");
         assert_eq!((1, 1), (report.files_dropped.len(), report.pinned_kept));
         assert_eq!(old.rows, report.rows_lost);
         // Only the pinned file is left and it is over target: said so, not forced.
         let usage = DiskUsage { wal_bytes: 0, store_bytes: old.bytes, budget_bytes: old.bytes };
-        let report = reclaim_pinned(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false, &pins).unwrap();
+        let report = reclaim_pinned(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), false, &pins).unwrap();
         assert!(report.files_dropped.is_empty() && report.exhausted && oldest_path.exists());
         // Unpinned, it goes.
-        let report = reclaim_pinned(&store, &mut cat, &LevelBuckets::default(), usage, &Watermarks::default(), false, &PinSet::default()).unwrap();
+        let report = reclaim_pinned(&store, &mut cat, &Tenancy::default(), usage, &Watermarks::default(), false, &PinSet::default()).unwrap();
         assert_eq!(1, report.files_dropped.len());
     }
 }
