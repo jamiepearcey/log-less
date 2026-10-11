@@ -27,6 +27,15 @@
 //!
 //! Per-project overrides beat both, which is what makes one proxy usable in
 //! front of several upstream projects.
+//!
+//! # The listener
+//!
+//! [`crate::bounded_http`], reading gzip and chunked bodies (`@sentry/node`
+//! streams its body, so it arrives chunked). The key, the `Host` (when any key
+//! is accepted) and the encoding are judged from the head, before the body is
+//! read. There is deliberately no `Content-Type` rule: browser SDKs send
+//! `text/plain` so that their requests need no CORS preflight, and a DSN key is
+//! public by design, so `allowed_keys` is the only gate on who may write.
 
 pub mod dsn;
 pub mod envelope;
@@ -36,6 +45,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::bounded_http::{self, BoundedServer};
 use crate::httpd::{self, Handler, Incoming, Limits, Method, Reject, Reply};
 use crate::model::{Attr, AttrValue, LogRecord, Severity};
 use crate::spool::{Spool, SpoolConfig};
@@ -58,6 +68,8 @@ pub struct SentryConfig {
     /// Point your SDK's DSN host here: `http://<any key>@127.0.0.1:9000/<project>`.
     #[serde(default = "default_sentry_addr")]
     pub addr: String,
+    /// Sizes the listener: `workers` x 32 connections at once (at least 64),
+    /// each on its own thread.
     #[serde(default = "default_sentry_workers")]
     pub workers: usize,
     /// How to authenticate upstream. See [`UpstreamAuth`].
@@ -330,36 +342,52 @@ impl SentryHandler {
         Some((project, endpoint))
     }
 
-    fn client_key(&self, request: &Incoming) -> Option<String> {
-        request
+    /// The client's key, from `X-Sentry-Auth`, `Authorization` or the query.
+    /// `Err` when a header that carries it is repeated or two copies disagree:
+    /// a proxy in front may have checked another copy than the one used here.
+    fn client_key(&self, request: &Incoming) -> Result<Option<String>, ()> {
+        if request.header_count("x-sentry-auth") > 1 || request.header_count("authorization") > 1 {
+            return Err(());
+        }
+        let keys: Vec<String> = request
             .header("x-sentry-auth")
             .and_then(dsn::parse_auth_header)
-            .or_else(|| {
-                request.header("authorization").and_then(dsn::parse_auth_header)
-            })
+            .into_iter()
+            .chain(request.header("authorization").and_then(dsn::parse_auth_header))
             .map(|auth| auth.key)
-            .or_else(|| {
-                envelope_query_key(request.query)
-            })
+            .chain(envelope_query_keys(request.query))
+            .collect();
+        match keys.first() {
+            None => Ok(None),
+            Some(key) if keys.iter().all(|k| k == key) => Ok(Some(key.clone())),
+            Some(_) => Err(()),
+        }
     }
 
-    fn authorize(&self, key: Option<&str>) -> Result<String, Reply> {
-        let Some(key) = key else {
-            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
-            return Err(error_reply(401, "missing sentry key"));
+    fn authorize(&self, key: Result<Option<String>, ()>) -> Result<String, Reply> {
+        let key = match key {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                return Err(error_reply(401, "missing sentry key"));
+            }
+            Err(()) => {
+                self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                return Err(error_reply(401, "the sentry key is given more than once"));
+            }
         };
         if !self.config.allowed_keys.is_empty()
-            && !self.config.allowed_keys.iter().any(|k| k == key)
+            && !self.config.allowed_keys.iter().any(|k| *k == key)
         {
             self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
             return Err(error_reply(401, "unknown sentry key"));
         }
-        Ok(key.to_string())
+        Ok(key)
     }
 
     fn ingest(&self, request: &Incoming, project: &str, endpoint: Endpoint) -> Reply {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
-        let key = match self.authorize(self.client_key(request).as_deref()) {
+        let key = match self.authorize(self.client_key(request)) {
             Ok(k) => k,
             Err(reply) => return reply,
         };
@@ -507,6 +535,29 @@ impl Handler for SentryHandler {
         }
     }
 
+    /// Refusals that need only the head, answered before the body is read and
+    /// counted as requests: a foreign `Host` while any key is accepted (so only
+    /// on loopback, see `Receiver::start`), a missing, unknown or repeated key,
+    /// an encoding other than gzip. Other paths fall through to `handle`.
+    fn preflight(&self, head: &Incoming) -> Option<Reply> {
+        if head.method != Method::Post || SentryHandler::route(head.path).is_none() {
+            return None;
+        }
+        let refused = if self.config.allowed_keys.is_empty() && !bounded_http::loopback_host(head) {
+            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+            error_reply(403, "the Host header is not a loopback name")
+        } else if let Err(denied) = self.authorize(self.client_key(head)) {
+            denied
+        } else if !bounded_http::encoding_accepted(head) {
+            self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
+            error_reply(415, "Content-Encoding must be gzip or absent")
+        } else {
+            return None;
+        };
+        self.stats.requests.fetch_add(1, Ordering::Relaxed);
+        Some(refused)
+    }
+
     fn reject(&self, reason: Reject) -> Reply {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         match reason {
@@ -523,7 +574,7 @@ impl Handler for SentryHandler {
 }
 
 pub struct Receiver {
-    server: httpd::Server,
+    server: BoundedServer,
     stats: Arc<SentryStats>,
     forwarder: Option<std::thread::JoinHandle<()>>,
     wake: Option<crossbeam_channel::Sender<()>>,
@@ -611,14 +662,14 @@ impl Receiver {
             wake: wake.clone(),
         });
 
-        let server = httpd::Server::start(
+        let server = BoundedServer::start(
             &config.addr,
-            config.workers,
             "sentry",
             Limits {
                 max_body_bytes: config.max_body_bytes,
                 max_decompressed_bytes: config.max_decompressed_bytes,
             },
+            bounded_http::ingest_limits(config.workers),
             handler,
         )?;
 
@@ -799,8 +850,8 @@ fn sample_keep(id: &str, rate: f64) -> bool {
     ((hash % 10_000) as f64) < rate * 10_000.0
 }
 
-fn envelope_query_key(query: &str) -> Option<String> {
-    query.split('&').find_map(|pair| {
+fn envelope_query_keys(query: &str) -> impl Iterator<Item = String> + '_ {
+    query.split('&').filter_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         (k == "sentry_key").then(|| v.to_string())
     })

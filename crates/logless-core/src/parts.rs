@@ -1005,6 +1005,7 @@ mod tests {
     fn post(addr: std::net::SocketAddr, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
         let mut r = ureq::post(format!("http://{addr}{path}"))
             .header("Authorization", "Bearer tok")
+            .header("Content-Type", "application/json")
             .config()
             .http_status_as_error(false)
             .build()
@@ -1038,6 +1039,44 @@ mod tests {
         let r = ureq::post(format!("http://{a}{PRESIGN_PATH}")).config().http_status_as_error(false).build().send("{}").unwrap();
         assert_eq!(401, r.status().as_u16());
         c.receiver.shutdown();
+        stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn a_parts_request_a_page_could_send_without_a_preflight_is_refused_unread() {
+        // Tokenless and on loopback, a web page could POST here with no Content-Type (or a form or text type)
+        // without asking first, and so have this process sign URLs or record parts it never checked.
+        let (s3, _fake, stop) = fake_s3();
+        let dir = tempfile::tempdir().unwrap();
+        let config = PeerConfig {
+            enabled: true,
+            addr: "127.0.0.1:0".into(),
+            parts: PartsConfig {
+                enabled: true,
+                endpoint: s3.clone(),
+                bucket: "logs".into(),
+                access_key_id: "AK".into(),
+                secret_access_key: "SK".into(),
+                ..PartsConfig::default()
+            },
+            ..PeerConfig::default()
+        };
+        let rx = peer::Receiver::start_with_catalog(&config, "central".into(), Some(dir.path().join("catalog.sqlite")), |_| Admitted::Accepted).unwrap();
+        let a = rx.local_addr();
+        let presign = serde_json::json!({"name": format!("{HEX}.parquet"), "size": 10, "sha256": HEX}).to_string();
+        let commit = serde_json::json!({"name": format!("{HEX}.parquet"), "size": 10, "sha256": HEX, "rows": 1, "min_unix_nano": 1, "max_unix_nano": 2, "origin": "edge"}).to_string();
+        use crate::bounded_http::testing::{exchange, request, WAIT};
+        for (path, body) in [(PRESIGN_PATH, &presign), (COMMIT_PATH, &commit)] {
+            for kind in [None, Some("text/plain"), Some("application/x-www-form-urlencoded"), Some("multipart/form-data; boundary=x")] {
+                let headers: Vec<(&str, &str)> = kind.map(|k| ("Content-Type", k)).into_iter().collect();
+                let (status, text) = exchange(a, &request("POST", path, &headers, body.as_bytes()), WAIT);
+                assert_eq!(415, status, "{path} {kind:?}: {text}");
+            }
+        }
+        // The edge sends application/json, which a page cannot send without a preflight this listener never answers.
+        let (status, text) = exchange(a, &request("POST", PRESIGN_PATH, &[("Content-Type", "application/json")], presign.as_bytes()), WAIT);
+        assert_eq!(200, status, "{text}");
+        rx.shutdown();
         stop.store(true, Ordering::Release);
     }
 

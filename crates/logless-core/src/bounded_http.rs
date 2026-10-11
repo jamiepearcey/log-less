@@ -1,5 +1,6 @@
-//! A small HTTP/1.1 listener with a hard cap on the request head, for the
-//! admin API and the peer receiver.
+//! A small HTTP/1.1 listener with a hard cap on the request head, for every
+//! listener here: the admin API, the peer receiver, S3 serve, OTLP/HTTP, Splunk
+//! HEC and the Sentry proxy.
 //!
 //! `tiny_http` buffers request headers without any limit, before a handler
 //! (and so before authentication) runs: one unauthenticated 100 MB header
@@ -7,9 +8,11 @@
 //! ingest. This listener reads the head into a fixed budget, refuses anything
 //! over it with 431, bounds how long a client may take to send it, caps
 //! concurrent connections, and answers every request with `Connection: close`
-//! so there is no connection state to abuse. Bodies need `Content-Length`;
-//! chunked requests are refused. Gzip bodies are decoded only for a listener
-//! that asks for it ([`HeadLimits::gzip`]), under the decompressed-size cap.
+//! so there is no connection state to abuse. Bodies need `Content-Length`
+//! unless the listener reads chunked bodies ([`HeadLimits::chunked`]), which the
+//! ingest listeners do because SDKs that stream their body send them. Gzip
+//! bodies are decoded only for a listener that asks for it
+//! ([`HeadLimits::gzip`]), under the decompressed-size cap.
 //!
 //! A handler can refuse on the head alone ([`Handler::preflight`]), so an
 //! unauthenticated client is answered before this process buffers or inflates
@@ -35,6 +38,10 @@ pub struct HeadLimits {
     /// Decode `Content-Encoding: gzip` bodies, capped by
     /// `Limits::max_decompressed_bytes`. Off: the body reaches the handler as sent.
     pub gzip: bool,
+    /// Read `Transfer-Encoding: chunked` bodies, capped by `Limits::max_body_bytes`. Off: 501. Either
+    /// way `Transfer-Encoding` with `Content-Length`, or with any coding but `chunked`, is refused, and
+    /// the reply closes the connection, so there is no second request for a proxy to disagree about.
+    pub chunked: bool,
 }
 
 impl Default for HeadLimits {
@@ -45,8 +52,43 @@ impl Default for HeadLimits {
             request_timeout: Duration::from_secs(10),
             max_connections: 64,
             gzip: false,
+            chunked: false,
         }
     }
+}
+
+/// The limits for an ingest listener (OTLP, HEC, Sentry), from its `workers` setting: one thread per
+/// connection, `workers` x 32 connections at once (at least 64), 30 s to send a whole request, and gzip and
+/// chunked bodies read, because exporters and SDKs send both.
+pub(crate) fn ingest_limits(workers: usize) -> HeadLimits {
+    HeadLimits {
+        max_connections: (workers * 32).max(64),
+        request_timeout: Duration::from_secs(30),
+        gzip: true,
+        chunked: true,
+        ..HeadLimits::default()
+    }
+}
+
+/// `Content-Encoding` as a listener with [`HeadLimits::gzip`] reads it: absent, `identity`, or one `gzip`.
+/// Anything else would reach the parser as compressed bytes.
+pub(crate) fn encoding_accepted(head: &Incoming) -> bool {
+    match head.header_count("content-encoding") {
+        0 => true,
+        1 => matches!(head.header("content-encoding").map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("" | "identity" | "gzip")),
+        _ => false,
+    }
+}
+
+/// For a listener that takes requests without a credential on a loopback address: exactly one `Host`, and
+/// a literal loopback name. A page that rebinds its own name to 127.0.0.1 sends that name.
+pub(crate) fn loopback_host(head: &Incoming) -> bool {
+    head.header_count("host") == 1 && crate::admin_api::host_allowed(head.header("host"), &[])
+}
+
+/// Whether every address `addr` resolves to is a loopback one.
+pub(crate) fn loopback_addr(addr: &str) -> bool {
+    addr.to_socket_addrs().map(|mut a| a.all(|s| s.ip().is_loopback())).unwrap_or(false)
 }
 
 pub struct BoundedServer {
@@ -303,10 +345,17 @@ fn read_request(
         headers.push((name.to_string(), value.trim().to_string()));
     }
 
-    if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")) {
-        return fail(Bad::Unsupported("send a Content-Length body; chunked requests are not accepted"));
-    }
+    let mut codings = headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"));
+    let chunked = match (codings.next(), codings.next()) {
+        (None, _) => false,
+        (Some((_, v)), None) if head.chunked && v.eq_ignore_ascii_case("chunked") => true,
+        _ if head.chunked => return fail(Bad::Unsupported("the only transfer coding accepted is a single chunked")),
+        _ => return fail(Bad::Unsupported("send a Content-Length body; chunked requests are not accepted")),
+    };
     let mut lengths = headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+    if chunked && lengths.clone().next().is_some() {
+        return fail(Bad::Request("Content-Length and Transfer-Encoding together"));
+    }
     let declared = match (lengths.next(), lengths.next()) {
         (None, _) => 0usize,
         (Some((_, v)), None) => match v.parse::<usize>() {
@@ -324,16 +373,76 @@ fn read_request(
     }
 
     let mut body = buf[end + 4..].to_vec();
-    while body.len() < declared {
-        if let Err(b) = fill(stream, &mut body, deadline) {
-            return fail(b);
+    if chunked {
+        body = read_chunked(stream, body, limits.max_body_bytes, head.max_head_bytes, deadline)?;
+    } else {
+        while body.len() < declared {
+            if let Err(b) = fill(stream, &mut body, deadline) {
+                return fail(b);
+            }
         }
+        body.truncate(declared);
     }
-    body.truncate(declared);
     if head.gzip && headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-encoding") && v.eq_ignore_ascii_case("gzip")) {
         body = inflate(&body, limits.max_decompressed_bytes)?;
     }
     Ok(Parsed { method, method_name: m.to_string(), path, query, headers, body })
+}
+
+/// Decodes a chunked body that starts with `buf`. Each size line is hex digits (an extension after `;` is
+/// ignored) ending in CRLF, and each chunk is followed by CRLF; anything else is 400. The data may not pass
+/// `max_body`, and a size line or the trailers may not pass `max_line`. Trailers are read and dropped, and
+/// so is anything after the final CRLF.
+fn read_chunked(stream: &mut TcpStream, mut buf: Vec<u8>, max_body: usize, max_line: usize, deadline: Instant) -> Result<Vec<u8>, Result<Bad, Reject>> {
+    let mut body = Vec::new();
+    loop {
+        let line = take_line(stream, &mut buf, max_line, deadline)?;
+        let digits = line.split(|b| *b == b';').next().unwrap_or_default();
+        if digits.is_empty() || digits.len() > 15 || !digits.iter().all(u8::is_ascii_hexdigit) {
+            return Err(Ok(Bad::Request("malformed chunk size")));
+        }
+        let size = usize::from_str_radix(std::str::from_utf8(digits).unwrap_or("0"), 16).unwrap_or(usize::MAX);
+        if size == 0 {
+            break;
+        }
+        if body.len().saturating_add(size) > max_body {
+            return Err(Err(Reject::TooLarge));
+        }
+        while buf.len() < size + 2 {
+            fill(stream, &mut buf, deadline).map_err(Ok)?;
+        }
+        if &buf[size..size + 2] != b"\r\n" {
+            return Err(Ok(Bad::Request("chunk data does not end with CRLF")));
+        }
+        body.extend_from_slice(&buf[..size]);
+        buf.drain(..size + 2);
+    }
+    let mut trailers = 0usize;
+    loop {
+        let line = take_line(stream, &mut buf, max_line, deadline)?;
+        if line.is_empty() {
+            return Ok(body);
+        }
+        trailers += line.len() + 2;
+        if trailers > max_line {
+            return Err(Ok(Bad::HeadTooLarge));
+        }
+    }
+}
+
+/// Removes and returns the next CRLF-terminated line of `buf`, reading more as needed, up to `max_line`.
+fn take_line(stream: &mut TcpStream, buf: &mut Vec<u8>, max_line: usize, deadline: Instant) -> Result<Vec<u8>, Result<Bad, Reject>> {
+    loop {
+        if let Some(i) = buf.windows(2).position(|w| w == b"\r\n") {
+            let line = buf[..i].to_vec();
+            buf.drain(..i + 2);
+            return Ok(line);
+        }
+        if buf.len() > max_line {
+            return Err(Ok(Bad::Request("chunk line too long")));
+        }
+        fill(stream, buf, deadline).map_err(Ok)?;
+    }
 }
 
 /// Reads at most `limit` bytes out of the gzip stream, then one more to tell
@@ -423,6 +532,115 @@ fn copy_exact(reader: &mut dyn Read, stream: &mut TcpStream, len: u64) {
                 left -= n as u64;
             }
         }
+    }
+}
+
+/// Raw-socket helpers for the listener abuse tests. They write bytes as given, because the requests worth
+/// testing (a stalled body, a 2 MiB header, a repeated header) are ones an HTTP client library would refuse
+/// to produce or would tidy up.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant};
+
+    pub const WAIT: Duration = Duration::from_secs(5);
+
+    /// Sends `request` as is; returns the status code (0 when nothing came back within `wait`) and the
+    /// whole response text.
+    pub fn exchange(addr: SocketAddr, request: &[u8], wait: Duration) -> (u16, String) {
+        let mut conn = TcpStream::connect(addr).unwrap();
+        conn.set_read_timeout(Some(wait)).unwrap();
+        // The server may answer and hang up before a big request is fully written.
+        let _ = conn.write_all(request);
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = conn.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        let text = String::from_utf8_lossy(&out).into_owned();
+        (text.split(' ').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0), text)
+    }
+
+    /// A request with `Host: 127.0.0.1` and a `Content-Length`, then `headers` in order, so a test can
+    /// repeat one.
+    pub fn request(method: &str, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n", body.len());
+        for (k, v) in headers {
+            head.push_str(&format!("{k}: {v}\r\n"));
+        }
+        head.push_str("\r\n");
+        [head.into_bytes(), body.to_vec()].concat()
+    }
+
+    /// As [`request`] with the body sent in `Transfer-Encoding: chunked` pieces of `piece` bytes.
+    pub fn chunked(method: &str, path: &str, headers: &[(&str, &str)], body: &[u8], piece: usize) -> Vec<u8> {
+        let mut out = format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n").into_bytes();
+        for (k, v) in headers {
+            out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
+        for part in body.chunks(piece.max(1)) {
+            out.extend_from_slice(format!("{:x}\r\n", part.len()).as_bytes());
+            out.extend_from_slice(part);
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"0\r\n\r\n");
+        out
+    }
+
+    pub fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Opens six connections that each send `head` (which must declare a `Content-Length` of more than ten
+    /// bytes) and ten bytes of the body, then never finish. Returns what `good` got meanwhile, and asserts
+    /// it was answered within two seconds.
+    pub fn answer_beside_stalled_uploads(addr: SocketAddr, head: &str, good: &[u8]) -> (u16, String) {
+        let stalled: Vec<TcpStream> = (0..6)
+            .map(|_| {
+                let mut c = TcpStream::connect(addr).unwrap();
+                c.write_all(head.as_bytes()).unwrap();
+                c.write_all(b"0123456789").unwrap();
+                c
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        let got = exchange(addr, good, Duration::from_secs(3));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}: {got:?}", started.elapsed());
+        drop(stalled);
+        got
+    }
+
+    /// The status for a request to `path` carrying one 2 MiB header line.
+    pub fn huge_header_status(addr: SocketAddr, path: &str) -> u16 {
+        let big = "a".repeat(2 * 1024 * 1024);
+        exchange(addr, &request("POST", path, &[("X-Big", &big)], b""), WAIT).0
+    }
+
+    /// Holds `cap` idle connections open, then returns how many of `extra` further connections the server
+    /// closed at once without waiting for a request. The idle ones are closed before it returns.
+    pub fn closed_past_the_cap(addr: SocketAddr, cap: usize, extra: usize) -> usize {
+        let idle: Vec<TcpStream> = (0..cap).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        std::thread::sleep(Duration::from_millis(300));
+        let mut closed = 0;
+        for _ in 0..extra {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            if matches!(c.read(&mut [0u8; 1]), Ok(0)) {
+                closed += 1;
+            }
+        }
+        drop(idle);
+        // The server notices the hang-ups and frees the slots.
+        std::thread::sleep(Duration::from_millis(300));
+        closed
     }
 }
 
@@ -594,6 +812,39 @@ mod tests {
     fn post_gz(addr: SocketAddr, body: &[u8]) -> u16 {
         let head = format!("POST / HTTP/1.1\r\nHost: x\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n", body.len());
         send(addr, &[head.as_bytes(), body].concat(), Duration::from_secs(5))
+    }
+
+    #[test]
+    fn chunked_bodies_are_read_strictly_and_only_when_asked_for() {
+        let limits = Limits { max_body_bytes: 64, max_decompressed_bytes: 4096 };
+        let head = HeadLimits { chunked: true, gzip: true, request_timeout: Duration::from_millis(500), ..Default::default() };
+        let (server, probe) = start(head, limits, false);
+        let a = server.local_addr();
+        let post = |chunks: &str| send(a, format!("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n{chunks}").as_bytes(), Duration::from_secs(5));
+        assert_eq!(200, post("5\r\nhello\r\n1;name=v\r\n!\r\n0\r\nX-Trailer: t\r\n\r\n"));
+        assert_eq!(b"hello!", probe.handled.lock().unwrap()[0].as_slice(), "extensions and trailers are dropped");
+        assert_eq!(200, send(a, &testing::chunked("POST", "/", &[("Content-Encoding", "gzip")], &testing::gzip(b"zipped"), 3), Duration::from_secs(5)));
+        assert_eq!(b"zipped", probe.handled.lock().unwrap()[1].as_slice());
+        assert_eq!(200, post(&format!("40\r\n{}\r\n0\r\n\r\n", "a".repeat(64))), "exactly at the cap");
+        assert_eq!(413, post(&format!("40\r\n{}\r\n1\r\nb\r\n0\r\n\r\n", "a".repeat(64))), "one byte over, across chunks");
+        assert_eq!(413, post("ffffffffffffff\r\n"), "declared far past the cap");
+        for bad in ["zz\r\n", "-1\r\n", " 5\r\nhello\r\n0\r\n\r\n", "5 \r\nhello\r\n0\r\n\r\n", "5\nhello\r\n0\r\n\r\n", "5\r\nhelloXX0\r\n\r\n", "fffffffffffffffff\r\n", ";\r\n"] {
+            assert_eq!(400, post(bad), "{bad:?}");
+        }
+        let both = "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        assert_eq!(400, send(a, both.as_bytes(), Duration::from_secs(5)), "Content-Length with Transfer-Encoding");
+        for coding in ["Transfer-Encoding: gzip, chunked", "Transfer-Encoding: chunked, chunked", "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked", "Transfer-Encoding: identity"] {
+            let req = format!("POST / HTTP/1.1\r\nHost: x\r\n{coding}\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+            assert_eq!(501, send(a, req.as_bytes(), Duration::from_secs(5)), "{coding}");
+        }
+        // A chunk that stops half way is cut off at the request deadline, as a short Content-Length body is.
+        assert_eq!(408, post("a\r\nhello"));
+        assert_eq!(408, post("5\r\nhello\r\n"), "no last chunk");
+        let mut trailers = String::from("0\r\n");
+        trailers.push_str(&"X-T: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n".repeat(300));
+        assert_eq!(431, post(&format!("{trailers}\r\n")), "trailers are bounded like the head");
+        assert_eq!(3, probe.handled.lock().unwrap().len());
+        server.shutdown();
     }
 
     #[test]

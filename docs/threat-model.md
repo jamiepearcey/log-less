@@ -1,14 +1,20 @@
 # Threat model: the network listeners
 
-Scope: the four HTTP listeners a log-less process can open, what each one does with hostile input, and the test that
-shows it. Written 2026-10-11 against branch `hard/recv`. It feeds Plane items 61 (receiver security), 75 (S3 serve
-hardening) and 136 (security review).
+Scope: the HTTP listeners a log-less process can open, what each one does with hostile input, and the test that
+shows it. Written 2026-10-11 against branch `hard/recv` (admin API, peer receiver, S3 serve) and extended the same day
+on `hard/listeners` (OTLP/HTTP, Splunk HEC, the Sentry proxy, and the parts endpoints' Content-Type rule). It feeds
+Plane items 61 (receiver security), 75 (S3 serve hardening) and 136 (security review).
 
 How to read the tables: **Test** is the name of a test in `crates/logless-core/src` that sends the hostile input and
 asserts the safe outcome, or "not covered" when nothing does. "Checked, fine" means the test passed on the code as it was
 before this branch, so the defence already existed and the test now pins it. "Fixed" means the test failed first. Every
 test named here was run and passed (`cargo test -p logless-core --lib -- s3_serve:: httpd:: bounded_http:: peer::
-admin_api::`).
+admin_api::` on `hard/recv`; `cargo test -p logless-core --lib -- otlp:: hec:: sentry:: bounded_http:: parts::` on
+`hard/listeners`, where the OTLP, HEC, Sentry and parts rows were written). On `hard/listeners` "fixed" means the test
+was run against the `tiny_http` listeners first and failed at the assertion the row describes; a test stops at its first
+failure, so the later assertions in a fixed test were not run against the old code, and what the row says the old code
+did for those comes from reading it (marked "read"). Real-client checks for those three listeners are in
+[evidence/listeners-compat.md](evidence/listeners-compat.md).
 
 ## Assets
 
@@ -34,8 +40,10 @@ admin_api::`).
 ```
 
 * **Edge.** Trusts its local applications (anything that can reach its OTLP/HEC/Sentry ports can write logs; those
-  listeners are loopback by default and have no authentication). Does not trust the network: the admin API and S3 serve
-  refuse to leave loopback without a token or keys.
+  listeners are loopback by default; HEC and Sentry can require a token or key, OTLP cannot). Does not trust the
+  network: the admin API, S3 serve, HEC and Sentry refuse to leave loopback without a token, keys or allowed keys.
+  Does not trust the local browser either: a page that reaches a loopback listener is refused by `Host`,
+  `Content-Type` or `Origin` rules (per listener, below).
 * **Central.** Trusts only holders of a peer token. A token holder is trusted to send records, not to be able to crash or
   fill the process; the limits below are what makes that true. Every record from a peer is untrusted input to the parser.
 * **Console.** A server-side process that holds the admin token and the S3 keys. The browser never receives either and
@@ -44,14 +52,15 @@ admin_api::`).
 * **Secrets store.** Today: the config file (tokens and keys in clear), environment variables, and `sync.json` plus
   `sync-token` in the data dir. There is no separate secrets service. Anyone who can read those files has the secrets.
 
-Out of scope here: the OTLP, Splunk HEC and Sentry listeners (see "Not defended or not done"), TLS (there is none; run a
-proxy), the CLI and file tailing, the console's own authentication.
+Out of scope here: the OTLP **gRPC** listener (`otlp/grpc.rs`, its own HTTP/2 server; not reviewed), TLS (there is
+none; run a proxy), the CLI and file tailing, the console's own authentication, the Sentry proxy's upstream side
+(spool, forwarding, replay).
 
 ## Common machinery
 
-The admin API, the peer receiver and the S3 server run on `bounded_http.rs`, a small HTTP/1.1 server. It exists because
-`tiny_http` (0.12, used by the other listeners) reads each header line into an unbounded buffer, sets no read timeout, and
-runs one thread per connection with no cap (read in `tiny_http-0.12.0/src/client.rs`, `read_next_line`, and demonstrated
+Every HTTP/1.1 listener (admin API, peer receiver, S3 server, OTLP/HTTP, HEC, Sentry) runs on `bounded_http.rs`, a small
+HTTP/1.1 server; `tiny_http` is no longer a dependency. It exists because `tiny_http` (0.12) reads each header line into
+an unbounded buffer, sets no read timeout, and runs one thread per connection with no cap (read in `tiny_http-0.12.0/src/client.rs`, `read_next_line`, and demonstrated
 against the S3 server before this branch: a 64 MiB header was buffered and answered 200).
 
 | Abuse case | Defence | Test |
@@ -60,13 +69,17 @@ against the S3 server before this branch: a 64 MiB header was buffered and answe
 | Head or body that never finishes (slowloris) | whole-request deadline, 408 | `bounded_http::tests::a_client_that_stalls_in_the_head_or_the_body_is_cut_off_at_the_request_timeout` (300 ms deadline; also a one-byte-at-a-time drip, which does not extend it) |
 | Many connections | cap, extra connections closed unread; slots return | `bounded_http::tests::connections_past_the_cap_are_closed_unread_and_the_slots_come_back` |
 | Malformed request line or header, folded headers, bad or repeated `Content-Length`, non-UTF-8 head, HTTP/2 preface | 400, handler never called | `bounded_http::tests::malformed_heads_are_400_and_never_reach_the_handler` |
-| Chunked bodies, and `Content-Length` with `Transfer-Encoding` (request smuggling) | 501; no chunk parser exists to disagree with a proxy | same test; `peer::tests::framing_tricks_are_refused_rather_than_guessed_at` |
+| Chunked bodies, and `Content-Length` with `Transfer-Encoding` (request smuggling) | admin, peer, S3: 501, no chunk parser runs | same test; `peer::tests::framing_tricks_are_refused_rather_than_guessed_at` |
+| Chunked bodies on the ingest listeners (OTLP, HEC, Sentry read them: `@sentry/node` and the OpenTelemetry JS exporter stream their bodies) | strict parser, `HeadLimits::chunked`: hex size only (extensions after `;` ignored), CRLF only, data capped at the body limit across chunks, trailers capped at the head budget and dropped, bytes after the last chunk dropped; `Content-Length` with `Transfer-Encoding` is 400; any coding but one `chunked` (`gzip, chunked`, `chunked, chunked`, two headers) is 501; a stalled chunk is 408 | `bounded_http::tests::chunked_bodies_are_read_strictly_and_only_when_asked_for` (new code; the old 501 for these listeners was never a defence, `tiny_http` read chunked bodies) |
 | Pipelined second request | every reply is `Connection: close`; bytes after the declared body are dropped, never parsed | `peer::tests::framing_tricks_are_refused_rather_than_guessed_at` |
 | Refusal that needs only the head (auth, Host) answered after a body is buffered | `Handler::preflight`: answered before the body is read | `bounded_http::tests::a_preflight_refusal_is_sent_without_waiting_for_the_body` |
 | Gzip bomb | decoded only where enabled, capped, one byte over is 413 | `bounded_http::tests::gzip_is_decoded_only_when_asked_for_and_only_up_to_the_cap` |
 | Client that stops reading a download | 10 s per write, then the connection is dropped | `s3_serve::tests::a_stalled_download_does_not_starve_other_requests` (checks the others are served; the 10 s cut-off itself is not covered) |
 
-Fixed on this branch: the peer receiver and the S3 server were on `tiny_http` and now use this server (see below).
+Fixed on `hard/recv`: the peer receiver and the S3 server were on `tiny_http` and now use this server. Fixed on
+`hard/listeners`: OTLP/HTTP, HEC and Sentry, which were the last three (sections below). Those three use
+`bounded_http::ingest_limits(workers)`: `workers` x 32 connections (at least 64), 30 s per request, gzip and chunked
+bodies read.
 
 ## Peer receiver (`POST /v1/ingest`, `POST /v1/parts/*`, `GET /.well-known/logless`)
 
@@ -100,7 +113,7 @@ Defect fixes: `peer.rs` `Receiver::start` (was `httpd::Server::start`, HEAD line
 | Capability document leaking tokens | it carries no secret | `peer::tests::the_capability_document_does_not_leak_secrets` |
 | CRLF line endings, blank lines | accepted (a control, not an attack) | `peer::tests::crlf_line_endings_and_blank_lines_are_fine` |
 | Forged `logless.origin` / `logless.hops`, replayed event ids | belongs to hop and dedupe handling, not reviewed here | existing `a_record_that_came_back_to_its_origin...`, `a_retried_batch_is_recognised...` |
-| Cross-site POST to the parts endpoints with no `Content-Type` (tokenless, loopback, parts enabled) | **not defended**: the content-type rule is only applied to ingest because `parts.rs` was out of scope and its tests send bodies without a type | not covered |
+| Cross-site POST to the parts endpoints with no `Content-Type`, or a form or text type (tokenless, loopback, parts enabled) | 415 from the head, the same rule as ingest (`refuse_head`; `peer.rs` preflight now passes the parts paths through it). The edge sender already sent `application/json` | `parts::tests::a_parts_request_a_page_could_send_without_a_preflight_is_refused_unread` (fixed: a typeless presign was answered 200 with a signed URL) |
 
 ## S3 serve (`crates/logless-core/src/s3_serve.rs`)
 
@@ -155,14 +168,91 @@ otherwise pinned what was there.
 | Lost update by two writers; unconfirmed destructive change; log injection through `actor` | `If-Match` versions, impact-bound confirmation, sanitised actor | `two_concurrent_writers_cannot_both_win`, `destructive_changes_need_confirmation_and_say_what_they_would_delete`, `actor_is_required_and_sanitised` (pre-existing) |
 | Admin API as a proxy to internal hosts (`sync` target URL, `sync/test`) | **not defended**: an admin-token holder can make the process send a request to any URL | a saved token is never sent to a different address (`a_saved_token_is_never_sent_to_a_different_address`); the SSRF itself is not covered |
 
+## OTLP/HTTP (`POST /v1/logs`, `crates/logless-core/src/otlp/http.rs`)
+
+No credential exists in OTLP/HTTP as served here, so the listener's defences are its limits, its `Host` rule on
+loopback and its `Content-Type` rule. Defect fix: `Receiver::start` was `httpd::Server::start` (tiny_http) and is now
+`BoundedServer::start` with `OtlpHandler::preflight`.
+
+| Abuse case | Defence | Test |
+|---|---|---|
+| Uploads that stop half way, more of them than workers | each holds its own connection thread for at most 30 s; others are answered at once. With `tiny_http` and two workers, two such uploads stopped the receiver answering | `otlp::http::tests::a_stalled_upload_does_not_stop_the_receiver_answering` (fixed) |
+| 2 MiB header line, 200 headers | 431, receiver keeps serving | `otlp::http::tests::a_2_mib_header_is_431_and_the_receiver_keeps_serving` (fixed: the 2 MiB header was accepted, 200) |
+| Many connections | cap `workers` x 32, at least 64; past it closed unread; slots come back | `otlp::http::tests::connections_past_the_cap_are_closed_and_the_slots_come_back` (fixed: no cap) |
+| Oversized body, sent or declared (1 TiB, never sent) | 413 from the head, as a protobuf `Status` | `otlp::http::tests::an_oversized_or_damaged_body_is_refused_before_the_decoder` (sent: checked, fine; declared: fixed, `tiny_http` had not answered within 2 s) |
+| Gzip bomb (16 MiB in under 64 KiB), truncated gzip, junk claiming to be gzip | 413 at the decompressed cap; 400 | same test (not run on the old code); `gzip_bomb_is_capped` (pre-existing, passed on the old code) |
+| Malformed protobuf: truncated, length past the end, endless varint, wire type 7, values nested 10 000 deep | 400 `INVALID_ARGUMENT`; nesting stops at the decoder's depth limit (16), no stack overflow | `otlp::http::tests::malformed_protobuf_and_json_are_400_and_never_a_crash` (checked, fine) |
+| Malformed OTLP/JSON: truncated, bare string, 100 000-deep arrays, `1e999999`, invalid UTF-8 | 400 with a JSON `Status` (serde_json's recursion limit) | same test (checked, fine) |
+| A web page posting to 127.0.0.1 with no `Content-Type`, `text/plain`, a form type (no CORS preflight needed) | 415 from the head: only `application/x-protobuf` and `application/json`, exactly one `Content-Type`. Both need a preflight, which is never answered | `otlp::http::tests::only_protobuf_and_json_content_types_and_gzip_are_accepted` (fixed: `text/plain` was decoded as protobuf and stored, 200) |
+| `Content-Encoding` other than gzip (`br`, `deflate`, `zstd`, `gzip, gzip`, two headers) | 415 (before, read: ignored, the compressed bytes went to the decoder) | same test |
+| DNS rebinding: a foreign, missing or second `Host` on a loopback bind | 403 from the head; literal loopback names only | `otlp::http::tests::a_loopback_receiver_refuses_a_foreign_host_header` (fixed) |
+| Full pipeline | 503 with `Retry-After: 1`, as before; a chunked gzip export is read | `otlp::http::tests::a_full_pipeline_says_when_to_retry_and_a_chunked_export_is_read` |
+
+## Splunk HEC (`/services/collector*`, `crates/logless-core/src/hec.rs`)
+
+Defect fix: `Receiver::start` was `httpd::Server::start` and is now `BoundedServer::start` with `HecHandler::preflight`,
+which judges the token, `Host`, `Origin`, channel and encoding before the body is read. Splunk's response codes are kept
+(2 token required, 3 invalid authorization, 4 invalid token, 6 invalid data format, 9 busy, 10 channel missing,
+11 invalid channel, 14 ack disabled, 17 healthy) and so are ack ids and the ack poll.
+
+| Abuse case | Defence | Test |
+|---|---|---|
+| Uploads that stop half way, more of them than workers | 30 s per connection thread; others answered | `hec::tests::a_stalled_upload_does_not_stop_the_receiver_answering` (fixed) |
+| 2 MiB header line, 200 headers | 431, keeps serving | `hec::tests::a_2_mib_header_is_431_and_the_receiver_keeps_serving` (fixed: the 2 MiB header reached the token check, 401) |
+| Many connections | cap `workers` x 32, at least 64 | `hec::tests::connections_past_the_cap_are_closed_and_the_slots_come_back` (fixed) |
+| Oversized body sent or declared, gzip bomb, truncated or fake gzip, malformed JSON (truncated batch, NUL, invalid UTF-8, an array, 20 000-deep nesting) | 413 / 400 with code 6; a batch with one bad event stores nothing | `hec::tests::oversized_bombed_or_damaged_bodies_are_refused_with_their_splunk_codes` (sent: checked, fine; declared 1 TiB: fixed, not answered within 2 s; the rest not run on the old code) |
+| Missing, empty, wrong, prefix, suffix, other-case token; `Bearer` scheme; wrong header with a good query token | 401 code 2/3 or 403 code 4; the header wins over the query | `hec::tests::a_token_is_judged_from_the_head_and_must_arrive_once` (all but the last checked, fine; the last not run on the old code) |
+| Two `Authorization` headers (also two good ones); two `token` query parameters | neither counts, 401 code 3 | same test (fixed: good one first then a wrong one was 200; the rest read: the first one counted) |
+| No token with a body: 3 MiB declared and never sent; a 64 MiB gzip bomb with a wrong token | 401/403 from the head, nothing read or inflated, no size limit revealed (before, read: the body was read before the handler ran) | same test |
+| `Content-Encoding` other than gzip, or stacked | 415 | `hec::tests::only_gzip_is_decoded_and_stacked_headers_are_refused` (fixed: an uncompressed body labelled `br` on `/raw` was stored, 200) |
+| Two `X-Splunk-Request-Channel` headers (which channel owns the ack id) | 400 code 11 (before, read: the first was used) | same test |
+| Tokenless loopback listener and a page in a local browser: a cross-site POST (`Origin`, `Sec-Fetch-Site`), `text/plain`, or DNS rebinding (`Host`) | 403 from the head when there are no tokens and the request carries `Origin` or `Sec-Fetch-Site`, or a non-loopback or second `Host`. HEC itself takes any `Content-Type`, so a type rule is not available | `hec::tests::a_tokenless_receiver_refuses_web_pages_and_foreign_host_names` (fixed: accepted, 200) |
+| Chunked upload with a channel | read; ack id issued and pollable as before | `hec::tests::a_chunked_upload_gets_its_ack_id` |
+| Tokenless on a public address | refused at start (pre-existing) | `an_empty_token_list_refuses_to_bind_a_public_address` |
+
+## Sentry proxy (`/api/<project>/envelope/`, `/store/`, `crates/logless-core/src/sentry.rs`)
+
+Defect fix: `Receiver::start` was `httpd::Server::start` and is now `BoundedServer::start` with `SentryHandler::preflight`
+(key, `Host`, encoding judged from the head). Envelope handling, the `{"id"}` reply, 429 with `Retry-After` and the
+reflected `X-Sentry-Rate-Limits` are unchanged (`upstream_rate_limits_are_reflected_back_to_the_sdk`,
+`a_full_pipeline_is_429_not_a_silent_drop`).
+
+| Abuse case | Defence | Test |
+|---|---|---|
+| Uploads that stop half way | 30 s per connection thread; others answered | `sentry::tests::a_stalled_upload_does_not_stop_the_proxy_answering` (fixed) |
+| 2 MiB header line, 200 headers | 431, keeps serving | `sentry::tests::a_2_mib_header_is_431_and_the_proxy_keeps_serving` (fixed: reached the handler, 401) |
+| Many connections | cap `workers` x 32, at least 64 | `sentry::tests::connections_past_the_cap_are_closed_and_the_slots_come_back` (fixed) |
+| Oversized envelope sent or declared, gzip bomb, truncated or fake gzip | 413 / 400, nothing stored or forwarded | `sentry::tests::oversized_bombed_or_malformed_envelopes_store_and_forward_nothing` (sent: checked, fine; declared: fixed, not answered within 2 s; the rest not run on the old code) |
+| Malformed envelopes: header not JSON or an array, 20 000-deep header, bad item header, `length` past the end or near `u64::MAX`, negative `length`, 1001 items, invalid UTF-8 | 400 | same test (not run on the old code; `malformed_envelopes_are_400_and_not_forwarded` covered two of them before) |
+| Unknown, prefix or other-case key; no key | 401 | `sentry::tests::a_key_is_judged_from_the_head_and_must_arrive_once` (checked, fine) |
+| Two `X-Sentry-Auth` headers; header and query keys that disagree; two `sentry_key` parameters; `X-Sentry-Auth` and `Authorization` that disagree | 401. The same key in two places is accepted | same test (fixed: a good header then a wrong one was 200; the rest read: the first source in a fixed order counted) |
+| No good key with a body: 3 MiB declared and never sent; a bomb with a wrong key | 401 from the head, nothing read or inflated (before, read: the body was read first) | same test |
+| `Content-Encoding` other than gzip (`br`, which `sentry-sdk` for Python uses when `brotli` is installed; `deflate`, `zstd`; stacked) | 415 naming gzip | `sentry::tests::only_gzip_is_decoded_and_other_encodings_are_named_not_misread` (fixed: an uncompressed envelope labelled `br` was accepted; a real brotli body would have been parsed as text and refused as malformed) |
+| DNS rebinding when `allowed_keys` is empty (loopback only) | 403 for a foreign or second `Host` | `sentry::tests::an_open_key_policy_refuses_a_foreign_host_header` (fixed) |
+| `@sentry/node` streams its body: chunked, gzipped past 32 KiB | read | `sentry::tests::the_node_sdk_shape_a_chunked_gzip_stream_is_read`; real SDKs in the evidence file |
+| A web page posting `text/plain` with a key in the query | **accepted by design**: browser SDKs send exactly that so that no preflight is needed, and a DSN key is public. On a loopback proxy with no `allowed_keys` any local page can write envelopes; with `allowed_keys` a page that knows a key can | not a defect; pinned by `the_key_may_arrive_in_the_query_string` |
+
 ## Not defended or not done
 
-1. **OTLP, Splunk HEC and Sentry listeners are still on `tiny_http`** (`otlp/http.rs`, `hec.rs`, `sentry.rs`). They have the
-   defect the S3 and peer listeners had: unbounded header buffering, no read timeout, a thread per connection with no cap,
-   and a body-read that ties up one of a few workers. They are loopback by default and unauthenticated by design; on a
-   public bind they are exposed to any peer that can reach the port. The fix is the same swap as the peer receiver
-   (`BoundedServer::start` with `gzip: true`), but their suites are outside the filter this task ran, so it was not done.
-   Treat as open until it is.
+1. **Residuals of the OTLP, HEC and Sentry listeners** (moved to `bounded_http` on `hard/listeners`):
+   * OTLP has no credential. On a non-loopback bind anyone who can reach the port can write logs, and the `Host` rule is
+     off there (any name is legitimate). The `Content-Type` rule still stops a browser page.
+   * The tokenless HEC rule against browsers rests on browsers sending `Origin` (or `Sec-Fetch-Site`) on a cross-site
+     POST, which current browsers do; a client that strips both is not a browser page and is trusted like any local
+     process.
+   * HEC token comparison is plain string equality, not constant time, and a short HEC token on a public bind is not
+     refused (the peer and admin listeners refuse under 24 characters). Not changed here.
+   * Refusals of the head (431, 408, malformed head 400, transfer-coding 501) come from `bounded_http` as `{"error":...}`
+     JSON, not as an OTLP `Status` or a HEC `{"text","code"}`. A client that parses a fixed error shape gets a foreign one
+     for those; the status code is right.
+   * The 30 s request deadline of these listeners is not exercised by their own tests (it would take 30 s); the
+     mechanism is tested in `bounded_http` at 300 ms, and the listener tests show other clients are served meanwhile.
+   * Every reply is `Connection: close`. Exporters reconnect per batch; the cost was not measured. OTLP partial success
+     (`partialSuccess` in the response) was never implemented and still is not: rejected records are not reported back.
+   * Splunk forwarders, the OpenTelemetry Collector and the OpenTelemetry SDKs were not available; HEC and OTLP were
+     checked with `curl` only (see the evidence file). A real client that sends `Transfer-Encoding` with anything but
+     one `chunked`, or (OTLP) a `Content-Type` other than the two OTLP types, is now refused.
+   * The OTLP gRPC listener has its own HTTP/2 server and was not reviewed.
 2. **No TLS.** Bearer tokens and SigV4 requests cross the network in clear unless a proxy terminates TLS. A passive
    observer gets the token, or a signed request to replay for 15 minutes, and with a weak S3 secret can recover it offline
    (the S3 secret has no minimum length; the peer and admin tokens do, 24 characters, on non-loopback binds).
@@ -174,10 +264,12 @@ otherwise pinned what was there.
 5. **A token holder can write anything**: forge `logless.origin`/`logless.hops` to have records dropped as loops, fill the
    store up to the disk budget, or send a record claiming any service. Tokens are not scoped per sender.
 6. **Slots can be held for the deadline.** An attacker who can open connections can hold all 64 slots of a listener for
-   10 to 30 s each and so deny that listener (not the OTLP listeners). No per-source cap.
+   10 to 30 s each and so deny that listener (since `hard/listeners` this includes OTLP/HTTP, HEC and Sentry). No
+   per-source cap.
 7. **Anonymous loopback mode** (no tokens, no keys) trusts every local process and, for the peer receiver and S3, any web
    page that can name `127.0.0.1` itself. The Host and Content-Type rules close rebinding and blind cross-site writes for
-   ingest; they do not close cross-site writes to the parts endpoints (above).
+   ingest and, since `hard/listeners`, the parts endpoints; the same kind of rules cover OTLP and tokenless HEC. A page
+   can still write to a loopback Sentry proxy (above, by design).
 8. **Secrets at rest are plain text** in the config file and environment. `sync-token` is written 0600 (`sync.rs`, line
    154) but that was read, not tested here. `SyncTarget` derives `Debug` and carries the token; nothing found prints it,
    but a `{:?}` would. It is in `sync.rs`, which was not mine to edit.

@@ -678,3 +678,181 @@ fn routes_are_parsed_from_the_path() {
     assert!(SentryHandler::route("/envelope/").is_none());
     assert!(SentryHandler::route("/api/1/security/").is_none());
 }
+
+// Abuse cases, sent as raw bytes (see `crate::bounded_http::testing`).
+use crate::bounded_http::testing::{self as raw, WAIT};
+
+const ENVELOPE_PATH: &str = "/api/1/envelope/";
+
+fn keyed() -> Harness {
+    Harness::start(SentryConfig {
+        enabled: true,
+        upstream_auth: UpstreamAuth::Relay,
+        upstream_dsn: Some("https://u@sentry.example/9".into()),
+        allowed_keys: vec!["goodkey".into()],
+        max_body_bytes: 64 * 1024,
+        max_decompressed_bytes: 64 * 1024,
+        ..Default::default()
+    })
+}
+
+const GOOD_KEY: (&str, &str) = ("X-Sentry-Auth", "Sentry sentry_version=7, sentry_key=goodkey");
+
+fn addr(h: &Harness) -> std::net::SocketAddr {
+    h.receiver.as_ref().unwrap().local_addr()
+}
+
+#[test]
+fn a_stalled_upload_does_not_stop_the_proxy_answering() {
+    // With a pool of two workers, two SDKs that stop half way through a body held both forever.
+    let h = Harness::relay();
+    let head = format!("POST {ENVELOPE_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Sentry-Auth: {}\r\nContent-Length: 100000\r\n\r\n", AUTH.1);
+    let good = raw::request("POST", ENVELOPE_PATH, &[AUTH], &envelope_bytes(&[("event", AN_ERROR)]));
+    let (status, text) = raw::answer_beside_stalled_uploads(addr(&h), &head, &good);
+    assert_eq!(200, status, "{text}");
+    assert_eq!(1, h.stored.lock().unwrap().len());
+}
+
+#[test]
+fn a_2_mib_header_is_431_and_the_proxy_keeps_serving() {
+    let h = Harness::relay();
+    let a = addr(&h);
+    assert_eq!(431, raw::huge_header_status(a, ENVELOPE_PATH));
+    let many: Vec<(&str, &str)> = (0..200).map(|_| ("X-A", "b")).collect();
+    assert_eq!(431, raw::exchange(a, &raw::request("POST", ENVELOPE_PATH, &many, b""), WAIT).0, "200 headers");
+    let good = raw::request("POST", ENVELOPE_PATH, &[AUTH], &envelope_bytes(&[("event", AN_ERROR)]));
+    assert_eq!(200, raw::exchange(a, &good, WAIT).0);
+}
+
+#[test]
+fn connections_past_the_cap_are_closed_and_the_slots_come_back() {
+    let h = Harness::start(SentryConfig { enabled: true, workers: 1, ..Default::default() });
+    let a = addr(&h);
+    assert_eq!(5, raw::closed_past_the_cap(a, 64, 5), "one worker: a cap of 64");
+    let good = raw::request("POST", ENVELOPE_PATH, &[AUTH], &envelope_bytes(&[("event", AN_ERROR)]));
+    assert_eq!(200, raw::exchange(a, &good, WAIT).0);
+}
+
+#[test]
+fn oversized_bombed_or_malformed_envelopes_store_and_forward_nothing() {
+    let h = keyed();
+    let a = addr(&h);
+    let post = |headers: &[(&str, &str)], body: &[u8]| raw::exchange(a, &raw::request("POST", ENVELOPE_PATH, &[&[GOOD_KEY][..], headers].concat(), body), WAIT);
+    assert_eq!(413, post(&[], &vec![b'x'; 100_000]).0, "sent");
+    let lie = format!("POST {ENVELOPE_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Sentry-Auth: {}\r\nContent-Length: 1099511627776\r\n\r\n", GOOD_KEY.1);
+    let started = std::time::Instant::now();
+    assert_eq!(413, raw::exchange(a, lie.as_bytes(), WAIT).0, "declared 1 TiB");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    let bomb = raw::gzip(&vec![b'\n'; 16 * 1024 * 1024]);
+    assert!(bomb.len() < 64 * 1024);
+    assert_eq!(413, post(&[("Content-Encoding", "gzip")], &bomb).0, "bomb");
+    let packed = raw::gzip(&envelope_bytes(&[("event", AN_ERROR)]));
+    for junk in [&packed[..packed.len() - 4], &b"plain"[..]] {
+        let (status, text) = post(&[("Content-Encoding", "gzip")], junk);
+        assert_eq!(400, status, "{junk:?}: {text}");
+    }
+    let deep = format!("{}{}\n", "[".repeat(20_000), "]".repeat(20_000));
+    for (name, body) in [
+        ("header is not json", b"{event_id\n".to_vec()),
+        ("header is an array", b"[]\n".to_vec()),
+        ("deeply nested header", deep.into_bytes()),
+        ("item header not json", b"{}\n{type:event}\n{}\n".to_vec()),
+        ("length past the end", b"{}\n{\"type\":\"event\",\"length\":500}\n{}\n".to_vec()),
+        ("length near u64::MAX", b"{}\n{\"type\":\"event\",\"length\":18446744073709551615}\n{}\n".to_vec()),
+        ("negative length", b"{}\n{\"type\":\"event\",\"length\":-1}\nnot json at all\n{\n".to_vec()),
+        ("too many items", [b"{}\n".to_vec(), b"{\"type\":\"x\",\"length\":0}\n\n".repeat(1001)].concat()),
+        ("invalid utf-8 header", b"{\"event_id\":\"\xff\"}\n".to_vec()),
+    ] {
+        let (status, text) = post(&[], &body);
+        assert_eq!(400, status, "{name}: {text}");
+    }
+    assert!(h.stored.lock().unwrap().is_empty());
+    h.settle();
+    assert!(h.fake.sent.lock().unwrap().is_empty());
+    assert!(h.stats().accounts_for_everything(), "{:?}", h.stats());
+}
+
+#[test]
+fn a_key_is_judged_from_the_head_and_must_arrive_once() {
+    let h = keyed();
+    let a = addr(&h);
+    let body = envelope_bytes(&[("event", AN_ERROR)]);
+    let q = |query: &str| format!("{ENVELOPE_PATH}?{query}");
+    for (name, path, headers) in [
+        ("none", ENVELOPE_PATH.to_string(), vec![]),
+        ("unknown key", ENVELOPE_PATH.to_string(), vec![("X-Sentry-Auth", "Sentry sentry_key=wrong")]),
+        ("a prefix", ENVELOPE_PATH.to_string(), vec![("X-Sentry-Auth", "Sentry sentry_key=goodke")]),
+        ("other case", ENVELOPE_PATH.to_string(), vec![("X-Sentry-Auth", "Sentry sentry_key=GOODKEY")]),
+        ("two auth headers, the good one first", ENVELOPE_PATH.to_string(), vec![GOOD_KEY, ("X-Sentry-Auth", "Sentry sentry_key=wrong")]),
+        ("header and query disagree", q("sentry_key=wrong"), vec![GOOD_KEY]),
+        ("two query keys", q("sentry_key=goodkey&sentry_key=wrong"), vec![]),
+        ("X-Sentry-Auth and Authorization disagree", ENVELOPE_PATH.to_string(), vec![GOOD_KEY, ("Authorization", "Sentry sentry_key=wrong")]),
+    ] {
+        let (status, text) = raw::exchange(a, &raw::request("POST", &path, &headers, &body), WAIT);
+        assert_eq!(401, status, "{name}: {text}");
+    }
+    // The same key given twice in two places is not ambiguous.
+    let both = raw::request("POST", &q("sentry_key=goodkey&sentry_version=7"), &[GOOD_KEY], &body);
+    assert_eq!(200, raw::exchange(a, &both, WAIT).0);
+    // Without a good key a body is never awaited, inflated or sized.
+    let head = format!("POST {ENVELOPE_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3145728\r\n\r\n");
+    let started = std::time::Instant::now();
+    assert_eq!(401, raw::exchange(a, head.as_bytes(), WAIT).0);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    let bomb = raw::gzip(&vec![b'\n'; 64 * 1024 * 1024]);
+    let req = raw::request("POST", ENVELOPE_PATH, &[("X-Sentry-Auth", "Sentry sentry_key=wrong"), ("Content-Encoding", "gzip")], &bomb);
+    assert_eq!(401, raw::exchange(a, &req, WAIT).0);
+    assert_eq!(1, h.stored.lock().unwrap().len(), "only the good request was stored");
+    assert!(h.stats().accounts_for_everything(), "{:?}", h.stats());
+}
+
+#[test]
+fn only_gzip_is_decoded_and_other_encodings_are_named_not_misread() {
+    // A brotli envelope (sentry-sdk for Python sends br when the brotli module is installed) was parsed as
+    // plain text and refused as malformed, which reads as a bug in the SDK.
+    let h = Harness::relay();
+    let a = addr(&h);
+    let body = envelope_bytes(&[("event", AN_ERROR)]);
+    for encoding in ["br", "deflate", "zstd", "gzip, gzip"] {
+        let (status, text) = raw::exchange(a, &raw::request("POST", ENVELOPE_PATH, &[AUTH, ("Content-Encoding", encoding)], &body), WAIT);
+        assert_eq!(415, status, "{encoding}: {text}");
+        assert!(text.contains("gzip"), "says what is accepted: {text}");
+    }
+    let twice = raw::request("POST", ENVELOPE_PATH, &[AUTH, ("Content-Encoding", "gzip"), ("Content-Encoding", "gzip")], &raw::gzip(&raw::gzip(&body)));
+    assert_eq!(415, raw::exchange(a, &twice, WAIT).0, "stacked encodings");
+    assert!(h.stored.lock().unwrap().is_empty());
+    assert!(h.stats().accounts_for_everything(), "{:?}", h.stats());
+}
+
+#[test]
+fn an_open_key_policy_refuses_a_foreign_host_header() {
+    // With no allowed keys any key is accepted, so on loopback the Host is what is left against DNS rebinding.
+    let h = Harness::relay();
+    let a = addr(&h);
+    let body = envelope_bytes(&[("event", AN_ERROR)]);
+    for host in ["evil.example", "evil.example:9000", "127.0.0.1.nip.io"] {
+        let req = format!("POST {ENVELOPE_PATH}?sentry_key=k HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n", body.len());
+        assert_eq!(403, raw::exchange(a, &[req.as_bytes(), &body].concat(), WAIT).0, "Host {host}");
+    }
+    let two = raw::request("POST", ENVELOPE_PATH, &[AUTH, ("Host", "evil.example")], &body);
+    assert_eq!(403, raw::exchange(a, &two, WAIT).0, "a second Host");
+    assert!(h.stored.lock().unwrap().is_empty());
+    for host in ["localhost:9000", "[::1]:9000"] {
+        let req = format!("POST {ENVELOPE_PATH}?sentry_key=k HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n", body.len());
+        assert_eq!(200, raw::exchange(a, &[req.as_bytes(), &body].concat(), WAIT).0, "Host {host}");
+    }
+}
+
+#[test]
+fn the_node_sdk_shape_a_chunked_gzip_stream_is_read() {
+    // @sentry/node pipes its body (gzipped past 32 KiB), so it arrives with Transfer-Encoding: chunked.
+    let h = Harness::relay();
+    let big = format!(r#"{{"level":"error","message":"{}"}}"#, "m".repeat(40_000));
+    let body = raw::gzip(&envelope_bytes(&[("event", &big)]));
+    let path = "/api/1/envelope/?sentry_key=nodekey&sentry_version=7&sentry_client=sentry.javascript.node%2F8.55.0";
+    let req = raw::chunked("POST", path, &[("Content-Type", "application/x-sentry-envelope"), ("Content-Encoding", "gzip")], &body, 16 * 1024);
+    let (status, text) = raw::exchange(addr(&h), &req, WAIT);
+    assert_eq!(200, status, "{text}");
+    assert!(text.contains(r#"{"id":"9ecf1f2a3b4c4d5e8f90112233445566"}"#), "{text}");
+    assert_eq!(1, h.stored.lock().unwrap().len());
+}

@@ -16,6 +16,11 @@
 //! | `POST /services/collector/ack` | durability poll |
 //! | `GET /services/collector/health` , `/health/1.0` | liveness |
 //!
+//! The listener is [`crate::bounded_http`]. Everything that needs only the head
+//! (token, `Host`, encoding, a repeated header) is judged before the body is
+//! read, so a client without a token is answered without buffering or inflating
+//! a byte of what it sent.
+//!
 //! Not implemented: index routing (we have level buckets, not indexes, and
 //! silently accepting an `index` we cannot honour is better than refusing the
 //! data, so it is kept as an attribute), and `/services/collector/raw` with
@@ -28,6 +33,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::bounded_http::{self, BoundedServer};
 use crate::httpd::{self, Handler, Incoming, Limits, Method, Reject, Reply};
 use crate::model::LogRecord;
 
@@ -45,6 +51,7 @@ mod code {
     pub const INVALID_DATA_FORMAT: u32 = 6;
     pub const SERVER_BUSY: u32 = 9;
     pub const DATA_CHANNEL_MISSING: u32 = 10;
+    pub const INVALID_DATA_CHANNEL: u32 = 11;
     pub const EVENT_FIELD_REQUIRED: u32 = 12;
     pub const EVENT_FIELD_BLANK: u32 = 13;
     pub const ACK_DISABLED: u32 = 14;
@@ -60,6 +67,8 @@ pub struct HecConfig {
     /// Splunk's HEC port, so an existing client only changes hostname.
     #[serde(default = "default_hec_addr")]
     pub addr: String,
+    /// Sizes the listener: `workers` x 32 connections at once (at least 64),
+    /// each on its own thread.
     #[serde(default = "default_hec_workers")]
     pub workers: usize,
     /// Accepted tokens. **Empty means every token is accepted** — usable for a
@@ -198,19 +207,30 @@ impl HecHandler {
         if self.config.tokens.is_empty() {
             return Ok(());
         }
+        // A token given twice is ambiguous (a proxy may act on the other one),
+        // so neither counts.
+        if request.header_count("authorization") > 1 {
+            self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+            return Err(reply(401, code::INVALID_AUTHORIZATION, "Invalid authorization"));
+        }
         let header = request.header("authorization").unwrap_or("").trim();
         if header.is_empty() {
             // Splunk also accepts the token as a query parameter for clients
             // that cannot set headers.
-            let from_query = event::query_pairs(request.query)
+            let from_query: Vec<String> = event::query_pairs(request.query)
                 .into_iter()
-                .find(|(k, _)| k == "token")
-                .map(|(_, v)| v);
-            return match from_query {
-                Some(token) => self.check_token(&token),
-                None => {
+                .filter(|(k, _)| k == "token")
+                .map(|(_, v)| v)
+                .collect();
+            return match from_query.as_slice() {
+                [token] => self.check_token(token),
+                [] => {
                     self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
                     Err(reply(401, code::TOKEN_REQUIRED, "Token is required"))
+                }
+                _ => {
+                    self.stats.unauthorized.fetch_add(1, Ordering::Relaxed);
+                    Err(reply(401, code::INVALID_AUTHORIZATION, "Invalid authorization"))
                 }
             };
         }
@@ -377,6 +397,44 @@ impl Handler for HecHandler {
         }
     }
 
+    /// Refusals that need only the head, answered before the body is read. A
+    /// refused event request is counted as one; a refused ack poll is not, as
+    /// ack polls never are.
+    fn preflight(&self, head: &Incoming) -> Option<Reply> {
+        let ingest = match (head.method, head.path) {
+            (Method::Post, "/services/collector/ack") => false,
+            (
+                Method::Post,
+                "/services/collector" | "/services/collector/event" | "/services/collector/event/1.0" | "/services/collector/raw",
+            ) => true,
+            _ => return None,
+        };
+        // Without tokens the listener is loopback only (see `Receiver::start`),
+        // and what is left between it and a web page in a local browser is the
+        // page's own marks: an `Origin` or `Sec-Fetch-Site` on a cross-site
+        // POST, or its own name in `Host` after DNS rebinding. No HEC client
+        // sends either of the first two.
+        let browser = head.header("origin").is_some() || head.header("sec-fetch-site").is_some();
+        let (refused, counter) = if self.config.tokens.is_empty() && (browser || !bounded_http::loopback_host(head)) {
+            (reply(403, code::INVALID_AUTHORIZATION, "Forbidden"), Some(&self.stats.unauthorized))
+        } else if let Err(denied) = self.authorized(head) {
+            (denied, None)
+        } else if head.header_count("x-splunk-request-channel") > 1 {
+            (reply(400, code::INVALID_DATA_CHANNEL, "Invalid data channel"), Some(&self.stats.bad_request))
+        } else if !bounded_http::encoding_accepted(head) {
+            (reply(415, code::INVALID_DATA_FORMAT, "Content-Encoding must be gzip or absent"), Some(&self.stats.bad_request))
+        } else {
+            return None;
+        };
+        if ingest {
+            self.stats.requests.fetch_add(1, Ordering::Relaxed);
+            if let Some(counter) = counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Some(refused)
+    }
+
     fn reject(&self, reason: Reject) -> Reply {
         self.stats.requests.fetch_add(1, Ordering::Relaxed);
         match reason {
@@ -393,7 +451,7 @@ impl Handler for HecHandler {
 }
 
 pub struct Receiver {
-    server: httpd::Server,
+    server: BoundedServer,
     stats: Arc<HecStats>,
 }
 
@@ -419,14 +477,14 @@ impl Receiver {
             acks,
             sink: Box::new(sink),
         });
-        let server = httpd::Server::start(
+        let server = BoundedServer::start(
             &config.addr,
-            config.workers,
             "hec",
             Limits {
                 max_body_bytes: config.max_body_bytes,
                 max_decompressed_bytes: config.max_decompressed_bytes,
             },
+            bounded_http::ingest_limits(config.workers),
             handler,
         )?;
         Ok(Self { server, stats })
@@ -764,6 +822,187 @@ mod tests {
         let h = Harness::plain();
         assert_eq!(post(&h.url("/services/collector/nope"), "{}", &[AUTH]).0, 404);
         assert_eq!(h.stats().requests, 0);
+    }
+
+    // Abuse cases, sent as raw bytes (see `crate::bounded_http::testing`).
+    use crate::bounded_http::testing::{self as raw, WAIT};
+
+    const RAW_AUTH: (&str, &str) = ("Authorization", "Splunk secret");
+
+    fn event(headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        raw::request("POST", "/services/collector/event", headers, body)
+    }
+
+    #[test]
+    fn a_stalled_upload_does_not_stop_the_receiver_answering() {
+        // With a pool of two workers, two forwarders that stop half way through a body held both forever.
+        let h = Harness::plain();
+        let head = "POST /services/collector HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Splunk secret\r\nContent-Length: 100000\r\n\r\n";
+        let a = h.receiver.as_ref().unwrap().local_addr();
+        let (status, text) = raw::answer_beside_stalled_uploads(a, head, &event(&[RAW_AUTH], br#"{"event":"served"}"#));
+        assert_eq!(200, status, "{text}");
+        assert_eq!(1, h.seen.lock().unwrap().len());
+    }
+
+    #[test]
+    fn a_2_mib_header_is_431_and_the_receiver_keeps_serving() {
+        let h = Harness::plain();
+        let a = h.receiver.as_ref().unwrap().local_addr();
+        assert_eq!(431, raw::huge_header_status(a, "/services/collector"));
+        let many: Vec<(&str, &str)> = (0..200).map(|_| ("X-A", "b")).collect();
+        assert_eq!(431, raw::exchange(a, &event(&many, b""), WAIT).0, "200 headers");
+        assert_eq!(200, raw::exchange(a, &event(&[RAW_AUTH], br#"{"event":"after"}"#), WAIT).0);
+        assert_eq!(1, h.seen.lock().unwrap().len());
+    }
+
+    #[test]
+    fn connections_past_the_cap_are_closed_and_the_slots_come_back() {
+        let h = Harness::start(
+            HecConfig { addr: "127.0.0.1:0".into(), workers: 1, tokens: vec!["secret".into()], ..Default::default() },
+            true,
+        );
+        let a = h.receiver.as_ref().unwrap().local_addr();
+        assert_eq!(5, raw::closed_past_the_cap(a, 64, 5), "one worker: a cap of 64");
+        assert_eq!(200, raw::exchange(a, &event(&[RAW_AUTH], br#"{"event":"after"}"#), WAIT).0);
+    }
+
+    #[test]
+    fn oversized_bombed_or_damaged_bodies_are_refused_with_their_splunk_codes() {
+        let h = Harness::start(
+            HecConfig {
+                addr: "127.0.0.1:0".into(),
+                tokens: vec!["secret".into()],
+                max_body_bytes: 64 * 1024,
+                max_decompressed_bytes: 64 * 1024,
+                ..Default::default()
+            },
+            true,
+        );
+        let a = h.receiver.as_ref().unwrap().local_addr();
+        let (status, text) = raw::exchange(a, &event(&[RAW_AUTH], &vec![b' '; 100_000]), WAIT);
+        assert_eq!(413, status, "{text}");
+        assert!(text.contains(r#""code":6"#), "{text}");
+        let lie = "POST /services/collector HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Splunk secret\r\nContent-Length: 1099511627776\r\n\r\n";
+        let started = std::time::Instant::now();
+        assert_eq!(413, raw::exchange(a, lie.as_bytes(), WAIT).0, "declared 1 TiB");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let bomb = raw::gzip(&vec![b' '; 16 * 1024 * 1024]);
+        assert!(bomb.len() < 64 * 1024);
+        assert_eq!(413, raw::exchange(a, &event(&[RAW_AUTH, ("Content-Encoding", "gzip")], &bomb), WAIT).0, "bomb");
+        let packed = raw::gzip(br#"{"event":"x"}"#);
+        for junk in [&packed[..packed.len() - 4], &b"plain"[..]] {
+            let (status, text) = raw::exchange(a, &event(&[RAW_AUTH, ("Content-Encoding", "gzip")], junk), WAIT);
+            assert_eq!(400, status, "{junk:?}: {text}");
+            assert!(text.contains(r#""code":6"#), "{text}");
+        }
+        let deep = format!("{{\"event\":{}{}}}", "[".repeat(20_000), "]".repeat(20_000));
+        for (name, body) in [
+            ("truncated", &br#"{"event":"x"}{"event":"#[..]),
+            ("nul", b"{\"event\":\0}"),
+            ("invalid utf-8", b"{\"event\":\"\xff\xfe\"}"),
+            ("an array", b"[{\"event\":\"x\"}]"),
+            ("deep nesting", deep.as_bytes()),
+        ] {
+            let (status, text) = raw::exchange(a, &event(&[RAW_AUTH], body), WAIT);
+            assert_eq!(400, status, "{name}: {text}");
+            assert!(text.contains(r#""code":6"#), "{name}: {text}");
+        }
+        assert!(h.seen.lock().unwrap().is_empty(), "no partial batch was kept");
+        assert!(h.stats().accounts_for_everything(), "{:?}", h.stats());
+    }
+
+    #[test]
+    fn a_token_is_judged_from_the_head_and_must_arrive_once() {
+        let h = Harness::plain();
+        let a = h.receiver.as_ref().unwrap().local_addr();
+        let body = br#"{"event":"x"}"#;
+        for (name, headers, path, want, code) in [
+            ("none", vec![], "/services/collector", 401, 2),
+            ("empty", vec![("Authorization", "Splunk ")], "/services/collector", 401, 3),
+            ("wrong", vec![("Authorization", "Splunk wrong")], "/services/collector", 403, 4),
+            ("a prefix", vec![("Authorization", "Splunk secre")], "/services/collector", 403, 4),
+            ("plus a suffix", vec![("Authorization", "Splunk secret!")], "/services/collector", 403, 4),
+            ("other case", vec![("Authorization", "Splunk SECRET")], "/services/collector", 403, 4),
+            ("bearer", vec![("Authorization", "Bearer secret")], "/services/collector", 401, 3),
+            ("two headers, the good one first", vec![RAW_AUTH, ("Authorization", "Splunk wrong")], "/services/collector", 401, 3),
+            ("two good headers", vec![RAW_AUTH, RAW_AUTH], "/services/collector", 401, 3),
+            ("wrong header beats a good query token", vec![("Authorization", "Splunk wrong")], "/services/collector?token=secret", 403, 4),
+            ("wrong query token", vec![], "/services/collector?token=wrong", 403, 4),
+            ("two query tokens", vec![], "/services/collector?token=secret&token=wrong", 401, 3),
+        ] {
+            let (status, text) = raw::exchange(a, &raw::request("POST", path, &headers, body), WAIT);
+            assert_eq!(want, status, "{name}: {text}");
+            assert!(text.contains(&format!(r#""code":{code}"#)), "{name}: {text}");
+        }
+        // Without a token a body is never awaited: 3 MiB declared, none sent.
+        let head = "POST /services/collector HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3145728\r\n\r\n";
+        let started = std::time::Instant::now();
+        assert_eq!(401, raw::exchange(a, head.as_bytes(), WAIT).0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        // Nor inflated, nor sized: a bomb with a wrong token learns nothing about the limits.
+        let bomb = raw::gzip(&vec![b' '; 64 * 1024 * 1024]);
+        assert_eq!(403, raw::exchange(a, &event(&[("Authorization", "Splunk wrong"), ("Content-Encoding", "gzip")], &bomb), WAIT).0);
+        assert!(h.seen.lock().unwrap().is_empty());
+        assert!(h.stats().accounts_for_everything(), "{:?}", h.stats());
+    }
+
+    #[test]
+    fn only_gzip_is_decoded_and_stacked_headers_are_refused() {
+        let h = Harness::with_ack();
+        let a = h.receiver.as_ref().unwrap().local_addr();
+        // A brotli body on the raw endpoint was stored as text.
+        for encoding in ["br", "deflate", "zstd", "gzip, gzip"] {
+            let req = raw::request("POST", "/services/collector/raw", &[RAW_AUTH, ("Content-Encoding", encoding)], b"line one\n");
+            let (status, text) = raw::exchange(a, &req, WAIT);
+            assert_eq!(415, status, "{encoding}: {text}");
+        }
+        let twice = event(&[RAW_AUTH, ("Content-Encoding", "gzip"), ("Content-Encoding", "gzip")], &raw::gzip(&raw::gzip(br#"{"event":"x"}"#)));
+        assert_eq!(415, raw::exchange(a, &twice, WAIT).0, "stacked encodings");
+        // Two channels: which one owns the ack id is ambiguous.
+        let two = event(&[RAW_AUTH, ("X-Splunk-Request-Channel", "a"), ("X-Splunk-Request-Channel", "b")], br#"{"event":"x"}"#);
+        let (status, text) = raw::exchange(a, &two, WAIT);
+        assert_eq!(400, status, "{text}");
+        assert!(text.contains(r#""code":11"#), "{text}");
+        assert!(h.seen.lock().unwrap().is_empty());
+        assert!(h.stats().accounts_for_everything(), "{:?}", h.stats());
+    }
+
+    #[test]
+    fn a_tokenless_receiver_refuses_web_pages_and_foreign_host_names() {
+        // No token means loopback only, and a page in the user's browser can still reach loopback: by a
+        // cross-site POST (it carries an Origin) or by DNS rebinding (it carries the page's own Host).
+        let h = Harness::start(HecConfig { addr: "127.0.0.1:0".into(), ..Default::default() }, true);
+        let a = h.receiver.as_ref().unwrap().local_addr();
+        let body = br#"{"event":"x"}"#;
+        for (name, headers) in [
+            ("a cross-site page", vec![("Origin", "https://evil.example"), ("Content-Type", "text/plain")]),
+            ("an opaque origin", vec![("Origin", "null")]),
+            ("a page on localhost", vec![("Origin", "http://localhost:3000")]),
+            ("a fetch the browser labels cross-site", vec![("Sec-Fetch-Site", "cross-site")]),
+            ("a second Host", vec![("Host", "evil.example")]),
+        ] {
+            let (status, text) = raw::exchange(a, &event(&headers, body), WAIT);
+            assert_eq!(403, status, "{name}: {text}");
+        }
+        for host in ["evil.example", "evil.example:8088", "127.0.0.1.nip.io"] {
+            let req = format!("POST /services/collector HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n", body.len());
+            assert_eq!(403, raw::exchange(a, &[req.as_bytes(), body].concat(), WAIT).0, "Host {host}");
+        }
+        assert!(h.seen.lock().unwrap().is_empty());
+        assert_eq!(200, raw::exchange(a, &event(&[], body), WAIT).0);
+    }
+
+    #[test]
+    fn a_chunked_upload_gets_its_ack_id() {
+        let h = Harness::with_ack();
+        let a = h.receiver.as_ref().unwrap().local_addr();
+        let req = raw::chunked("POST", "/services/collector?channel=c1", &[RAW_AUTH], br#"{"event":"one"}{"event":"two"}"#, 5);
+        let (status, text) = raw::exchange(a, &req, WAIT);
+        assert_eq!(200, status, "{text}");
+        assert!(text.ends_with(r#"{"text":"Success","code":0,"ackId":0}"#), "{text}");
+        assert_eq!(2, h.seen.lock().unwrap().len());
+        let poll = raw::request("POST", "/services/collector/ack?channel=c1", &[RAW_AUTH], br#"{"acks":[0]}"#);
+        assert!(raw::exchange(a, &poll, WAIT).1.ends_with(r#"{"acks":{"0":false}}"#));
     }
 
     #[test]
