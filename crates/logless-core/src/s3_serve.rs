@@ -2290,7 +2290,7 @@ mod tests {
         let f = secured_fixture();
         let creds = Credentials { access_key: "AK".into(), secret_key: "SK".into() };
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let url = s3_sigv4::presign(&creds, "GET", &f.addr.to_string(), &obj(K_INFO_A), "us-east-1", now, 300);
+        let url = s3_sigv4::presign(&creds, "GET", &f.addr.to_string(), &obj(K_INFO_A), "us-east-1", now, 300, &[]);
         let r = f.get(&url);
         assert_eq!(403, r.status, "query-string auth is for part upload on the central, not for this server");
         // Credentials in the query beside a header-less request, in the other common spellings.
