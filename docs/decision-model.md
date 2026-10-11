@@ -29,6 +29,21 @@ checkpoint (421M parameters, CPU, about 200 ms per call, 2026-10-11, hand-writte
 | Triage a cluster (60 clusters, 5 classes) | 52% (chance 20%); answers "bug" for 38 of 60 whatever the option order. Actionable-vs-noise AUC 0.59, a plain level >= error rule 0.81. |
 | Page / show / ignore an anomaly (37 signals) | 19% (majority class 43%), AUC 0.49. |
 
+The `typed-decisions` checkpoint (same size, trained on invoice, security-incident, customer-service and agent-trace
+workflows) and 70 further items written without reading the first set did not change the verdicts (full tables:
+`~/tmp/laya-eval/RESULTS-typed.md`):
+
+| Job | Base | typed-decisions |
+|---|---|---|
+| Triage, 5 classes (orig / new items) | 0.52 / 0.53 | 0.53 / 0.57 (keyword rules 0.78 on orig); answers "bug" for most items; moves up to 19 points with option order |
+| Gating, 3-way (orig / new) | 0.19 / 0.37 | 0.30 / 0.40; almost never says "ignore" (recall 0.00 to 0.10), so a veto only fires where it is wrong |
+| Same failure, 50 pairs | acc 0.74, AUC 0.82 | acc 0.80, AUC 0.85; probabilities compressed (max 0.73), 10 of 11 right at 0.6 |
+
+Only the noise-versus-rest ranking improved (AUC 0.88 to 0.98 against 0.67 to 0.81 for a level rule), which is a sort key, not
+a decision. What it would take to build triage or gating: a few hundred author-independent labelled clusters from real logs,
+a fine-tune or temperature fit on them, and a clear (10 point) win over keyword and level rules on held-out labels, stable
+across option order. For gating, also deploy and load-test calendar context the signal text does not carry.
+
 So the boost is gated by plain context instead (`sync_signals`: a template flood that is all info or debug is noted, not
 boosted). Retest triage and gating after fine-tuning on labelled real clusters, or with the typed-decisions checkpoint
 (not tried). Harness: `~/tmp/laya-eval/run`.
