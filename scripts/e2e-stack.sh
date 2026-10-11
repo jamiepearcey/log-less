@@ -25,6 +25,7 @@ SYNC_TIMEOUT="${SYNC_TIMEOUT:-90}"
 KEEP="${KEEP:-0}"
 BUCKET="logless-parts"
 PREFIX="edges"
+NODE="edge-1"   # the edge's node id: its parts live under $PREFIX/$NODE/
 
 for tool in "$LOGLESS_BIN" "$MINIO_BIN" "$MC_BIN" "$DUCKDB_BIN" curl python3 openssl sqlite3 shasum; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing: $tool" >&2; exit 2; }
@@ -149,18 +150,20 @@ log "minio on $MINIO_PORT, bucket $BUCKET"
 
 # --- central -----------------------------------------------------------------------------------------------------
 PEER_PORT=$(free_port); CENTRAL_ADMIN=$(free_port)
-PEER_TOKEN="$(rand 24)"; CENTRAL_TOKEN="$(rand 24)"
+PEER_TOKEN="$(rand 24)"; CENTRAL_TOKEN="$(rand 24)"   # PEER_TOKEN is the edge node's token
 mkdir -p "$R/central"; : > "$R/central/empty.log"
 render_config "$R/central/data" "
 peer|enabled|true
 peer|addr|\"127.0.0.1:$PEER_PORT\"
-peer|tokens|[\"$PEER_TOKEN\"]
+peer|nodes|[{ id = \"$NODE\", token = \"$PEER_TOKEN\" }]
 peer.parts|enabled|true
 peer.parts|endpoint|\"http://127.0.0.1:$MINIO_PORT\"
 peer.parts|bucket|\"$BUCKET\"
 peer.parts|prefix|\"$PREFIX\"
 peer.parts|access_key_id|\"$MINIO_USER\"
 peer.parts|secret_access_key|\"$MINIO_SECRET\"
+peer.parts|warm_retention_secs|2
+peer.parts|cold_retention_secs|2
 admin|enabled|true
 admin|addr|\"127.0.0.1:$CENTRAL_ADMIN\"
 admin|token|\"$CENTRAL_TOKEN\"
@@ -304,11 +307,11 @@ check "parts job done" "$( [ "$pstate" = done ] && [ "$uploaded" -ge 1 ] && [ "$
   "state=$pstate files_total=$ptotal uploaded=$uploaded rejected=$prej error=$perr (edge files=$files)"
 
 # Every object in MinIO is named by its content: sha256(object) == name, and the set matches central's catalog.
-objects=$("$MC_BIN" --config-dir "$R/mc" ls --json "e2e/$BUCKET/$PREFIX/" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort)
+objects=$("$MC_BIN" --config-dir "$R/mc" ls --json "e2e/$BUCKET/$PREFIX/$NODE/" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort)
 n_obj=0; bad_obj=0
 for o in $objects; do
   n_obj=$(( n_obj + 1 ))
-  h=$("$MC_BIN" --config-dir "$R/mc" cat "e2e/$BUCKET/$PREFIX/$o" | shasum -a 256 | cut -d' ' -f1)
+  h=$("$MC_BIN" --config-dir "$R/mc" cat "e2e/$BUCKET/$PREFIX/$NODE/$o" | shasum -a 256 | cut -d' ' -f1)
   [ "$h.parquet" = "$o" ] || { bad_obj=$(( bad_obj + 1 )); log "MISMATCH $o sha256=$h"; }
 done
 check "minio parts match their sha256" "$( [ "$n_obj" -ge 1 ] && [ "$n_obj" = "$uploaded" ] && [ "$bad_obj" = 0 ] && echo 1 || echo 0)" \
@@ -318,6 +321,41 @@ missing_on_edge=$(comm -23 <(echo "$objects") <(echo "$edge_hashes") | grep -c .
 check "each part is an edge file" "$(eq "$missing_on_edge" 0)" "objects with no edge file of that sha256: $missing_on_edge"
 catalog=$(sqlite3 "$R/central/data/catalog.sqlite" "select name from peer_parts order by name" 2>/dev/null)
 check "central catalog lists the parts" "$(eq "$catalog" "$objects")" "peer_parts rows=$(echo "$catalog" | grep -c .)"
+
+# --- tiers, node-owned prefix, listing, retention --------------------------------------------------------------
+peerpost() { # path, body, [token]  -> "<http status> <body>"
+  curl -s --max-time 10 -w ' %{http_code}' -X POST -H "Authorization: Bearer ${3:-$PEER_TOKEN}" -H 'Content-Type: application/json' -d "$2" "http://127.0.0.1:$PEER_PORT$1"
+}
+all_keys() { "$MC_BIN" --config-dir "$R/mc" ls --recursive --json "e2e/$BUCKET/" | python3 -c 'import sys, json; [print(json.loads(l)["key"]) for l in sys.stdin if l.strip()]' | sort; }
+first=$(echo "$objects" | head -1)
+sz=$("$MC_BIN" --config-dir "$R/mc" stat --json "e2e/$BUCKET/$PREFIX/$NODE/$first" | jq_py 'v["size"]')
+pre_foreign=$(peerpost /v1/parts/presign "{\"name\":\"$first\",\"size\":$sz,\"sha256\":\"${first%.parquet}\",\"node\":\"edge-2\"}")
+pre_trav=$(peerpost /v1/parts/presign "{\"name\":\"../edge-2/$first\",\"size\":$sz,\"sha256\":\"${first%.parquet}\"}")
+com_foreign=$(peerpost /v1/parts/commit "{\"name\":\"$first\",\"size\":$sz,\"sha256\":\"${first%.parquet}\",\"rows\":1,\"min_unix_nano\":1,\"max_unix_nano\":2,\"origin\":\"x\",\"node\":\"edge-2\"}")
+keys_outside=$(all_keys | grep -vc "^$PREFIX/$NODE/" || true)
+check "foreign prefix and traversal refused; nothing outside own prefix" \
+  "$( [[ "$pre_foreign" == *' 403' && "$pre_trav" == *' 422' && "$com_foreign" == *' 403' && "$keys_outside" = 0 ]] && echo 1 || echo 0)" \
+  "foreign presign=${pre_foreign##* } traversal presign=${pre_trav##* } foreign commit=${com_foreign##* } objects outside $PREFIX/$NODE/=$keys_outside"
+listing=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" GET "/admin/v1/parts?node=$NODE&tier=warm&limit=1000")
+n_list=$(echo "$listing" | jq_py 'v["count"]')
+n_other=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" GET "/admin/v1/parts?node=edge-2" | jq_py 'v["count"]')
+check "catalog listing by node and tier" "$( [ "$n_list" = "$uploaded" ] && [ "$n_other" = 0 ] && echo 1 || echo 0)" \
+  "warm parts of $NODE=$n_list (uploaded=$uploaded) parts of edge-2=$n_other"
+ret=$(peerpost /v1/parts/retire "{\"name\":\"$first\"}")
+ret_again=$(peerpost /v1/parts/retire "{\"name\":\"$first\"}")
+n_cold=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" GET "/admin/v1/parts?tier=cold" | jq_py 'v["count"]')
+check "node retires its own part to cold" "$( [[ "$ret" == *' 200' && "$ret_again" == *' 404' && "$n_cold" = 1 ]] && echo 1 || echo 0)" \
+  "retire=${ret##* } repeat=${ret_again##* } cold parts=$n_cold"
+sleep 3   # retention is 2 s in this stack; every part's newest data is now older than that
+dry=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" POST /admin/v1/parts/sweep '{"dry_run":true}' | jq_py 'v["would_delete"]')
+after_dry=$(all_keys | grep -c . || true)
+swept=$(admin "$CENTRAL_ADMIN" "$CENTRAL_TOKEN" POST /admin/v1/parts/sweep '{"dry_run":false}' | jq_py '"%d %d" % (v["deleted"], v["failed"])')
+after_sweep=$(all_keys | grep -c . || true)
+cat_left=$(sqlite3 "$R/central/data/catalog.sqlite" "select count(*) from peer_parts")
+audit_exp=$(sqlite3 "$R/central/data/catalog.sqlite" "select count(*) from peer_parts_audit where action='expire' and outcome='deleted'")
+check "retention sweep deletes expired catalogued parts and audits them" \
+  "$( [ "$dry" = "$uploaded" ] && [ "$after_dry" = "$uploaded" ] && [ "$swept" = "$uploaded 0" ] && [ "$after_sweep" = 0 ] && [ "$cat_left" = 0 ] && [ "$audit_exp" = "$uploaded" ] && echo 1 || echo 0)" \
+  "dry-run would_delete=$dry objects after dry run=$after_dry sweep deleted/failed='$swept' objects after=$after_sweep catalog rows=$cat_left expire audit rows=$audit_exp"
 
 # --- peer counters (live, before shutdown) -----------------------------------------------------------------------
 edge_sync=$(admin "$EDGE_ADMIN" "$EDGE_TOKEN" GET /admin/v1/sync)

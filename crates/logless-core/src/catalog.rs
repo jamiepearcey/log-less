@@ -62,6 +62,48 @@ pub struct Catalog {
     conn: Connection,
 }
 
+/// One catalogued part (`peer_parts`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PeerPartRow {
+    pub node: String,
+    pub name: String,
+    pub size: u64,
+    pub rows: u64,
+    pub min_unix_nano: u64,
+    pub max_unix_nano: u64,
+    pub origin: String,
+    pub committed_ms: u64,
+    /// `warm` or `cold`.
+    pub tier: String,
+    pub tier_ms: u64,
+}
+
+/// What [`Catalog::list_peer_parts`] selects. `None` matches everything.
+#[derive(Debug, Clone, Default)]
+pub struct PartsFilter {
+    pub node: Option<String>,
+    pub tier: Option<String>,
+    pub from_nano: Option<u64>,
+    pub to_nano: Option<u64>,
+    /// Only parts whose newest data is older than this (the retention test).
+    pub newest_before_nano: Option<u64>,
+    pub limit: usize,
+}
+
+/// One change central made to a part after its commit (`peer_parts_audit`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PartsAuditRow {
+    pub id: u64,
+    pub at_ms: u64,
+    pub action: String,
+    pub node: String,
+    pub name: String,
+    pub tier: String,
+    pub size: u64,
+    pub outcome: String,
+    pub detail: String,
+}
+
 /// Reads `hour=…/level=…` back out of a path. The catalog is derived state, so
 /// the path is the authority here, not the other way round.
 fn partition_from_path(path: &Path) -> (u64, String) {
@@ -94,6 +136,17 @@ impl Catalog {
     fn init(conn: Connection) -> Result<Self, CatalogError> {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // `peer_parts` once keyed a part by name alone, under a flat prefix. Parts now belong to a node and
+        // live under its prefix, so those rows name objects nobody can reach by their new keys: keep them
+        // aside under another name and start the catalog afresh.
+        let flat: bool = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('peer_parts')", [], |r| r.get::<_, i64>(0))
+            .map(|columns| columns > 0)
+            .unwrap_or(false)
+            && conn.query_row("SELECT COUNT(*) FROM pragma_table_info('peer_parts') WHERE name = 'node'", [], |r| r.get::<_, i64>(0))? == 0;
+        if flat {
+            conn.execute_batch("ALTER TABLE peer_parts RENAME TO peer_parts_flat_legacy")?;
+        }
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS files (
@@ -167,17 +220,41 @@ impl Catalog {
             );
 
             -- Parquet parts edges uploaded to object storage (`crate::parts`),
-            -- central side. Named by content hash, so a row is never updated.
-            -- Not recoverable from the local store; the bucket listing is its
-            -- source of truth.
+            -- central side. A part belongs to the node whose token committed it
+            -- and lives at `<prefix>/<node>/<name>`. Named by content hash, so
+            -- only `tier` ever changes: 'warm' (uploaded; the node may still
+            -- hold its local copy) or 'cold' (the node dropped its copy; the
+            -- object is the only one). 'hot' is a node's local file that was
+            -- never uploaded, so it has no row. Not recoverable from the local
+            -- store; the bucket listing is its source of truth.
             CREATE TABLE IF NOT EXISTS peer_parts (
-                name          TEXT PRIMARY KEY,
+                node          TEXT NOT NULL,
+                name          TEXT NOT NULL,
                 size          INTEGER NOT NULL,
                 rows          INTEGER NOT NULL,
                 min_observed  INTEGER NOT NULL,
                 max_observed  INTEGER NOT NULL,
                 origin        TEXT    NOT NULL,
-                committed_ms  INTEGER NOT NULL
+                committed_ms  INTEGER NOT NULL,
+                tier          TEXT    NOT NULL DEFAULT 'warm' CHECK (tier IN ('warm', 'cold')),
+                tier_ms       INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (node, name)
+            );
+            CREATE INDEX IF NOT EXISTS peer_parts_by_time ON peer_parts (max_observed, min_observed);
+
+            -- Every change central makes to a part after it was committed:
+            -- a tier move or an expiry (with the object delete's outcome).
+            -- Append-only; a row outlives the part it describes.
+            CREATE TABLE IF NOT EXISTS peer_parts_audit (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                at_ms   INTEGER NOT NULL,
+                action  TEXT    NOT NULL,
+                node    TEXT    NOT NULL,
+                name    TEXT    NOT NULL,
+                tier    TEXT    NOT NULL,
+                size    INTEGER NOT NULL,
+                outcome TEXT    NOT NULL,
+                detail  TEXT    NOT NULL
             );
             "#,
         )?;
@@ -352,16 +429,101 @@ impl Catalog {
             .collect())
     }
 
-    /// Records a part an edge uploaded. Returns false when the name was already recorded: a repeated
+    /// Records a part `node` uploaded. Returns false when that node already committed the name: a repeated
     /// commit is a no-op. Waits briefly for the writer, which shares this file.
-    pub fn record_peer_part(&self, part: &crate::parts::CommittedPart, committed_ms: u64) -> Result<bool, CatalogError> {
+    pub fn record_peer_part(&self, node: &str, part: &crate::parts::CommittedPart, committed_ms: u64) -> Result<bool, CatalogError> {
         self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let n = self.conn.execute(
-            "INSERT OR IGNORE INTO peer_parts (name, size, rows, min_observed, max_observed, origin, committed_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![part.name, part.size as i64, part.rows as i64, part.min_unix_nano as i64, part.max_unix_nano as i64, part.origin, committed_ms as i64],
+            "INSERT OR IGNORE INTO peer_parts (node, name, size, rows, min_observed, max_observed, origin, committed_ms, tier, tier_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'warm', ?8)",
+            params![node, part.name, part.size as i64, part.rows as i64, part.min_unix_nano as i64, part.max_unix_nano as i64, part.origin, committed_ms as i64],
         )?;
         Ok(n > 0)
+    }
+
+    /// Moves one of `node`'s warm parts to cold (the node no longer holds its local copy) and audits it.
+    /// Returns false when the node has no such part or it is cold already.
+    pub fn mark_peer_part_cold(&mut self, node: &str, name: &str, at_ms: u64) -> Result<bool, CatalogError> {
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let tx = self.conn.transaction()?;
+        let size: Option<i64> = tx
+            .query_row("SELECT size FROM peer_parts WHERE node = ?1 AND name = ?2 AND tier = 'warm'", params![node, name], |r| r.get(0))
+            .optional()?;
+        let Some(size) = size else { return Ok(false) };
+        tx.execute("UPDATE peer_parts SET tier = 'cold', tier_ms = ?3 WHERE node = ?1 AND name = ?2", params![node, name, at_ms as i64])?;
+        tx.execute(
+            "INSERT INTO peer_parts_audit (at_ms, action, node, name, tier, size, outcome, detail) VALUES (?1, 'tier', ?2, ?3, 'cold', ?4, 'ok', 'warm to cold: the node dropped its local copy')",
+            params![at_ms as i64, node, name, size],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Catalogued parts, oldest data first. A part matches a time range when its observed-time span overlaps it.
+    pub fn list_peer_parts(&self, filter: &PartsFilter) -> Result<Vec<PeerPartRow>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node, name, size, rows, min_observed, max_observed, origin, committed_ms, tier, tier_ms FROM peer_parts
+             WHERE (?1 IS NULL OR node = ?1) AND (?2 IS NULL OR tier = ?2)
+               AND (?3 IS NULL OR max_observed >= ?3) AND (?4 IS NULL OR min_observed <= ?4)
+               AND (?6 IS NULL OR max_observed < ?6)
+             ORDER BY max_observed, node, name LIMIT ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![filter.node, filter.tier, filter.from_nano.map(|v| v as i64), filter.to_nano.map(|v| v as i64), filter.limit as i64, filter.newest_before_nano.map(|v| v as i64)],
+            |r| {
+                Ok(PeerPartRow {
+                    node: r.get(0)?,
+                    name: r.get(1)?,
+                    size: r.get::<_, i64>(2)? as u64,
+                    rows: r.get::<_, i64>(3)? as u64,
+                    min_unix_nano: r.get::<_, i64>(4)? as u64,
+                    max_unix_nano: r.get::<_, i64>(5)? as u64,
+                    origin: r.get(6)?,
+                    committed_ms: r.get::<_, i64>(7)? as u64,
+                    tier: r.get(8)?,
+                    tier_ms: r.get::<_, i64>(9)? as u64,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Records the outcome of expiring `part`: when the object is gone (`deleted`) the catalog row goes
+    /// with it, in the same transaction as the audit row; when the delete failed the row stays and the
+    /// audit row says why, so the next sweep tries again.
+    pub fn finish_peer_part_expiry(&mut self, part: &PeerPartRow, at_ms: u64, detail: &str, deleted: bool) -> Result<(), CatalogError> {
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let tx = self.conn.transaction()?;
+        if deleted {
+            tx.execute("DELETE FROM peer_parts WHERE node = ?1 AND name = ?2", params![part.node, part.name])?;
+        }
+        tx.execute(
+            "INSERT INTO peer_parts_audit (at_ms, action, node, name, tier, size, outcome, detail) VALUES (?1, 'expire', ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![at_ms as i64, part.node, part.name, part.tier, part.size as i64, if deleted { "deleted" } else { "delete_failed" }, detail],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The most recent audit rows, newest first.
+    pub fn peer_parts_audit(&self, limit: usize) -> Result<Vec<PartsAuditRow>, CatalogError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, at_ms, action, node, name, tier, size, outcome, detail FROM peer_parts_audit ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(PartsAuditRow {
+                id: r.get::<_, i64>(0)? as u64,
+                at_ms: r.get::<_, i64>(1)? as u64,
+                action: r.get(2)?,
+                node: r.get(3)?,
+                name: r.get(4)?,
+                tier: r.get(5)?,
+                size: r.get::<_, i64>(6)? as u64,
+                outcome: r.get(7)?,
+                detail: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn peer_part_count(&self) -> Result<u64, CatalogError> {

@@ -34,6 +34,8 @@ const TOKEN_ENV: &str = "LOGLESS_ADMIN_TOKEN";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 const MAX_HISTORY_LIMIT: usize = 1000;
+const DEFAULT_PARTS_LIMIT: usize = 100;
+const MAX_PARTS_LIMIT: usize = 1000;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -153,6 +155,8 @@ pub struct AdminService {
     decision: Option<(crate::decision::DecisionConfig, Arc<dyn crate::decision::DecisionProvider>)>,
     /// Peer sync, set once the sender exists (`set_sync`). Absent in a process that has none.
     sync: OnceLock<Arc<crate::sync::SyncControl>>,
+    /// `[peer.parts]`, for the part catalog endpoints and the retention sweep.
+    parts: crate::parts::PartsConfig,
     /// The peer receiver's counters, when this process accepts records from other instances.
     peer: OnceLock<Arc<crate::peer::PeerStats>>,
 }
@@ -325,6 +329,7 @@ impl AdminService {
             }),
             scan_gate: Mutex::new(()),
             sync: OnceLock::new(),
+            parts: config.peer.parts.clone(),
             peer: OnceLock::new(),
         })
     }
@@ -518,6 +523,79 @@ impl AdminService {
                 self.sync_get()
             }
             Err(r) => r,
+        }
+    }
+
+    /// `GET /admin/v1/parts?node=&tier=&from_ms=&to_ms=&limit=`: the parts edges uploaded, oldest data first.
+    /// `tier` is `warm` or `cold`; a `hot` file is only on its node and is not in this catalog.
+    pub fn parts_list(&self, query: &str) -> Resp {
+        let mut filter = crate::catalog::PartsFilter { limit: DEFAULT_PARTS_LIMIT, ..Default::default() };
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let bad = |what: &str| err(400, "bad_query", format!("{key}: {what}"));
+            match key {
+                "node" if crate::parts::valid_node(value) => filter.node = Some(value.to_string()),
+                "node" => return bad("not a node id"),
+                "tier" if matches!(value, "warm" | "cold") => filter.tier = Some(value.to_string()),
+                "tier" if value == "hot" => return bad("hot parts are local files on their node and are not in the central catalog"),
+                "tier" => return bad("must be warm or cold"),
+                "from_ms" | "to_ms" => match value.parse::<u64>().ok().and_then(|ms| ms.checked_mul(1_000_000)) {
+                    Some(nano) if key == "from_ms" => filter.from_nano = Some(nano),
+                    Some(nano) => filter.to_nano = Some(nano),
+                    None => return bad("must be milliseconds since the epoch"),
+                },
+                "limit" => match value.parse::<usize>() {
+                    Ok(n) if (1..=MAX_PARTS_LIMIT).contains(&n) => filter.limit = n,
+                    _ => return bad(&format!("must be 1 to {MAX_PARTS_LIMIT}")),
+                },
+                _ => return bad("unknown parameter"),
+            }
+        }
+        match self.catalog().and_then(|c| c.list_peer_parts(&filter).map_err(|e| err(500, "catalog_unavailable", e.to_string()))) {
+            Ok(parts) => (200, json!({ "parts": parts, "count": parts.len() })),
+            Err(r) => r,
+        }
+    }
+
+    /// `GET /admin/v1/parts/audit?limit=`: tier moves and expiries, newest first.
+    pub fn parts_audit(&self, query: &str) -> Resp {
+        let limit = match query_limit(query) {
+            Ok(n) => n,
+            Err(r) => return r,
+        };
+        match self.catalog().and_then(|c| c.peer_parts_audit(limit).map_err(|e| err(500, "catalog_unavailable", e.to_string()))) {
+            Ok(rows) => (200, json!({ "audit": rows })),
+            Err(r) => r,
+        }
+    }
+
+    /// `POST /admin/v1/parts/sweep {"dry_run": bool}`: expire catalogued parts older than the retention in
+    /// `[peer.parts]`. Without `dry_run: false` it only reports what would go.
+    pub fn parts_sweep(&self, body: &[u8]) -> Resp {
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        struct Body {
+            #[serde(default = "yes")]
+            dry_run: bool,
+        }
+        fn yes() -> bool {
+            true
+        }
+        let req: Body = if body.iter().all(u8::is_ascii_whitespace) {
+            Body::default()
+        } else {
+            match serde_json::from_slice(body) {
+                Ok(b) => b,
+                Err(e) => return err(400, "bad_request", format!("the body is not {{\"dry_run\": bool}}: {e}")),
+            }
+        };
+        let central = match crate::parts::PartsCentral::new(self.parts.clone(), self.catalog_path.clone()) {
+            Ok(c) => c,
+            Err(m) => return err(409, "parts_disabled", m),
+        };
+        match central.sweep((self.clock)().saturating_mul(1_000), req.dry_run) {
+            Ok(report) => (200, json!(report)),
+            Err(m) => err(500, "sweep_failed", m),
         }
     }
 
@@ -1037,6 +1115,9 @@ impl Handler for Api {
             (Method::Post, "/admin/v1/policies/preview") => reply(s.preview(&req.body)),
             (Method::Post, "/admin/v1/policies/restore") => etag(s.restore(if_match, &req.body)),
             (Method::Get, "/admin/v1/templates/merge-suggestions") => reply(s.merge_suggestions()),
+            (Method::Get, "/admin/v1/parts") => reply(s.parts_list(req.query)),
+            (Method::Get, "/admin/v1/parts/audit") => reply(s.parts_audit(req.query)),
+            (Method::Post, "/admin/v1/parts/sweep") => reply(s.parts_sweep(&req.body)),
             (Method::Get, "/admin/v1/sync") => reply(s.sync_get()),
             (Method::Put, "/admin/v1/sync") => reply(s.sync_put(&req.body)),
             (Method::Post, "/admin/v1/sync/test") => reply(s.sync_test(&req.body)),
@@ -1057,6 +1138,9 @@ impl Handler for Api {
                 | "/admin/v1/policies/restore"
                 | "/admin/v1/policies/history"
                 | "/admin/v1/sync"
+                | "/admin/v1/parts"
+                | "/admin/v1/parts/audit"
+                | "/admin/v1/parts/sweep"
                 | "/admin/v1/templates/merge-suggestions"
                 | "/admin/v1/sync/test"
                 | "/admin/v1/sync/backfill"
@@ -2194,6 +2278,51 @@ mod tests {
         assert_eq!(400, r.call("POST", "/admin/v1/sync/backfill", &[], Some(json!({"from_ms": 1}))).0);
         assert_eq!(200, r.call("POST", "/admin/v1/sync/backfill/cancel", &[], None).0);
         assert_eq!(405, r.call("GET", "/admin/v1/sync/backfill", &[], None).0);
+    }
+
+    #[test]
+    fn the_part_catalog_lists_by_node_tier_and_time_and_the_sweep_needs_parts_enabled() {
+        let r = rig();
+        {
+            let mut cat = Catalog::open(&r.config.catalog_path()).unwrap();
+            let part = |tag: char, lo_ms: u64, hi_ms: u64| crate::parts::CommittedPart {
+                name: format!("{}.parquet", tag.to_string().repeat(64)),
+                size: 10,
+                sha256: tag.to_string().repeat(64),
+                rows: 3,
+                min_unix_nano: lo_ms * 1_000_000,
+                max_unix_nano: hi_ms * 1_000_000,
+                origin: "inst".into(),
+                node: None,
+            };
+            cat.record_peer_part("edge-a", &part('a', 100, 200), 1).unwrap();
+            cat.record_peer_part("edge-a", &part('b', 300, 400), 1).unwrap();
+            cat.record_peer_part("edge-b", &part('c', 150, 350), 1).unwrap();
+            assert!(cat.mark_peer_part_cold("edge-a", &part('a', 0, 0).name, 9).unwrap());
+        }
+        let names = |q: &str| -> Vec<String> {
+            let (status, v) = r.call("GET", &format!("/admin/v1/parts{q}"), &[], None);
+            assert_eq!(200, status, "{q}: {v}");
+            assert_eq!(v["count"], v["parts"].as_array().unwrap().len());
+            v["parts"].as_array().unwrap().iter().map(|p| format!("{}/{}/{}", p["node"].as_str().unwrap(), p["tier"].as_str().unwrap(), &p["name"].as_str().unwrap()[..1])).collect()
+        };
+        assert_eq!(vec!["edge-a/cold/a", "edge-b/warm/c", "edge-a/warm/b"], names(""));
+        assert_eq!(vec!["edge-a/cold/a", "edge-a/warm/b"], names("?node=edge-a"));
+        assert_eq!(2, names("?tier=warm").len());
+        assert_eq!(vec!["edge-a/cold/a"], names("?tier=cold"));
+        assert_eq!(vec!["edge-b/warm/c", "edge-a/warm/b"], names("?from_ms=250&to_ms=320"));
+        assert_eq!(1, names("?limit=1").len());
+        assert_eq!(vec!["edge-b/warm/c"], names("?node=edge-b&tier=warm&from_ms=0&to_ms=1000"));
+        for bad in ["?tier=hot", "?tier=lukewarm", "?node=../x", "?node=", "?from_ms=x", "?limit=0", "?limit=1001", "?color=red"] {
+            let (status, v) = r.call("GET", &format!("/admin/v1/parts{bad}"), &[], None);
+            assert_eq!((400, "bad_query"), (status, v["error"].as_str().unwrap()), "{bad}: {v}");
+        }
+        let (status, v) = r.call("GET", "/admin/v1/parts/audit", &[], None);
+        assert_eq!((200, 1), (status, v["audit"].as_array().unwrap().len()), "{v}");
+        assert_eq!("tier", v["audit"][0]["action"]);
+        let (status, v) = r.call("POST", "/admin/v1/parts/sweep", &[], Some(json!({"dry_run": false})));
+        assert_eq!((409, "parts_disabled"), (status, v["error"].as_str().unwrap()), "{v}");
+        assert_eq!(405, r.call("POST", "/admin/v1/parts", &[], None).0);
     }
 
     #[test]

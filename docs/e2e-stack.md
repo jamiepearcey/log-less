@@ -24,7 +24,7 @@ KEEP=1 scripts/e2e-stack.sh              # keep the run directory (configs, agen
 ## What runs
 
 * **MinIO** with a bucket `logless-parts`.
-* **central**: `logless run` with `[peer]` (token auth) and `[peer.parts]` pointing at MinIO under prefix `edges`, and
+* **central**: `logless run` with `[peer]` (one `[[peer.nodes]]` entry, `edge-1`, whose token is the edge's destination token) and `[peer.parts]` pointing at MinIO under prefix `edges`, and
   the admin API.
 * **edge**: `logless run` with the OTLP/HTTP, HEC (token) and Sentry proxy listeners, the admin API, 128 KiB WAL
   segments (so segments roll and merge into Parquet while it runs), and one `[[destinations]] type = "logless"` to
@@ -54,6 +54,10 @@ Both agents run with `--tail` on an empty file, which keeps them running until S
 | minio parts match their sha256 | every object under `edges/` hashes (sha256 of its bytes, read back with `mc cat`) to its own name, and their number is `uploaded` |
 | each part is an edge file | every object's sha256 is the sha256 of a Parquet file in the edge's store |
 | central catalog lists the parts | central's `peer_parts` table holds exactly the object names |
+| foreign prefix and traversal refused | with the edge's node token: a presign naming another node is 403, a `../` name is 422, a foreign-node commit is 403, and every object in the bucket is under `edges/<node>/` |
+| catalog listing by node and tier | central `GET /admin/v1/parts?node=&tier=warm` returns exactly the uploaded parts; another node has none |
+| node retires its own part to cold | `POST /v1/parts/retire` is 200 once, 404 the second time, and `tier=cold` lists one part |
+| retention sweep deletes expired catalogued parts and audits them | the stack runs with 2 s warm and cold retention; after 3 s a dry run reports every part and deletes none, a real sweep deletes all (bucket empty, `peer_parts` empty) and writes one `expire`/`deleted` audit row per part |
 | peer ack counters sane | central `receiver.accepted == edge sent_records - duplicates == central ingest.written`; `records == accepted + duplicates + loops`; `1 <= wal_waits <= requests`; `wal_wait_us_max` under `ack_wait_ms`; zero loops, unauthorized, bad requests, unsaved dedupe ids, WAL timeouts and shutdown 503s; edge state `ok`, no `last_error`, and nothing dropped, rejected, sampled out or rolled up |
 | exits on SIGTERM within 10 s | edge, then central, then MinIO each exit within 10 s of SIGTERM (time shown) |
 | no ERROR lines | neither agent log has a line at level ERROR |
