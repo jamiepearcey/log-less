@@ -1,4 +1,4 @@
-# ADR 0001: Partition on event time, use 8k-row row groups, keep the sort order
+# ADR 0002: Partition on event time, use 8k-row row groups, keep the sort order
 
 Status: proposed (decision for Plane 73; the migration is Plane 74 and 16 and is not implemented here).
 Date: 2026-10-11. Evidence: `docs/evidence/sort-layout-bench.md`, script `scripts/sort-layout-bench.py`.

@@ -506,7 +506,12 @@ pub fn restore(source: &dyn PartSource, opts: &Options) -> Result<Report, Restor
     let templates: Vec<Template> = derived
         .templates
         .iter()
-        .map(|(id, t)| Template { id: *id, tokens: t.exemplar.clone(), count: t.count, first_seen_unix_secs: t.first_secs, last_seen_unix_secs: t.last_secs })
+        .map(|(id, t)| {
+            let mut template = Template { id: *id, tokens: t.exemplar.clone(), count: t.count, first_seen_unix_secs: t.first_secs, last_seen_unix_secs: t.last_secs, lineage_id: *id };
+            // Birth text is not in the bucket; the exemplar is the best identity available.
+            template.lineage_id = template.fingerprint();
+            template
+        })
         .collect();
     let sightings: Vec<TemplateSighting> = derived
         .sightings
