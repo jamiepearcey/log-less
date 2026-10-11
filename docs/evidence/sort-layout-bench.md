@@ -3,7 +3,7 @@
 Reproduce: `python3 scripts/sort-layout-bench.py --hours 72 --json r72.json` and `--hours 12 --json r12.json`
 (needs only the `duckdb` Python package with `httpfs`; about 5 minutes per scale; writes about 150 MB per layout
 under `~/tmp/logless-sort-bench` and deletes it). Raw results: `sort-layout-bench-72h.json`, `sort-layout-bench-12h.json`.
-Decision: `docs/adr/0001-sort-order-and-partitioning.md`.
+Decision: `docs/adr/0002-sort-order-and-partitioning.md`.
 
 ## What was measured
 
