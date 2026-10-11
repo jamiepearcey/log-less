@@ -186,9 +186,12 @@ impl Spool {
     /// Written by atomic rename so a crash mid-commit leaves either the old
     /// cursor or the new one — never a half-written offset that would resume
     /// inside a frame.
+    ///
+    /// The in-memory cursor moves only once the file is written, so a failed
+    /// commit leaves the frame pending here too and the caller resends it.
     pub fn commit(&mut self, cursor: Cursor) -> Result<(), SpoolError> {
-        self.cursor = cursor;
         write_cursor(&self.dir, cursor)?;
+        self.cursor = cursor;
         for segment in list_segments(&self.dir)? {
             if segment < cursor.segment && segment != self.write_segment {
                 let path = segment_path(&self.dir, segment);

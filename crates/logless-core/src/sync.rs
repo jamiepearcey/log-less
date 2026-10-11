@@ -662,10 +662,40 @@ pub fn encode_frames(instance: &str, min_severity: u8, batch: &[LogRecord]) -> (
     (frames, total)
 }
 
+/// The sender's pace and spool size. Tests shrink them; production uses the default.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Tuning {
+    /// The first backoff; it doubles per consecutive failure up to [`MAX_BACKOFF_SECS`] units.
+    pub backoff_unit: Duration,
+    /// How long a refused token waits before the next try.
+    pub auth_retry: Duration,
+    pub spool_max_bytes: u64,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self { backoff_unit: Duration::from_secs(1), auth_retry: Duration::from_secs(AUTH_RETRY_SECS), spool_max_bytes: 256 * 1024 * 1024 }
+    }
+}
+
 /// Runs the sender until `stop` is set and the tap is empty. Owns the spool and the planner.
 /// `known_templates` are the template ids the catalog holds, so a restart is not a wave of novel shapes.
 pub fn run(control: Arc<SyncControl>, rx: Receiver<Item>, spool_dir: &Path, stop: &AtomicBool, known_templates: Vec<u64>, known_pairs: Vec<(Option<String>, u64)>) {
-    let mut spool = match Spool::open(spool_dir, SpoolConfig { max_total_bytes: 256 * 1024 * 1024, ..SpoolConfig::default() }) {
+    run_tuned(control, rx, spool_dir, stop, known_templates, known_pairs, Tuning::default())
+}
+
+pub(crate) fn run_tuned(
+    control: Arc<SyncControl>,
+    rx: Receiver<Item>,
+    spool_dir: &Path,
+    stop: &AtomicBool,
+    known_templates: Vec<u64>,
+    known_pairs: Vec<(Option<String>, u64)>,
+    tuning: Tuning,
+) {
+    // Segments small enough that a drained spool gives its space back (whole consumed segments are unlinked).
+    let segment_bytes = (tuning.spool_max_bytes / 8).min(SpoolConfig::default().segment_bytes);
+    let mut spool = match Spool::open(spool_dir, SpoolConfig { max_total_bytes: tuning.spool_max_bytes, segment_bytes, ..SpoolConfig::default() }) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "sync spool unavailable; peer sync is disabled");
@@ -703,15 +733,23 @@ pub fn run(control: Arc<SyncControl>, rx: Receiver<Item>, spool_dir: &Path, stop
             let extra = planner.tick(now_ms(), closing);
             push_frames(&control, &mut spool, &extra);
         }
-        let _ = spool.sync();
+        if let Err(e) = spool.sync() {
+            control.update(|s| {
+                s.last_error = Some(format!("The sync spool could not be flushed to disk: {e}"));
+                s.last_error_ms = Some(now_ms());
+            });
+        }
 
         if Instant::now() >= next_attempt {
             match deliver(&control, &mut spool) {
                 Pass::Idle | Pass::Progress => failures = 0,
-                Pass::Backoff(retry_after) => {
+                Pass::Backoff(wait) => {
                     failures += 1;
-                    let secs = retry_after.unwrap_or_else(|| (1u64 << failures.min(6)).min(MAX_BACKOFF_SECS));
-                    next_attempt = Instant::now() + Duration::from_secs(secs);
+                    let wait = match wait {
+                        Wait::Auth => tuning.auth_retry,
+                        Wait::Doubling => tuning.backoff_unit * (1u32 << failures.min(6)).min(MAX_BACKOFF_SECS as u32),
+                    };
+                    next_attempt = Instant::now() + wait;
                 }
             }
         }
@@ -781,7 +819,30 @@ fn push_frames(control: &SyncControl, spool: &mut Spool, records: &[LogRecord]) 
 enum Pass {
     Idle,
     Progress,
-    Backoff(Option<u64>),
+    Backoff(Wait),
+}
+
+enum Wait {
+    /// One unit, doubling per consecutive failure.
+    Doubling,
+    /// The token was refused.
+    Auth,
+}
+
+/// Moves the spool cursor past a frame the peer has answered for good. A cursor that cannot be written is
+/// a durability failure, not a delivery one: the frame stays pending, is sent again (the peer drops what
+/// it already holds) and the status says why until the cursor can be written.
+fn commit(control: &SyncControl, spool: &mut Spool, cursor: crate::spool::Cursor) -> Result<(), Pass> {
+    spool.commit(cursor).map_err(|e| {
+        tracing::warn!(error = %e, "sync spool cursor write failed");
+        control.update(|s| {
+            s.last_error = Some(format!(
+                "The peer has the batch, but the sync spool could not record that ({e}). It will be sent again, and the peer will drop the copy, until the spool's cursor can be written."
+            ));
+            s.last_error_ms = Some(now_ms());
+        });
+        Pass::Backoff(Wait::Doubling)
+    })
 }
 
 fn deliver(control: &SyncControl, spool: &mut Spool) -> Pass {
@@ -793,7 +854,7 @@ fn deliver(control: &SyncControl, spool: &mut Spool) -> Pass {
                 s.last_error = Some(format!("The sync spool could not be read: {e}"));
                 s.last_error_ms = Some(now_ms());
             });
-            return Pass::Backoff(None);
+            return Pass::Backoff(Wait::Doubling);
         }
     };
     if frames.is_empty() {
@@ -802,7 +863,8 @@ fn deliver(control: &SyncControl, spool: &mut Spool) -> Pass {
     for (cursor, payload) in frames {
         match send_frame(control.instance(), &target, &payload) {
             Outcome::Delivered { accepted, duplicates, loops, bytes } => {
-                let _ = spool.commit(cursor);
+                // What the peer said is counted whether or not the cursor moves: it did take these. A resend
+                // after a failed commit comes back as duplicates.
                 control.update(|s| {
                     s.sent_records += accepted;
                     s.duplicates += duplicates;
@@ -810,33 +872,42 @@ fn deliver(control: &SyncControl, spool: &mut Spool) -> Pass {
                     s.sent_bytes += bytes;
                     s.last_ok_ms = Some(now_ms());
                 });
+                if let Err(pass) = commit(control, spool, cursor) {
+                    return pass;
+                }
             }
             Outcome::Rejected(message) => {
-                let _ = spool.commit(cursor);
                 control.update(|s| {
                     s.rejected_batches += 1;
                     s.last_error = Some(message);
                     s.last_error_ms = Some(now_ms());
                 });
+                if let Err(pass) = commit(control, spool, cursor) {
+                    return pass;
+                }
             }
             Outcome::Retry(message) => {
                 control.update(|s| {
                     s.last_error = Some(message);
                     s.last_error_ms = Some(now_ms());
                 });
-                return Pass::Backoff(None);
+                return Pass::Backoff(Wait::Doubling);
             }
             Outcome::Unauthorized(message) => {
                 control.update(|s| {
                     s.last_error = Some(message);
                     s.last_error_ms = Some(now_ms());
                 });
-                return Pass::Backoff(Some(AUTH_RETRY_SECS));
+                return Pass::Backoff(Wait::Auth);
             }
         }
     }
     Pass::Progress
 }
+
+#[cfg(test)]
+#[path = "sync_soak.rs"]
+mod soak;
 
 #[cfg(test)]
 mod tests {
@@ -889,11 +960,19 @@ mod tests {
     }
 
     fn start_sender(dir: &Path, target: Option<SyncTarget>) -> Running {
+        start_sender_tuned(dir, target, Tuning::default())
+    }
+
+    fn quick() -> Tuning {
+        Tuning { backoff_unit: Duration::from_millis(20), auth_retry: Duration::from_millis(50), ..Tuning::default() }
+    }
+
+    fn start_sender_tuned(dir: &Path, target: Option<SyncTarget>, tuning: Tuning) -> Running {
         let control = SyncControl::new("edge".into(), SyncStore::new(dir), target);
         let (tap, rx) = channel(Arc::clone(&control));
         let stop = Arc::new(AtomicBool::new(false));
         let (c, s, d) = (Arc::clone(&control), Arc::clone(&stop), dir.join(SPOOL_DIR));
-        let handle = std::thread::spawn(move || run(c, rx, &d, &s, vec![1, 2, 3], Vec::new()));
+        let handle = std::thread::spawn(move || run_tuned(c, rx, &d, &s, vec![1, 2, 3], Vec::new(), tuning));
         Running { control, tap, stop, handle }
     }
 
@@ -999,6 +1078,35 @@ mod tests {
         run.control.set_target(Some(target_of(&p, Some("right"), 0)));
         wait_for("delivery after the fix", || !p.got.lock().unwrap().is_empty());
         run.finish();
+        p.receiver.shutdown();
+    }
+
+    #[test]
+    fn a_cursor_that_cannot_be_written_stops_the_spool_advancing_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = peer(vec![]);
+        // A directory where the cursor's temporary file goes: every cursor write fails, nothing else does.
+        let blocker = dir.path().join(SPOOL_DIR).join("cursor.tmp");
+        std::fs::create_dir_all(&blocker).unwrap();
+        let run = start_sender_tuned(dir.path(), Some(target_of(&p, None, 0)), quick());
+        run.tap.offer(&[record("once", Severity::ERROR)]);
+        wait_for("the failure to be reported", || run.control.status().last_error.as_deref().is_some_and(|e| e.contains("could not record")));
+        // The frame stays pending and is sent again; the peer drops the copies.
+        wait_for("a resend the peer recognised", || run.control.status().duplicates >= 2);
+        let status = run.control.status();
+        assert_eq!("error", status.state, "{status:?}");
+        assert!(status.backlog_bytes > 0, "the cursor did not move: {status:?}");
+        assert_eq!(1, p.got.lock().unwrap().len(), "stored once however often it is resent");
+        // Once the cursor can be written the sender recovers by itself.
+        std::fs::remove_dir(&blocker).unwrap();
+        wait_for("an empty backlog", || run.control.status().backlog_bytes == 0);
+        wait_for("ok", || run.control.status().state == "ok");
+        run.finish();
+        // And a restart has nothing left to resend.
+        let again = start_sender_tuned(dir.path(), Some(target_of(&p, None, 0)), quick());
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!((0, 0), (again.control.status().sent_records, again.control.status().duplicates));
+        again.finish();
         p.receiver.shutdown();
     }
 
