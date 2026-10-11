@@ -481,6 +481,10 @@ fn a_local_only_proxy_stores_without_forwarding() {
     let url = format!("http://{}/api/1/envelope/", receiver.local_addr());
     assert_eq!(post(&url, &envelope_bytes(&[("event", AN_ERROR)]), &[AUTH]).0, 200);
     assert_eq!(stored.lock().unwrap().len(), 1);
+    // With no upstream route nothing is forwarded, so the counters must not say it was (the
+    // e2e stack run reported `items_forwarded=1` while `envelopes_sent=0`).
+    let s = receiver.stats();
+    assert_eq!((s.items_forwarded, s.items_held_locally), (0, 1), "{s:?}");
     receiver.shutdown();
 }
 

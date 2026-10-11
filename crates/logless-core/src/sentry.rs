@@ -433,14 +433,17 @@ impl SentryHandler {
         let before = env.items.len();
         let sampled_out = self.apply_policy(&mut env, &event_id);
         self.stats.transactions_sampled_out.fetch_add(sampled_out, Ordering::Relaxed);
-        let forwarded = env.items.len() as u64;
+        // Items the policy kept are forwarded only if the project has a route; without one they
+        // stay local like everything else, and the counters say so.
+        let target = if env.is_empty() { None } else { self.routes.resolve(&key, project) };
+        let forwarded = if target.is_some() { env.items.len() as u64 } else { 0 };
         self.stats.items_forwarded.fetch_add(forwarded, Ordering::Relaxed);
         self.stats
             .items_held_locally
             .fetch_add(before as u64 - forwarded, Ordering::Relaxed);
 
         if !env.is_empty() {
-            match self.routes.resolve(&key, project) {
+            match target {
                 Some(target) => {
                     let outbound = Outbound { target, envelope: env };
                     if let Some(spool) = &self.spool {

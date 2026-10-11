@@ -1403,11 +1403,8 @@ mod tests {
         let addr = r.server.as_ref().unwrap().local_addr();
         assert!(std::net::TcpStream::connect(addr).is_ok());
         r.server.take().unwrap().shutdown();
-        // tiny_http closes the socket from its own accept thread, so give it a moment.
-        let deadline = Instant::now() + std::time::Duration::from_secs(3);
-        while std::net::TcpStream::connect(addr).is_ok() && Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        // `shutdown` joins the accept thread, which owns the listener, so the port is closed by the
+        // time it returns: no grace period.
         assert!(std::net::TcpStream::connect(addr).is_err(), "port must be released after shutdown");
     }
 

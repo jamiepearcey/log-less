@@ -79,6 +79,9 @@ pub struct WalWriter {
 
     unsynced_bytes: u64,
     last_sync: Instant,
+    /// Records covered by the last sync, and the value `maybe_sync` last reported.
+    synced_records: u64,
+    reported_records: u64,
 
     pub records_written: u64,
     pub bytes_written: u64,
@@ -113,6 +116,8 @@ impl WalWriter {
             current_len: HEADER_BYTES,
             unsynced_bytes: 0,
             last_sync: Instant::now(),
+            synced_records: 0,
+            reported_records: 0,
             records_written: 0,
             bytes_written: 0,
             syncs: 0,
@@ -163,17 +168,25 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Sync if the byte or time threshold has been crossed.
+    /// Sync if the byte or time threshold has been crossed. Returns true when
+    /// more records are on disk than at the previous call, whichever sync put
+    /// them there: a segment roll inside [`WalWriter::append`] syncs as well, and
+    /// a caller publishing [`WalWriter::synced_records`] must hear about it.
     pub fn maybe_sync(&mut self) -> Result<bool, WalError> {
-        if self.unsynced_bytes == 0 {
-            return Ok(false);
-        }
-        if self.unsynced_bytes >= self.fsync_bytes || self.last_sync.elapsed() >= self.fsync_interval
+        if self.unsynced_bytes > 0
+            && (self.unsynced_bytes >= self.fsync_bytes
+                || self.last_sync.elapsed() >= self.fsync_interval)
         {
             self.sync()?;
-            return Ok(true);
         }
-        Ok(false)
+        let advanced = self.synced_records > self.reported_records;
+        self.reported_records = self.synced_records;
+        Ok(advanced)
+    }
+
+    /// Records known to be on disk: those written before the last sync.
+    pub fn synced_records(&self) -> u64 {
+        self.synced_records
     }
 
     /// Flush userspace buffers and `fdatasync`.
@@ -185,6 +198,7 @@ impl WalWriter {
         self.current.get_ref().sync_data().map_err(io(&p))?;
         self.unsynced_bytes = 0;
         self.last_sync = Instant::now();
+        self.synced_records = self.records_written;
         self.syncs += 1;
         Ok(())
     }
@@ -441,6 +455,30 @@ mod tests {
         let mut all = Vec::new();
         let report = recover(dir, truncate, |b| all.extend(b)).unwrap();
         (report, all)
+    }
+
+    #[test]
+    fn a_sync_done_by_a_segment_roll_is_reported() {
+        // The writer loop publishes the synced count (what HEC acks, peer 200s and
+        // `ingest.written` read) only when `maybe_sync` says records became durable.
+        // A roll inside `append` syncs too; when that sync went unreported and no
+        // more records came, acks and peer requests waited for a sync that had
+        // already happened (seen in the e2e stack run: `written` stuck at 151 of 6000).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut w = WalWriter::open(tmp.path(), 512, Duration::from_secs(60), 1 << 30).unwrap();
+        w.append(&batch(50, "rolls")).unwrap();
+        assert_eq!(w.current_segment_id(), 2, "the batch is larger than a segment, so append rolled");
+        assert!(w.maybe_sync().unwrap(), "the roll's sync must be reported");
+        assert_eq!(w.synced_records(), 50);
+        assert!(!w.maybe_sync().unwrap(), "and reported once");
+
+        // Below every threshold: appended, not synced, not reported.
+        w.append(&batch(1, "small")).unwrap();
+        assert!(!w.maybe_sync().unwrap());
+        assert_eq!((w.synced_records(), w.records_written), (50, 51));
+        w.sync().unwrap();
+        assert!(w.maybe_sync().unwrap(), "an explicit sync is reported too");
+        assert_eq!(w.synced_records(), 51);
     }
 
     #[test]
