@@ -37,7 +37,7 @@ the file.
 
 * Every request needs `Authorization: Bearer <token>`, including `GET`.
   The comparison is constant time (SHA-256 of both sides, then a fixed-length
-  fold).
+  fold). Two `Authorization` headers count as none.
 * The `Host` header must be exactly one well-formed `host[:port]` that is a
   loopback name (`localhost`, `127.x.x.x`, `::1`) or listed in
   `allowed_hosts`. Userinfo, trailing junk and duplicate `Host` headers are

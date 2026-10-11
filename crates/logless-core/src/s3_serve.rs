@@ -6,37 +6,39 @@
 //! vendor. Only `GET`/`HEAD` of objects and ListObjectsV2 exist — there is no
 //! write path to harden.
 //!
-//! Like the other receivers it is blocking `std` plus `tiny_http`, but it does
-//! not use [`crate::httpd`]: that layer buffers a `Vec` reply, and a Parquet
-//! footer read followed by a few column-chunk ranges must stream from the file.
+//! It runs on [`crate::bounded_http`], like the admin API and the peer receiver:
+//! the request head is capped and has to arrive within a deadline, connections
+//! are capped, and a client that stops reading is cut off by the write timeout.
+//! The reply streams from the file (a Parquet footer read followed by a few
+//! column-chunk ranges must not be buffered), see [`crate::httpd::Streamed`].
 
 use std::fs::{self, File};
-use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tiny_http::{Header, Response, StatusCode};
-
-use crate::httpd::HttpError;
+use crate::bounded_http::{BoundedServer, HeadLimits};
+use crate::httpd::{self, Handler, HttpError, Incoming, Limits, Method, Reject, Streamed};
 use crate::s3_sigv4::{self, AuthError, Credentials};
 
-const RECV_POLL: Duration = Duration::from_millis(250);
-const STREAM_BUF: usize = 64 * 1024;
 const MAX_KEYS_CAP: usize = 1000;
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// Reported for every bucket; clients that sign with another region still verify.
 const REGION: &str = "us-east-1";
-/// Bodies above this are written from their own thread. `request.respond`
-/// blocks for the whole write and tiny_http exposes no write timeout, so a
-/// client that stops reading would otherwise pin a pool worker indefinitely.
-const DETACH_STREAM_ABOVE: u64 = 256 * 1024;
-/// Detached writers allowed per pool worker; beyond that big downloads get 503
-/// while listings and small ranges keep being served.
-const STREAMS_PER_WORKER: usize = 4;
+/// Connections served at once, per configured worker, and never fewer than
+/// `MIN_CONNECTIONS`: one thread each. Past that the listener hangs up, so
+/// connections that open and say nothing cannot grow the process.
+const CONNECTIONS_PER_WORKER: usize = 16;
+const MIN_CONNECTIONS: usize = 64;
+/// A client has this long to send its whole request. Downloads are not timed
+/// as a whole, only each write (see `bounded_http`), so a slow reader is cut
+/// off when it stops reading, not when it is merely slow.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// A request here is a `GET`/`HEAD`; no body is ever read, so none is let in.
+const MAX_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -118,18 +120,11 @@ struct Inner {
     requests: AtomicU64,
     range_requests: AtomicU64,
     bytes_served: AtomicU64,
-    max_streams: usize,
-    active_streams: AtomicUsize,
-    stream_threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
-/// A running listener. Like [`crate::httpd::Server`], dropping it does not stop
-/// the workers; call [`S3Server::shutdown`].
+/// A running listener. Dropping it does not stop it; call [`S3Server::shutdown`].
 pub struct S3Server {
-    server: Arc<tiny_http::Server>,
-    workers: Vec<JoinHandle<()>>,
-    stop: Arc<AtomicBool>,
-    local_addr: SocketAddr,
+    server: BoundedServer,
     inner: Arc<Inner>,
 }
 
@@ -170,16 +165,6 @@ impl S3Server {
             tracing::warn!(addr = %cfg.addr, "s3 serve has no credentials; serving the store anonymously on loopback");
         }
 
-        let server = tiny_http::Server::http(resolved).map_err(|e| HttpError::Bind {
-            addr: cfg.addr.clone(),
-            message: e.to_string(),
-        })?;
-        let local_addr = match server.server_addr() {
-            tiny_http::ListenAddr::IP(a) => a,
-            #[allow(unreachable_patterns)]
-            _ => resolved,
-        };
-
         let inner = Arc::new(Inner {
             store_dir,
             bucket: cfg.bucket.clone(),
@@ -188,29 +173,25 @@ impl S3Server {
             requests: AtomicU64::new(0),
             range_requests: AtomicU64::new(0),
             bytes_served: AtomicU64::new(0),
-            max_streams: cfg.workers.max(1) * STREAMS_PER_WORKER,
-            active_streams: AtomicUsize::new(0),
-            stream_threads: Mutex::new(Vec::new()),
         });
-        let server = Arc::new(server);
-        let stop = Arc::new(AtomicBool::new(false));
-        let workers = (0..cfg.workers.max(1))
-            .map(|i| {
-                let server = Arc::clone(&server);
-                let stop = Arc::clone(&stop);
-                let inner = Arc::clone(&inner);
-                std::thread::Builder::new()
-                    .name(format!("s3-serve-{i}"))
-                    .spawn(move || serve(&server, &inner, &stop))
-                    .expect("spawn s3 serve worker")
-            })
-            .collect();
-
-        Ok(S3Server { server, workers, stop, local_addr, inner })
+        let head = HeadLimits {
+            max_connections: (cfg.workers * CONNECTIONS_PER_WORKER).max(MIN_CONNECTIONS),
+            request_timeout: REQUEST_TIMEOUT,
+            ..HeadLimits::default()
+        };
+        let limits = Limits { max_body_bytes: MAX_BODY_BYTES, max_decompressed_bytes: 0 };
+        let server = BoundedServer::start(
+            &resolved.to_string(),
+            "s3-serve",
+            limits,
+            head,
+            Arc::new(S3Handler(Arc::clone(&inner))),
+        )?;
+        Ok(S3Server { server, inner })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
-        self.local_addr
+        self.server.local_addr()
     }
 
     pub fn stats(&self) -> S3Stats {
@@ -221,103 +202,43 @@ impl S3Server {
         }
     }
 
-    /// Stops accepting and joins every worker; in-flight downloads finish first.
+    /// Stops accepting, then waits (bounded) for in-flight downloads.
     pub fn shutdown(self) {
-        self.stop.store(true, Ordering::Release);
-        // `unblock` wakes only one waiter, so the stop flag is what ends the
-        // pool; this just shortens the last poll.
-        self.server.unblock();
-        for worker in self.workers {
-            let _ = worker.join();
-        }
-        // The pool is gone, so nothing can add to this any more.
-        let streams = std::mem::take(&mut *self.inner.stream_threads.lock().unwrap());
-        for stream in streams {
-            let _ = stream.join();
-        }
+        self.server.shutdown();
     }
 }
 
-fn serve(server: &tiny_http::Server, inner: &Arc<Inner>, stop: &AtomicBool) {
-    while !stop.load(Ordering::Acquire) {
-        match server.recv_timeout(RECV_POLL) {
-            Ok(Some(request)) => dispatch(inner, request),
-            Ok(None) => {}
-            // One dropped handshake must not retire a worker.
-            Err(error) => {
-                tracing::debug!(%error, "s3 accept failed");
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
+struct S3Handler(Arc<Inner>);
+
+impl Handler for S3Handler {
+    fn handle(&self, request: Incoming) -> httpd::Reply {
+        let inner = &self.0;
+        let id = inner.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut meta = Meta::default();
+        let reply = inner.route(id, request.method_name, request.path, request.query, request.headers(), &mut meta);
+        tracing::debug!(method = request.method_name, key = %meta.key, range = %meta.range, status = reply.status, "s3 request");
+        reply.into_http(id, inner, request.method == Method::Head)
     }
-}
 
-fn dispatch(inner: &Arc<Inner>, request: tiny_http::Request) {
-    let method = request.method().as_str().to_string();
-    let url = request.url().to_string();
-    let headers: Vec<(String, String)> = request
-        .headers()
-        .iter()
-        .map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
-        .collect();
-    let id = inner.requests.fetch_add(1, Ordering::Relaxed) + 1;
-
-    let mut meta = Meta::default();
-    let reply = inner.route(id, &method, &url, &headers, &mut meta);
-    let reply = reply
-        .with("x-amz-request-id", format!("{id:016x}"))
-        .with("x-amz-id-2", format!("log-less/{id:016x}"));
-    let status = reply.status;
-    let big = matches!(reply.body, Body::Stream { len, .. } if len > DETACH_STREAM_ABOVE);
-    tracing::debug!(%method, key = %meta.key, range = %meta.range, status, "s3 request");
-    if !big {
-        let response = reply.into_response(inner);
-        finish(request, response);
-        return;
+    /// The Host and signature checks need only the head, so a client without
+    /// credentials is answered before anything else about its request matters.
+    fn preflight(&self, request: &Incoming) -> Option<httpd::Reply> {
+        let inner = &self.0;
+        // Counted only when it refuses; an admitted request is counted by `handle`.
+        let id = inner.requests.load(Ordering::Relaxed) + 1;
+        let denied = inner.gate(id, request.method_name, request.path, request.query, request.headers())?;
+        inner.requests.fetch_add(1, Ordering::Relaxed);
+        Some(denied.into_http(id, inner, request.method == Method::Head))
     }
-    let Some(slot) = StreamSlot::acquire(inner) else {
-        let busy = Reply::error(id, 503, "SlowDown", "Too many large downloads in progress")
-            .with("Retry-After", "1");
-        let response = busy.into_response(inner);
-        finish(request, response);
-        return;
-    };
-    let response = reply.into_response(inner);
-    let handle = std::thread::Builder::new()
-        .name("s3-stream".into())
-        .spawn(move || {
-            let _slot = slot;
-            finish(request, response);
-        })
-        .expect("spawn s3 stream writer");
-    let mut threads = inner.stream_threads.lock().unwrap();
-    threads.retain(|t| !t.is_finished());
-    threads.push(handle);
-}
 
-fn finish(request: tiny_http::Request, response: tiny_http::ResponseBox) {
-    if let Err(error) = request.respond(response) {
-        tracing::debug!(%error, "s3 client went away mid-response");
-    }
-}
-
-/// One of the bounded detached writers; released when the write ends.
-struct StreamSlot(Arc<Inner>);
-
-impl StreamSlot {
-    fn acquire(inner: &Arc<Inner>) -> Option<StreamSlot> {
-        let taken = inner.active_streams.fetch_add(1, Ordering::AcqRel);
-        if taken >= inner.max_streams {
-            inner.active_streams.fetch_sub(1, Ordering::AcqRel);
-            return None;
-        }
-        Some(StreamSlot(Arc::clone(inner)))
-    }
-}
-
-impl Drop for StreamSlot {
-    fn drop(&mut self) {
-        self.0.active_streams.fetch_sub(1, Ordering::AcqRel);
+    fn reject(&self, reason: Reject) -> httpd::Reply {
+        let inner = &self.0;
+        let id = inner.requests.fetch_add(1, Ordering::Relaxed) + 1;
+        let reply = match reason {
+            Reject::TooLarge => Reply::error(id, 413, "EntityTooLarge", "Your proposed upload exceeds the maximum allowed size"),
+            Reject::Unreadable(_) => Reply::error(id, 400, "BadRequest", "The request could not be read"),
+        };
+        reply.into_http(id, inner, false)
     }
 }
 
@@ -366,31 +287,38 @@ impl Reply {
         self
     }
 
-    fn into_response(self, inner: &Arc<Inner>) -> tiny_http::ResponseBox {
-        let (reader, len): (Box<dyn Read + Send>, u64) = match self.body {
-            Body::Bytes(v) => {
-                let len = v.len() as u64;
-                (Box::new(Cursor::new(v)), len)
-            }
-            Body::Stream { reader, len } => {
-                // Counted at the file read, so an aborted download is not
-                // credited with bytes that were never read.
-                let counted = Counting { inner: reader, owner: Arc::clone(inner) };
-                (Box::new(BufReader::with_capacity(STREAM_BUF, counted)), len)
-            }
-            Body::Head(len) => (Box::new(io::empty()), len),
-        };
-        let headers = self
+    /// `head`: a `HEAD` reply advertises the length of what a `GET` would send and sends none of it.
+    fn into_http(self, id: u64, inner: &Arc<Inner>, head: bool) -> httpd::Reply {
+        let reply = self
+            .with("x-amz-request-id", format!("{id:016x}"))
+            .with("x-amz-id-2", format!("log-less/{id:016x}"));
+        let content_type = reply
             .headers
             .iter()
-            .filter_map(|(k, v)| Header::from_bytes(k.as_bytes(), v.as_bytes()).ok())
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let headers = reply
+            .headers
+            .into_iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("content-type"))
+            .map(|(k, v)| (k.to_string(), v))
             .collect();
-        // tiny_http turns any known length past 32 KiB into chunked encoding,
-        // which would hide the size from HEAD and from ranged clients.
-        let response =
-            Response::new(StatusCode(self.status), headers, reader, Some(len as usize), None)
-                .with_chunked_threshold(usize::MAX);
-        response.boxed()
+        let (body, stream) = match reply.body {
+            Body::Bytes(v) if head => {
+                let len = v.len() as u64;
+                (Vec::new(), Some(Streamed { reader: None, len }))
+            }
+            Body::Bytes(v) => (v, None),
+            // Counted at the file read, so an aborted download is not
+            // credited with bytes that were never read.
+            Body::Stream { reader, len } => {
+                let counted = Counting { inner: reader, owner: Arc::clone(inner) };
+                (Vec::new(), Some(Streamed { reader: Some(Box::new(counted)), len }))
+            }
+            Body::Head(len) => (Vec::new(), Some(Streamed { reader: None, len })),
+        };
+        httpd::Reply { status: reply.status, content_type, body, headers, stream }
     }
 }
 
@@ -431,42 +359,44 @@ impl Inner {
         self.allowed_hosts.iter().any(|h| h == host)
     }
 
+    /// Host and credential checks, which come before anything else is looked at.
+    fn gate(&self, id: u64, method: &str, raw_path: &str, raw_query: &str, headers: &[(String, String)]) -> Option<Reply> {
+        if !self.host_allowed(headers) {
+            return Some(Reply::error(id, 403, "AccessDenied", "Invalid Host header"));
+        }
+
+        let creds = self.creds.as_ref()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let Err(e) = s3_sigv4::verify(creds, method, raw_path, raw_query, headers, now) else {
+            return None;
+        };
+        Some(match e {
+            AuthError::Missing | AuthError::Malformed => Reply::error(id, 403, "AccessDenied", "Access Denied"),
+            AuthError::Expired => Reply::error(id, 403, "AccessDenied", "Request has expired"),
+            // An unknown key id answers like a bad secret; see `verify`.
+            AuthError::UnknownKey | AuthError::BadSignature => Reply::error(
+                id,
+                403,
+                "SignatureDoesNotMatch",
+                "The request signature we calculated does not match the signature you provided",
+            ),
+        })
+    }
+
     fn route(
         &self,
         id: u64,
         method: &str,
-        url: &str,
+        raw_path: &str,
+        raw_query: &str,
         headers: &[(String, String)],
         meta: &mut Meta,
     ) -> Reply {
-        let (raw_path, raw_query) = url.split_once('?').unwrap_or((url, ""));
-
-        if !self.host_allowed(headers) {
-            return Reply::error(id, 403, "AccessDenied", "Invalid Host header");
-        }
-
-        if let Some(creds) = &self.creds {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            if let Err(e) = s3_sigv4::verify(creds, method, raw_path, raw_query, headers, now) {
-                return match e {
-                    AuthError::Missing | AuthError::Malformed => {
-                        Reply::error(id, 403, "AccessDenied", "Access Denied")
-                    }
-                    AuthError::Expired => {
-                        Reply::error(id, 403, "AccessDenied", "Request has expired")
-                    }
-                    // An unknown key id answers like a bad secret; see `verify`.
-                    AuthError::UnknownKey | AuthError::BadSignature => Reply::error(
-                        id,
-                        403,
-                        "SignatureDoesNotMatch",
-                        "The request signature we calculated does not match the signature you provided",
-                    ),
-                };
-            }
+        if let Some(denied) = self.gate(id, method, raw_path, raw_query, headers) {
+            return denied;
         }
 
         let head = match method {
@@ -1823,7 +1753,7 @@ mod tests {
         let stalled: Vec<TcpStream> = (0..3)
             .map(|_| {
                 let mut s = TcpStream::connect(f.addr).unwrap();
-                write!(s, "GET /logs/{key} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+                write!(s, "GET /logs/{key} HTTP/1.1\r\nHost: {}\r\n\r\n", f.addr).unwrap();
                 s
             })
             .collect();
@@ -1984,4 +1914,427 @@ mod tests {
         );
         assert_eq!(tags(&xml, "IsTruncated"), vec!["true"]);
     }
+
+    // --- hostile input ---------------------------------------------------
+
+    fn raw_request(addr: SocketAddr, bytes: &[u8]) -> (u16, String) {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let _ = s.write_all(bytes);
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let text = String::from_utf8_lossy(&out).into_owned();
+        (text.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0), text)
+    }
+
+    #[test]
+    fn traversal_in_every_encoding_and_position_finds_nothing() {
+        let f = Fixture::new();
+        let secret = "outside the store";
+        let level = "hour=2026-01-01T00/level=info";
+        let paths: Vec<String> = vec![
+            // absolute and rooted
+            "/logs//etc/passwd".into(), "/logs/%2Fetc%2Fpasswd".into(), "/logs/%2Fsecret.parquet".into(),
+            format!("/logs/{}", f.tmp.path().join("secret.parquet").display()),
+            // dot segments, raw and encoded once, twice and three times
+            "/logs/./../secret.parquet".into(), "/logs/%2e/%2e%2e/secret.parquet".into(), "/logs/%2E%2E/secret.parquet".into(),
+            "/logs/%252e%252e%252fsecret.parquet".into(), "/logs/%25252e%25252e/secret.parquet".into(),
+            "/logs/..%2fsecret.parquet".into(), "/logs/..%2Fsecret.parquet".into(), format!("/logs/{level}/..%2f..%2f..%2fsecret.parquet"),
+            // backslash, raw and encoded, and a drive letter
+            "/logs/..\\secret.parquet".into(), "/logs/%5c..%5csecret.parquet".into(), "/logs/C:%5csecret.parquet".into(),
+            "/logs/..%255csecret.parquet".into(),
+            // overlong and non-UTF-8 spellings of '.' and '/'
+            "/logs/%c0%ae%c0%ae/secret.parquet".into(), "/logs/%c0%af%c0%afsecret.parquet".into(), "/logs/%e0%80%ae%e0%80%ae/secret.parquet".into(),
+            "/logs/%ff%fe/secret.parquet".into(), "/logs/%u002e%u002e/secret.parquet".into(), "/logs/..%00/secret.parquet".into(),
+            // NUL in the middle and at the end, raw and encoded
+            format!("/logs/{level}/a.parquet%00.txt"), format!("/logs/{level}%00/a.parquet"), "/logs/%00".into(), "/logs/%00../secret.parquet".into(),
+            // trailing dot, space, slash, dot-segment in the last position
+            format!("/logs/{level}/a.parquet."), format!("/logs/{level}/a.parquet%20"), format!("/logs/{level}/a.parquet/"),
+            format!("/logs/{level}/a.parquet/."), format!("/logs/{level}/a.parquet/.."),
+            // bucket position
+            "/%2e%2e/secret.parquet".into(), "/../logs/secret.parquet".into(), "/logs%2f..%2fsecret.parquet".into(),
+            "/logs%00/x.parquet".into(), "/LOGS/hour=2026-01-01T00/level=info/a.parquet".into(),
+            // malformed escapes
+            "/logs/%".into(), "/logs/%2".into(), "/logs/%zz/a.parquet".into(), "/logs/%2e%2".into(),
+        ];
+        for t in &paths {
+            let (status, text) = raw_request(f.addr, format!("GET {t} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", f.addr).as_bytes());
+            assert!(matches!(status, 400 | 404), "{t}: {status}");
+            assert!(!text.contains(secret), "{t} returned the file outside the store");
+            let (status, text) = raw_request(f.addr, format!("HEAD {t} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", f.addr).as_bytes());
+            assert!(matches!(status, 400 | 404), "HEAD {t}: {status} {text}");
+        }
+        // The same names as listing prefixes list nothing outside the store.
+        for prefix in ["../", "%2e%2e/", "..%2f", "%2e%2e%2f", "./", "a/../", "\\", "/", "//", "%00", "hour=2026-01-01T00/../..", "%252e%252e/"] {
+            let r = f.list(&format!("prefix={prefix}"));
+            assert_eq!(200, r.status, "{prefix}");
+            assert!(!r.text().contains("secret"), "{prefix}: {}", r.text());
+            assert!(!r.text().contains("<Key>"), "{prefix} lists a key: {}", r.text());
+        }
+        // Control: the real object is still there.
+        assert_eq!(200, f.get(&obj(K_INFO_A)).status);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_directory_or_file_in_the_store_is_neither_listed_nor_read() {
+        let f = Fixture::new();
+        let outside = f.tmp.path().join("outside");
+        fs::create_dir_all(outside.join("level=info")).unwrap();
+        fs::write(outside.join("level=info/x.parquet"), b"outside the store").unwrap();
+        let hour = f.store.join("hour=2026-01-01T00");
+        std::os::unix::fs::symlink(&outside, f.store.join("linked")).unwrap();
+        std::os::unix::fs::symlink(outside.join("level=info"), hour.join("level=linked")).unwrap();
+        std::os::unix::fs::symlink(f.tmp.path().join("secret.parquet"), hour.join("level=info/s.parquet")).unwrap();
+        // A link to the store itself must not make a loop the walker follows forever.
+        std::os::unix::fs::symlink(&f.store, hour.join("loop")).unwrap();
+        for key in ["linked/level=info/x.parquet", "hour=2026-01-01T00/level=linked/x.parquet", "hour=2026-01-01T00/level=info/s.parquet", "hour=2026-01-01T00/loop/hour=2026-01-01T00/level=info/a.parquet"] {
+            assert_eq!(404, f.get(&obj(key)).status, "{key}");
+        }
+        for query in ["", "prefix=linked/", "prefix=hour%3D2026-01-01T00%2F", "prefix=hour%3D2026-01-01T00%2Flevel%3Dlinked%2F", "delimiter=%2F"] {
+            let xml = f.list(query).text();
+            let listed = [tags(&xml, "Key"), tags(&xml, "Prefix").into_iter().skip(1).collect(), tags(&xml, "CommonPrefixes")].concat().join(" ");
+            for bad in ["linked", "loop", "s.parquet", "x.parquet"] {
+                assert!(!listed.contains(bad), "{query:?} lists {bad}: {xml}");
+            }
+        }
+    }
+
+    #[test]
+    fn range_requests_cannot_ask_for_more_than_the_object_or_for_many_pieces() {
+        let f = Fixture::new();
+        let t = obj(K_ERR_B); // 1000 bytes
+        let served = |range: &str| {
+            let r = f.get_h(&t, &[("Range", range)]);
+            assert!(r.body.len() <= 1000, "{range}: {} bytes", r.body.len());
+            r
+        };
+        for (range, status, len) in [
+            ("bytes=0-99999999999999999999999999", 200, 1000), // does not fit a u64: ignored, whole object
+            ("bytes=0-18446744073709551615", 206, 1000),
+            ("bytes=18446744073709551615-", 416, 0),
+            ("bytes=18446744073709551615-18446744073709551615", 416, 0),
+            ("bytes=-18446744073709551615", 206, 1000),
+            ("bytes=-99999999999999999999999999", 200, 1000),
+            ("bytes=999-18446744073709551615", 206, 1),
+            ("bytes=1000-", 416, 0),
+            ("bytes=-0", 416, 0),
+            ("bytes=5-4", 200, 1000),
+            ("bytes=-", 200, 1000),
+            ("bytes=", 200, 1000),
+            ("bytes=a-b", 200, 1000),
+            ("bytes=0x10-0x20", 200, 1000),
+            ("bytes=+1-2", 200, 1000),
+            ("bytes=1 -2", 206, 2),
+            ("items=0-9", 200, 1000),
+            ("bytes=0-9;x=1", 200, 1000),
+        ] {
+            let r = served(range);
+            assert_eq!(status, r.status, "{range}");
+            if status != 416 {
+                assert_eq!(len, r.body.len(), "{range}");
+            }
+        }
+        // Many ranges: S3 ignores a multi-range header, so the cost is one plain GET, never a multipart
+        // assembly or one read per range.
+        for count in [2usize, 100, 1000] {
+            let many = format!("bytes={}", (0..count).map(|i| format!("{i}-{i}")).collect::<Vec<_>>().join(","));
+            let r = served(&many);
+            assert_eq!((200, 1000), (r.status, r.body.len()), "{count} ranges");
+            assert_ne!(Some("multipart"), r.header("content-type").map(|c| &c[..9.min(c.len())]));
+        }
+        let too_many = format!("bytes={}", (0..5000).map(|i| format!("{i}-{i}")).collect::<Vec<_>>().join(","));
+        assert_eq!(431, f.get_h(&t, &[("Range", &too_many)]).status, "a 30 kB Range header is over the head budget");
+        // Repeated Range headers: one wins, and it is still bounded by the object.
+        let (status, text) = raw_request(f.addr, format!("GET {t} HTTP/1.1\r\nHost: {}\r\nRange: bytes=0-4\r\nRange: bytes=0-99999\r\nConnection: close\r\n\r\n", f.addr).as_bytes());
+        assert!(matches!(status, 200 | 206 | 416), "{text:.80}");
+    }
+
+    #[test]
+    fn a_huge_directory_lists_a_bounded_page_whatever_the_client_asks() {
+        let f = Fixture::new();
+        let dir = f.store.join("hour=2026-02-01T00/level=info");
+        fs::create_dir_all(&dir).unwrap();
+        for i in 0..5000 {
+            fs::write(dir.join(format!("f{i:05}.parquet")), b"x").unwrap();
+        }
+        let prefix = "prefix=hour%3D2026-02-01T00%2Flevel%3Dinfo%2F";
+        for max_keys in ["", "&max-keys=1000000", "&max-keys=2147483647", "&max-keys=9223372036854775807"] {
+            let xml = f.list(&format!("{prefix}{max_keys}")).text();
+            assert_eq!(1000, tags(&xml, "Key").len(), "{max_keys:?}");
+            assert_eq!(vec!["true"], tags(&xml, "IsTruncated"));
+            assert!(xml.len() < 400_000, "{} bytes", xml.len());
+        }
+        for bad in ["-1", "abc", "99999999999999999999", "1.5", ""] {
+            assert_eq!(400, f.list(&format!("{prefix}&max-keys={bad}")).status, "max-keys={bad}");
+        }
+        assert_eq!(0, tags(&f.list(&format!("{prefix}&max-keys=0")).text(), "Key").len());
+        // Thousands of distinct sub-prefixes roll up into at most one page too.
+        for i in 0..3000 {
+            fs::create_dir_all(f.store.join(format!("hour=2026-03-{:02}T{:02}", i % 28 + 1, i % 24)).join(format!("level=l{i}"))).unwrap();
+        }
+        let xml = f.list("delimiter=%2F&max-keys=100000").text();
+        assert!(tags(&xml, "CommonPrefixes").len() <= 1000, "{}", tags(&xml, "CommonPrefixes").len());
+        // A continuation token that is not one this server issued is refused, not followed.
+        for token in ["zz", "0", "../../etc/passwd", &"ab".repeat(2_000)] {
+            let r = f.list(&format!("continuation-token={token}"));
+            assert_eq!(400, r.status, "token {:.20}", token);
+        }
+    }
+
+    #[test]
+    fn very_long_query_strings_and_many_parameters_are_answered_not_amplified() {
+        let f = Fixture::new();
+        // Up to the head budget (16 KiB for the whole request line and headers) a long query is just answered.
+        let long = "a".repeat(10_000);
+        let r = f.list(&format!("prefix={long}"));
+        assert_eq!(200, r.status);
+        assert!(tags(&r.text(), "Key").is_empty());
+        assert!(r.body.len() < 2 * long.len() + 4096, "the prefix is echoed once");
+        let many: String = (0..1000).map(|i| format!("p{i}=v&")).collect();
+        assert_eq!(200, f.list(&many).status);
+        let escapes = "%41".repeat(3_000);
+        assert_eq!(200, f.list(&format!("prefix={escapes}")).status);
+        assert_eq!(200, f.list(&format!("prefix={}", "%".repeat(10_000))).status);
+        assert_eq!(200, f.list(&format!("prefix={}", "%e0%a4%a".repeat(1_000))).status);
+        // Past the budget: refused before the request is parsed any further.
+        for oversized in [format!("prefix={}", "a".repeat(100_000)), (0..20_000).map(|i| format!("p{i}=v&")).collect::<String>(), "%41".repeat(100_000)] {
+            assert_eq!(431, f.list(&oversized).status, "{} bytes of query", oversized.len());
+        }
+        // And the server is still fine.
+        assert_eq!(200, f.get(&obj(K_INFO_A)).status);
+    }
+
+    #[test]
+    fn nothing_but_get_and_head_is_served_and_the_store_never_changes() {
+        for creds in [false, true] {
+            let cfg = S3ServeConfig {
+                addr: "127.0.0.1:0".into(),
+                access_key: creds.then(|| "AK".to_string()),
+                secret_key: creds.then(|| "SK".to_string()),
+                ..Default::default()
+            };
+            let f = Fixture::with_cfg(cfg);
+            let snapshot = |dir: &Path| -> Vec<(String, u64)> {
+                fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, u64)>) {
+                    for e in fs::read_dir(dir).unwrap().flatten() {
+                        let p = e.path();
+                        if p.is_dir() { walk(&p, base, out) } else { out.push((p.strip_prefix(base).unwrap().display().to_string(), e.metadata().unwrap().len())) }
+                    }
+                }
+                let mut out = Vec::new();
+                walk(dir, dir, &mut out);
+                out.sort();
+                out
+            };
+            let before = snapshot(f.tmp.path());
+            let new_key = "hour=2026-04-01T00/level=info/new.parquet";
+            for method in ["PUT", "POST", "DELETE", "PATCH", "OPTIONS", "TRACE", "COPY", "MOVE", "PROPFIND", "put"] {
+                for target in [obj(new_key), obj(K_INFO_A), "/logs".to_string(), "/logs?delete".to_string(), "/logs?uploads".to_string(), "/".to_string()] {
+                    let body = b"<Delete><Object><Key>x</Key></Object></Delete>";
+                    let req = format!("{method} {target} HTTP/1.1\r\nHost: {}\r\nx-amz-copy-source: /logs/{K_INFO_A}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", f.addr, body.len());
+                    let (status, text) = raw_request(f.addr, &[req.as_bytes(), &body[..]].concat());
+                    // With credentials the request is judged unauthenticated first; either way it is refused.
+                    let want: &[u16] = if creds { &[403] } else { &[405, 501] };
+                    assert!(want.contains(&status), "creds={creds} {method} {target}: {status} {text:.100}");
+                    if !creds {
+                        assert!(text.to_ascii_lowercase().contains("allow: get, head") || status == 501, "{method} {target}: {text:.200}");
+                    }
+                }
+            }
+            assert_eq!(before, snapshot(f.tmp.path()), "creds={creds}: a refused write changed the store");
+        }
+    }
+
+    // SigV4 as a client does it, so the server's checks are tried with requests that are valid in every
+    // respect but the one under test.
+    fn sigv4(method: &str, path: &str, query: &str, host: &str, amz_date: &str, signed: &str, secret: &str) -> Vec<(String, String)> {
+        use hmac::{Hmac, Mac};
+        use sha2::{Digest, Sha256};
+        let hmac = |key: &[u8], data: &[u8]| {
+            let mut m = Hmac::<Sha256>::new_from_slice(key).unwrap();
+            m.update(data);
+            m.finalize().into_bytes().to_vec()
+        };
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let date = &amz_date[..8];
+        let hashed = "UNSIGNED-PAYLOAD";
+        let value = |name: &str| match name {
+            "host" => host.to_string(),
+            "x-amz-date" => amz_date.to_string(),
+            _ => hashed.to_string(),
+        };
+        let canon_headers: String = signed.split(';').map(|n| format!("{n}:{}\n", value(n))).collect();
+        let canonical = format!("{method}\n{path}\n{query}\n{canon_headers}\n{signed}\n{hashed}");
+        let to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{date}/us-east-1/s3/aws4_request\n{}", hex(&Sha256::digest(canonical.as_bytes())));
+        let k = hmac(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+        let k = hmac(&hmac(&hmac(&k, b"us-east-1"), b"s3"), b"aws4_request");
+        let signature = hex(&hmac(&k, to_sign.as_bytes()));
+        vec![
+            ("x-amz-date".into(), amz_date.to_string()),
+            ("x-amz-content-sha256".into(), hashed.into()),
+            ("Authorization".into(), format!("AWS4-HMAC-SHA256 Credential=AK/{date}/us-east-1/s3/aws4_request, SignedHeaders={signed}, Signature={signature}")),
+        ]
+    }
+
+    fn amz_at(offset_secs: i64) -> String {
+        let t = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + offset_secs) as u64;
+        let digits: String = iso_date(UNIX_EPOCH + Duration::from_secs(t))[..19].chars().filter(char::is_ascii_digit).collect();
+        format!("{}T{}Z", &digits[..8], &digits[8..])
+    }
+
+    fn secured_fixture() -> Fixture {
+        Fixture::with_cfg(S3ServeConfig { addr: "127.0.0.1:0".into(), access_key: Some("AK".into()), secret_key: Some("SK".into()), ..Default::default() })
+    }
+
+    const SIGNED_ALL: &str = "host;x-amz-content-sha256;x-amz-date";
+
+    fn code(r: &Resp) -> String {
+        tags(&r.text(), "Code").into_iter().next().unwrap_or_default()
+    }
+
+    #[test]
+    fn a_signature_is_only_good_for_the_request_it_was_made_for() {
+        let f = secured_fixture();
+        let host = f.addr.to_string();
+        let path = obj(K_INFO_A);
+        let call = |method: &str, path: &str, query: &str, h: &[(String, String)]| {
+            let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let target = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+            http(f.addr, method, &target, &h)
+        };
+        let good = sigv4("GET", &path, "", &host, &amz_at(0), SIGNED_ALL, "SK");
+        assert_eq!(200, call("GET", &path, "", &good).status, "control");
+
+        // Wrong secret, a flipped bit anywhere in the signature, a short or empty one.
+        let wrong = sigv4("GET", &path, "", &host, &amz_at(0), SIGNED_ALL, "not-the-secret");
+        assert_eq!(("SignatureDoesNotMatch", 403), (code(&call("GET", &path, "", &wrong)).as_str(), call("GET", &path, "", &wrong).status));
+        let auth = good.iter().find(|(k, _)| k == "Authorization").unwrap().1.clone();
+        let sig_at = auth.rfind("Signature=").unwrap() + "Signature=".len();
+        for (name, tampered) in [
+            ("last digit changed", { let mut a = auth.clone(); let c = a.pop().unwrap(); a.push(if c == '0' { '1' } else { '0' }); a }),
+            ("first digit changed", { let mut a = auth.clone(); let c = a.remove(sig_at); a.insert(sig_at, if c == '0' { '1' } else { '0' }); a }),
+            ("one byte short", auth[..auth.len() - 2].to_string()),
+            ("empty", auth[..sig_at].to_string()),
+            ("not hex", format!("{}{}", &auth[..sig_at], "z".repeat(64))),
+            ("sha512 label", auth.replace("AWS4-HMAC-SHA256", "AWS4-HMAC-SHA512")),
+            ("sigv2 style", "AWS AK:c2lnbmF0dXJl".to_string()),
+            ("bearer instead", "Bearer AK".to_string()),
+        ] {
+            let mut h = good.clone();
+            h.iter_mut().find(|(k, _)| k == "Authorization").unwrap().1 = tampered;
+            let r = call("GET", &path, "", &h);
+            assert_eq!(403, r.status, "{name}");
+            assert!(r.body.len() < 2000 && !r.text().contains("SK"), "{name}");
+        }
+
+        // Past the head budget (16 KiB) the request is refused before anything reads it.
+        let mut h = good.clone();
+        h.iter_mut().find(|(k, _)| k == "Authorization").unwrap().1 = format!("{}{}", &auth[..sig_at], "a".repeat(1 << 20));
+        assert_eq!(431, call("GET", &path, "", &h).status, "a megabyte of signature");
+
+        // The signature binds method, path and query: reusing it for anything else fails.
+        assert_eq!(403, call("HEAD", &path, "", &good).status, "other method");
+        assert_eq!(403, call("GET", &obj(K_INFO_E), "", &good).status, "other key");
+        let listing = sigv4("GET", "/logs", "list-type=2", &host, &amz_at(0), SIGNED_ALL, "SK");
+        assert_eq!(200, call("GET", "/logs", "list-type=2", &listing).status, "control");
+        assert_eq!(403, call("GET", "/logs", "list-type=2&prefix=", &listing).status, "added a parameter");
+        assert_eq!(403, call("GET", "/logs", "list-type=2&max-keys=1", &listing).status, "added a parameter");
+        assert_eq!(403, call("GET", "/logs", "list-type=1", &listing).status, "changed a value");
+        assert_eq!(403, call("GET", "/logs/", "list-type=2", &listing).status, "trailing slash");
+
+        // The signature must cover the host and the date, or it could be replayed under another name.
+        for signed in ["x-amz-content-sha256;x-amz-date", "host;x-amz-content-sha256", "host"] {
+            let h = sigv4("GET", &path, "", &host, &amz_at(0), signed, "SK");
+            assert_eq!(403, call("GET", &path, "", &h).status, "SignedHeaders={signed}");
+        }
+        // Another Host than the one signed.
+        let mut other_host = good.clone();
+        other_host.push(("Host".into(), "evil.example".into()));
+        assert_eq!(403, call("GET", &path, "", &other_host).status);
+    }
+
+    #[test]
+    fn a_stale_or_future_signature_is_refused_and_a_replay_inside_the_window_is_accepted() {
+        let f = secured_fixture();
+        let host = f.addr.to_string();
+        let path = obj(K_INFO_A);
+        let go = |offset: i64| {
+            let h = sigv4("GET", &path, "", &host, &amz_at(offset), SIGNED_ALL, "SK");
+            let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            http(f.addr, "GET", &path, &h)
+        };
+        for offset in [-3600, -86_400, -31_536_000, 3600, 86_400] {
+            let r = go(offset);
+            assert_eq!((403, "AccessDenied"), (r.status, code(&r).as_str()), "{offset}s");
+            assert!(r.text().contains("expired"), "{offset}s: {}", r.text());
+        }
+        assert_eq!(200, go(-600).status, "ten minutes old is inside the 15 minute window");
+        assert_eq!(200, go(600).status, "and so is ten minutes of clock skew ahead");
+        // Replay: the same request, byte for byte, again. SigV4 has no nonce; the window is the defence.
+        let h = sigv4("GET", &path, "", &host, &amz_at(0), SIGNED_ALL, "SK");
+        let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(200, http(f.addr, "GET", &path, &h).status);
+        assert_eq!(200, http(f.addr, "GET", &path, &h).status, "a replay inside the window is served: read-only, same bytes");
+        // Not a date at all.
+        for bad in ["", "20260101", "2026-01-01T00:00:00Z", "99999999T999999Z", "00000000T000000Z", "20261301T000000Z", "20260101T000000", &"9".repeat(10_000)] {
+            let h = sigv4("GET", &path, "", &host, &amz_at(0), SIGNED_ALL, "SK");
+            let mut h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            h.iter_mut().find(|(k, _)| *k == "x-amz-date").unwrap().1 = bad;
+            assert_eq!(403, http(f.addr, "GET", &path, &h).status, "date {:.20}", bad);
+        }
+    }
+
+    #[test]
+    fn a_presigned_query_string_is_not_credentials_for_reading() {
+        let f = secured_fixture();
+        let creds = Credentials { access_key: "AK".into(), secret_key: "SK".into() };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let url = s3_sigv4::presign(&creds, "GET", &f.addr.to_string(), &obj(K_INFO_A), "us-east-1", now, 300);
+        let r = f.get(&url);
+        assert_eq!(403, r.status, "query-string auth is for part upload on the central, not for this server");
+        // Credentials in the query beside a header-less request, in the other common spellings.
+        for q in ["AWSAccessKeyId=AK&Signature=x&Expires=99999999999", "access_key=AK&secret_key=SK", "X-Amz-Credential=AK"] {
+            assert_eq!(403, f.get(&format!("{}?{q}", obj(K_INFO_A))).status, "{q}");
+        }
+    }
+
+    #[test]
+    fn authentication_is_judged_before_anything_else_about_the_request() {
+        let f = secured_fixture();
+        let host = f.addr.to_string();
+        // A refused write, a missing key and a traversal all look the same to a caller with no signature.
+        for (method, target) in [("PUT", obj(K_INFO_A)), ("GET", obj("nope.parquet")), ("GET", "/logs/../secret.parquet".to_string()), ("DELETE", "/logs".to_string()), ("GET", "/nobucket/x".to_string())] {
+            let r = http(f.addr, method, &target, &[]);
+            assert_eq!((403, "AccessDenied"), (r.status, code(&r).as_str()), "{method} {target}");
+        }
+        // With a good signature the refusals come back to what they are.
+        let h = sigv4("PUT", &obj(K_INFO_A), "", &host, &amz_at(0), SIGNED_ALL, "SK");
+        let h: Vec<(&str, &str)> = h.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(405, http(f.addr, "PUT", &obj(K_INFO_A), &h).status);
+    }
+
+    #[test]
+    fn a_huge_header_is_refused_without_buffering_it() {
+        let f = Fixture::new();
+        let big = "a".repeat(64 * 1024 * 1024);
+        let (status, _) = raw_request(f.addr, format!("GET /logs?list-type=2 HTTP/1.1\r\nHost: {}\r\nX-Big: {big}\r\nConnection: close\r\n\r\n", f.addr).as_bytes());
+        assert_eq!(431, status, "answered {status} after buffering 64 MiB");
+        let many: String = (0..500).map(|i| format!("X-{i}: v\r\n")).collect();
+        let (status, _) = raw_request(f.addr, format!("GET /logs?list-type=2 HTTP/1.1\r\nHost: {}\r\n{many}Connection: close\r\n\r\n", f.addr).as_bytes());
+        assert_eq!(431, status, "500 headers");
+        let endless = [b"GET /logs HTTP/1.1\r\nX: ".to_vec(), vec![b'z'; 8 << 20]].concat();
+        assert_eq!(431, raw_request(f.addr, &endless).0, "a head with no end");
+        assert_eq!(200, f.list("").status, "still serving");
+    }
+
+
+    #[test]
+    fn a_logged_config_never_carries_the_secret_key() {
+        let cfg = S3ServeConfig { access_key: Some("AKID".into()), secret_key: Some("SENTINEL-SECRET".into()), ..Default::default() };
+        for shown in [format!("{cfg:?}"), format!("{cfg:#?}")] {
+            assert!(!shown.contains("SENTINEL"), "{shown}");
+        }
+    }
+
 }
