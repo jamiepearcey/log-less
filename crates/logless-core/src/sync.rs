@@ -603,7 +603,7 @@ pub fn encode_frames(instance: &str, min_severity: u8, batch: &[LogRecord]) -> (
 
 /// Runs the sender until `stop` is set and the tap is empty. Owns the spool and the planner.
 /// `known_templates` are the template ids the catalog holds, so a restart is not a wave of novel shapes.
-pub fn run(control: Arc<SyncControl>, rx: Receiver<Item>, spool_dir: &Path, stop: &AtomicBool, known_templates: Vec<u64>) {
+pub fn run(control: Arc<SyncControl>, rx: Receiver<Item>, spool_dir: &Path, stop: &AtomicBool, known_templates: Vec<u64>, known_pairs: Vec<(Option<String>, u64)>) {
     let mut spool = match Spool::open(spool_dir, SpoolConfig { max_total_bytes: 256 * 1024 * 1024, ..SpoolConfig::default() }) {
         Ok(s) => s,
         Err(e) => {
@@ -613,7 +613,7 @@ pub fn run(control: Arc<SyncControl>, rx: Receiver<Item>, spool_dir: &Path, stop
         }
     };
     let first = control.target().map(|t| t.planner_config()).unwrap_or_default();
-    let mut planner = Planner::new(control.instance().to_string(), first, now_ms(), known_templates);
+    let mut planner = Planner::new(control.instance().to_string(), first, now_ms(), known_templates).with_known_pairs(now_ms(), known_pairs);
     let mut failures = 0u32;
     let mut next_attempt = Instant::now();
     let mut disconnected = false;
@@ -832,7 +832,7 @@ mod tests {
         let (tap, rx) = channel(Arc::clone(&control));
         let stop = Arc::new(AtomicBool::new(false));
         let (c, s, d) = (Arc::clone(&control), Arc::clone(&stop), dir.join(SPOOL_DIR));
-        let handle = std::thread::spawn(move || run(c, rx, &d, &s, vec![1, 2, 3]));
+        let handle = std::thread::spawn(move || run(c, rx, &d, &s, vec![1, 2, 3], Vec::new()));
         Running { control, tap, stop, handle }
     }
 
@@ -1058,6 +1058,7 @@ mod tests {
         // A log shape the catalog never held.
         run.tap.offer(&[rec_t("something new broke", Severity::INFO, 424_242)]);
         wait_for("the marker", || p.got.lock().unwrap().iter().any(|r| has(r, "logless.anomaly")));
+        wait_for("the status to show it", || !run.control.status().anomalies.is_empty());
         let status = run.control.status();
         assert_eq!("novel", status.anomalies[0].kind);
         assert_eq!(vec!["api".to_string()], status.boosted_services);

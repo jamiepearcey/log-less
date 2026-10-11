@@ -398,6 +398,16 @@ impl Catalog {
         Ok(())
     }
 
+    /// Every (service, template id) pair ever merged into the store, for the sync planner's "first time in this service".
+    pub fn load_template_services(&self) -> Result<Vec<(Option<String>, u64)>, CatalogError> {
+        let mut stmt = self.conn.prepare("SELECT template_id, has_service, service FROM template_services")?;
+        let rows = stmt.query_map([], |row| {
+            let has: bool = row.get(1)?;
+            Ok((has.then(|| row.get::<_, String>(2)).transpose()?, row.get::<_, i64>(0)? as u64))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn load_templates(&self) -> Result<Vec<crate::drain::Template>, CatalogError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, tokens, count, first_seen, last_seen FROM templates ORDER BY id",

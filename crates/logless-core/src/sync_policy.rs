@@ -36,6 +36,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::model::{Attr, AttrValue, LogRecord};
+use crate::sync_signals::{Finding, Signals};
 
 /// Records at or above this OTel severity (errors and fatals) are always sent in full.
 pub const FULL_FROM: u8 = 17;
@@ -94,7 +95,7 @@ impl Default for PlannerConfig {
 pub struct Anomaly {
     pub at_ms: u64,
     pub service: Option<String>,
-    /// `novel` (a template never seen) or `rate` (warnings and worse far above the service's baseline).
+    /// `novel`, `rate`, `template_rate`, `silence`, `new_pair`, `error_share`, `param_drift` or `flow`; see `sync_signals`.
     pub kind: String,
     pub detail: String,
     /// Records of lead-up sent with it.
@@ -144,6 +145,7 @@ pub struct Planner {
     seen: HashSet<u64>,
     learn_until_ms: u64,
     rates: Rates,
+    signals: Signals,
     anomalies: VecDeque<Anomaly>,
     last_anomaly: HashMap<(Option<String>, &'static str), u64>,
     pub stats: PlannerStats,
@@ -164,10 +166,17 @@ impl Planner {
             seen,
             learn_until_ms,
             rates: Rates { bucket_start_ms: now_ms - now_ms % RATE_BUCKET_MS, ..Rates::default() },
+            signals: Signals::new(now_ms, []),
             anomalies: VecDeque::new(),
             last_anomaly: HashMap::new(),
             stats: PlannerStats::default(),
         }
+    }
+
+    /// The (service, template) pairs the catalog already holds, so a restart is not a wave of "new in this service".
+    pub fn with_known_pairs(mut self, now_ms: u64, pairs: impl IntoIterator<Item = (Option<String>, u64)>) -> Self {
+        self.signals = Signals::new(now_ms, pairs);
+        self
     }
 
     pub fn config(&self) -> &PlannerConfig {
@@ -201,16 +210,21 @@ impl Planner {
                 continue;
             }
             if self.cfg.anomaly_boost {
+                let mut first_ever = false;
                 if let Some(template) = record.template_id {
                     if !self.seen.contains(&template) {
+                        first_ever = true;
                         if self.seen.len() < SEEN_MAX {
                             self.seen.insert(template);
                         }
                         if now_ms >= self.learn_until_ms {
                             let detail = format!("a log shape never seen before (template {template})");
-                            self.trigger(record.service.clone(), "novel", detail, now_ms, &mut out);
+                            self.trigger(record.service.clone(), "novel", detail, true, now_ms, &mut out);
                         }
                     }
+                }
+                for f in self.signals.observe(now_ms, record, first_ever) {
+                    self.finding(f, now_ms, &mut out);
                 }
                 if record.severity.0 >= WARN {
                     *self.rates.counts.entry(record.service.clone()).or_insert(0) += 1;
@@ -233,7 +247,10 @@ impl Planner {
         if self.cfg.anomaly_boost {
             for (service, count, mean) in self.close_rate_buckets(now_ms) {
                 let detail = format!("{count} warnings or worse in {} s, against about {mean:.0} for a bucket this long", RATE_BUCKET_MS / 1000);
-                self.trigger(service, "rate", detail, now_ms, &mut out);
+                self.trigger(service, "rate", detail, true, now_ms, &mut out);
+            }
+            for f in self.signals.close_buckets(now_ms) {
+                self.finding(f, now_ms, &mut out);
             }
         }
         self.prune_ring(now_ms);
@@ -285,11 +302,19 @@ impl Planner {
         }
     }
 
-    fn trigger(&mut self, service: Option<String>, kind: &'static str, detail: String, now_ms: u64, out: &mut Vec<LogRecord>) {
-        let until = now_ms + BOOST_MS;
-        let entry = self.boosts.entry(service.clone()).or_insert(0);
-        let newly_boosted = *entry <= now_ms;
-        *entry = (*entry).max(until);
+    fn finding(&mut self, f: Finding, now_ms: u64, out: &mut Vec<LogRecord>) {
+        self.trigger(f.service, f.kind, f.detail, f.boost, now_ms, out);
+    }
+
+    /// Notes an anomaly: a marker record for the peer and a line in the log. With `boost`, also sends the service's lead-up and
+    /// raises it to full detail for [`BOOST_MS`]; without (a silence), there is nothing more to send.
+    fn trigger(&mut self, service: Option<String>, kind: &'static str, detail: String, boost: bool, now_ms: u64, out: &mut Vec<LogRecord>) {
+        let mut newly_boosted = false;
+        if boost {
+            let entry = self.boosts.entry(service.clone()).or_insert(0);
+            newly_boosted = *entry <= now_ms;
+            *entry = (*entry).max(now_ms + BOOST_MS);
+        }
         let quiet = self.last_anomaly.get(&(service.clone(), kind)).is_some_and(|at| now_ms.saturating_sub(*at) < ANOMALY_QUIET_MS);
         if quiet && !newly_boosted {
             return;
@@ -303,7 +328,7 @@ impl Planner {
         let mut lead = Vec::new();
         let mut keep = VecDeque::with_capacity(self.ring.len());
         for (at, mut record) in std::mem::take(&mut self.ring) {
-            if record.service == service {
+            if boost && record.service == service {
                 record.attributes.push(Attr { key: ATTR_SUPPLEMENT.into(), value: AttrValue::Str(format!("lookback:{kind}")) });
                 lead.push(record);
             } else {
@@ -430,7 +455,7 @@ mod tests {
         let mut p = planner(100, 0);
         let batch: Vec<_> = (0..100).map(|i| rec("api", Severity::INFO, 1, i)).collect();
         assert_eq!(100, p.process(1_000, &batch).len());
-        assert!(p.tick(10 * 60_000, true).is_empty());
+        assert!(p.tick(10 * 60_000, true).iter().all(|r| !is_rollup(r)), "nothing was left out, so nothing is rolled up");
         assert_eq!(0, p.stats.sampled_out);
     }
 
@@ -450,18 +475,20 @@ mod tests {
         let infos_sent = sent.iter().filter(|r| r.severity < Severity::ERROR).count() as u64;
         let rollups = p.tick(10 * 60_000, true);
         assert_eq!(2_000, infos_sent + rollup_total(&rollups), "sent plus rolled-up is exactly what the agent took");
-        assert!(rollups.iter().all(is_rollup));
+        assert!(rollups.iter().filter(|r| is_rollup(r)).count() > 0);
         assert!(infos_sent > 50 && infos_sent < 400, "about 10% of 2000, got {infos_sent}");
     }
 
     #[test]
     fn rollups_are_idempotent_across_a_retry_and_carry_the_window() {
-        let mut a = planner(1, 0);
-        let mut b = planner(1, 0);
+        // Boost off: this is about the rollups, and a first sighting of a pair would (rightly) send everything.
+        let quiet = || Planner::new("edge".into(), PlannerConfig { fidelity: 1, anomaly_boost: false, ..PlannerConfig::default() }, 0, [1, 2, 3, 4, 5]);
+        let (mut a, mut b) = (quiet(), quiet());
         let batch: Vec<_> = (0..500).map(|i| rec("api", Severity::INFO, 2, 61_000 + i)).collect();
         a.process(62_000, &batch);
         b.process(62_000, &batch);
         let (ra, rb) = (a.tick(3_600_000, true), b.tick(3_600_000, true));
+        let (ra, rb): (Vec<_>, Vec<_>) = (ra.into_iter().filter(is_rollup).collect(), rb.into_iter().filter(is_rollup).collect());
         assert_eq!(ra.iter().map(|r| r.event_id).collect::<Vec<_>>(), rb.iter().map(|r| r.event_id).collect::<Vec<_>>(), "same key, same id");
         let r = &ra[0];
         assert_eq!(60_000 * 1_000_000, r.observed_unix_nano, "the minute it covers");
@@ -538,8 +565,8 @@ mod tests {
         now += RATE_BUCKET_MS;
         let out = p.tick(now, false);
         let anomaly = p.anomalies();
-        assert_eq!("rate", anomaly[0].kind);
-        assert!(anomaly[0].detail.contains("400"));
+        let rate = anomaly.iter().find(|a| a.kind == "rate").expect("the service-level rate spike is logged");
+        assert!(rate.detail.contains("400"));
         assert!(!out.is_empty() || p.boosted(now) == vec!["api".to_string()]);
         assert_eq!(vec!["api".to_string()], p.boosted(now));
     }

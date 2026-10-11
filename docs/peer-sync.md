@@ -93,6 +93,19 @@ in-memory ring (20,000 records), flagged `logless.supplement = lookback:<kind>`;
 detail for 5 minutes**; and (3) sends a **marker record** (`logless.anomaly`, `.kind`, `.lookback`) the peer can alert
 on without knowing the sender's heuristics. The same service alarming again within 30 s while boosted is logged once.
 
+More signals (`sync_signals.rs`), each against the instance's own baseline, in memory and bounded:
+
+| `kind` | Noticed | Boosts |
+|---|---|---|
+| `template_rate` | one template's rate far above its own baseline | yes |
+| `silence` | a regular template, or a whole service, stopped (once per episode; a silent service is one finding) | no |
+| `new_pair` | a known template in a service for the first time (pairs read from the catalog) | yes |
+| `error_share` | errors a much larger share of a service's records, even as traffic falls | yes |
+| `param_drift` | a number inside a template (latency, size, count) shifted well off its bucket-by-bucket baseline | yes |
+| `flow` | two templates in one trace in an order never seen (per service) | yes |
+
+A stall of over an hour resets the baselines rather than calling every service silent.
+
 The planner's state (ring, baselines, unflushed rollups, boosts) is in memory: a restart forgets the current minute's
 rollups and relearns baselines for about a minute.
 
@@ -111,5 +124,3 @@ missing. The agent pushes: a peer behind another network can be sent a range, bu
 * **Query pushdown** (a filtered scan or partial aggregate answered by the instance). Measure first: the S3 path's bytes
   per query, with `scripts/s3-count-proxy.py` in the console repo, decide whether it pays, and keep the edge under the
   2 to 3 MB budget in `docs/platform-thesis.md` section 15, or ship it as a separate `logless-query` binary.
-* **More detectors:** per-template rate and silence, a known template appearing in a service for the first time, error
-  share rather than error count, numeric parameter drift, call-sequence novelty (`flow_hash`).

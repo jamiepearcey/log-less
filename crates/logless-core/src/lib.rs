@@ -31,6 +31,7 @@ pub mod counters;
 pub mod spool;
 pub mod sync;
 pub mod sync_policy;
+pub mod sync_signals;
 pub mod sentry;
 pub mod store;
 pub mod tail;

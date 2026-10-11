@@ -1017,7 +1017,8 @@ fn run(
             .and_then(|c| c.load_templates())
             .map(|t| t.into_iter().map(|t| t.id).collect())
             .unwrap_or_default();
-        std::thread::Builder::new().name("logless-sync".into()).spawn(move || sync::run(control, sync_rx, &spool_dir, &never, known))?
+        let known_pairs = Catalog::open(&catalog_path(config)).and_then(|c| c.load_template_services()).unwrap_or_default();
+        std::thread::Builder::new().name("logless-sync".into()).spawn(move || sync::run(control, sync_rx, &spool_dir, &never, known, known_pairs))?
     };
 
     // One variable with one meaning, not two flags: the maintainer must both
