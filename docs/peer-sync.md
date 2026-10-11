@@ -143,11 +143,15 @@ the secret) and the endpoints answer 404. Both endpoints take the same bearer to
 
 | Step | Request | Central does |
 |---|---|---|
-| 1 | `POST /v1/parts/presign {name, size, sha256}` | checks the name is `<64 hex sha256>.parquet` and matches `sha256`, and that `size` is 1 to `max_part_bytes` (422 otherwise); HEADs `<prefix>/<name>`; answers `already_present: true` if an object of that name and size exists, else a presigned PUT `url` valid `url_ttl_secs` and its `expires_at_ms` |
-| 2 | `PUT <url>` (edge to object storage) | nothing: the file goes straight to the bucket |
-| 3 | `POST /v1/parts/commit {name, size, sha256, rows, min_unix_nano, max_unix_nano, origin}` | HEADs the object and needs that size (409 if it is not there), records it in the catalog's `peer_parts` table, answers `{recorded}`; a repeated commit records nothing |
+| 1 | `POST /v1/parts/presign {name, size, sha256}` | checks the name is `<64 hex sha256>.parquet` and matches `sha256`, and that `size` is 1 to `max_part_bytes` (422 otherwise); HEADs `<prefix>/<name>` with `x-amz-checksum-mode: ENABLED`; answers `already_present: true` only if the object has that size and storage reports the SHA-256 checksum of the name, else a presigned PUT `url` valid `url_ttl_secs`, its `expires_at_ms`, and `headers: {x-amz-checksum-sha256}` (signed into the URL) |
+| 2 | `PUT <url>` with `headers` (edge to object storage) | nothing: the file goes straight to the bucket, and the storage refuses a body whose SHA-256 is not the one signed |
+| 3 | `POST /v1/parts/commit {name, size, sha256, rows, min_unix_nano, max_unix_nano, origin}` | HEADs the object and needs that size and checksum (409 otherwise), records it in the catalog's `peer_parts` table, answers `{recorded}`; a repeated commit records nothing |
 
-Parts are named by their content, so every step is idempotent: the same file is the same object.
+Parts are named by their content, so every step is idempotent: the same file is the same object. The content is
+checked by the storage, through S3's SHA-256 checksum: an object of the right size without the name's checksum (written
+some other way, or with other bytes) is not present, so it is uploaded again and a commit before that is refused. The
+checksum is what the storage recorded at upload; bit rot under the storage is the storage's to catch (MinIO refuses to
+serve such an object), not central's. Run against a real MinIO: `docs/evidence/parts-minio.md`.
 
 On the edge, `POST /admin/v1/sync/parts {"from_ms", "to_ms"}` starts an upload of the committed files that overlap the
 range, in the background (at most 31 days, one at a time, 409 otherwise; `POST /admin/v1/sync/parts/cancel` stops it).

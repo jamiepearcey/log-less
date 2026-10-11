@@ -12,7 +12,13 @@
 //!
 //! A part is named by its content: `<sha256 hex>.parquet`, stored at `<prefix>/<name>` in the bucket.
 //! The same file uploaded twice is the same object, so every step is idempotent: a presign for an
-//! object of that name and size answers `already_present`, and a repeated commit changes nothing.
+//! object already stored intact answers `already_present`, and a repeated commit changes nothing.
+//!
+//! Storage checks the content, not central and not the edge's word for it: the presigned PUT signs
+//! `x-amz-checksum-sha256` (the name's digest, base64), so the edge must send it and the storage
+//! refuses a body that does not hash to it. "Stored intact" is a HEAD with `x-amz-checksum-mode:
+//! ENABLED` answering that size and that same checksum; an object of the right size without it, or
+//! with another, is not present: presign hands out a URL to upload it again and commit refuses it.
 //!
 //! # The edge job
 //!
@@ -194,6 +200,30 @@ pub struct CommittedPart {
     pub origin: String,
 }
 
+const CHECKSUM_SHA256: &str = "x-amz-checksum-sha256";
+const CHECKSUM_MODE: &str = "x-amz-checksum-mode";
+
+/// The `x-amz-checksum-sha256` value for a digest given in hex: base64 of its 32 bytes.
+fn checksum_b64(sha256_hex: &str) -> Option<String> {
+    if sha256_hex.len() != 64 {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..32).map(|i| u8::from_str_radix(sha256_hex.get(2 * i..2 * i + 2)?, 16).ok()).collect::<Option<_>>()?;
+    Some(base64(&bytes))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (chunk[0] as u32) << 16 | (*chunk.get(1).unwrap_or(&0) as u32) << 8 | *chunk.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
 fn error_reply(status: u16, code: &str, message: &str) -> Reply {
     Reply::json(status, serde_json::json!({ "error": code, "message": message }).to_string())
 }
@@ -227,22 +257,27 @@ impl PartsCentral {
         path
     }
 
-    /// A presigned URL for `method` on the part's key, and when it stops working.
-    fn presigned(&self, method: &str, name: &str) -> (String, u64) {
+    /// A presigned URL for `method` on the part's key, signing `headers` (which the request must then
+    /// carry), and when it stops working.
+    fn presigned(&self, method: &str, name: &str, headers: &[(&str, &str)]) -> (String, u64) {
         let (scheme, host) = split_endpoint(&self.config.endpoint).expect("checked at construction");
         let creds = Credentials { access_key: self.config.access_key_id.clone(), secret_key: self.config.secret_access_key.clone() };
         let now = crate::now_unix_nanos() / 1_000_000_000;
-        let path_query = s3_sigv4::presign(&creds, method, host, &self.raw_key_path(name), &self.config.region, now, self.config.url_ttl_secs);
+        let raw_path = self.raw_key_path(name);
+        let path_query = s3_sigv4::presign(&creds, method, host, &raw_path, &self.config.region, now, self.config.url_ttl_secs, headers);
         (format!("{scheme}://{host}{path_query}"), (now + self.config.url_ttl_secs) * 1_000)
     }
 
-    /// The stored object's size, or None when there is no such object.
-    fn head(&self, name: &str) -> Result<Option<u64>, String> {
-        let (url, _) = self.presigned("HEAD", name);
-        let response = self.agent.head(&url).call().map_err(|e| format!("object storage is unreachable: {e}"))?;
+    /// Whether the object is stored with exactly this size and SHA-256, as the storage itself reports
+    /// it. A wrong size, no checksum or another checksum is not intact.
+    fn stored_intact(&self, name: &str, size: u64, sha256: &str) -> Result<bool, String> {
+        let (url, _) = self.presigned("HEAD", name, &[(CHECKSUM_MODE, "ENABLED")]);
+        let response = self.agent.head(&url).header(CHECKSUM_MODE, "ENABLED").call().map_err(|e| format!("object storage is unreachable: {e}"))?;
+        let header = |n: &str| response.headers().get(n).and_then(|v| v.to_str().ok()).map(str::trim);
         match response.status().as_u16() {
-            200 => Ok(response.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok())),
-            404 => Ok(None),
+            200 => Ok(header("content-length").and_then(|v| v.parse::<u64>().ok()) == Some(size)
+                && checksum_b64(sha256).is_some_and(|c| header(CHECKSUM_SHA256) == Some(c.as_str()))),
+            404 => Ok(false),
             other => Err(format!("object storage answered HTTP {other} to a HEAD")),
         }
     }
@@ -268,12 +303,15 @@ impl PartsCentral {
         if let Err(reply) = self.check_part(&req.name, req.size, &req.sha256) {
             return reply;
         }
-        let reply = match self.head(&req.name) {
-            Ok(Some(size)) if size == req.size => PresignReply { already_present: true, url: None, headers: None, expires_at_ms: 0 },
-            // Absent, or a damaged object under a content-addressed name: either way, upload it.
-            Ok(_) => {
-                let (url, expires_at_ms) = self.presigned("PUT", &req.name);
-                PresignReply { already_present: false, url: Some(url), headers: None, expires_at_ms }
+        let reply = match self.stored_intact(&req.name, req.size, &req.sha256) {
+            Ok(true) => PresignReply { already_present: true, url: None, headers: None, expires_at_ms: 0 },
+            // Absent, or something else under a content-addressed name: either way, upload it. The
+            // checksum is signed, so the edge must send it and storage refuses a body that differs.
+            Ok(false) => {
+                let checksum = checksum_b64(&req.sha256).expect("checked by check_part");
+                let (url, expires_at_ms) = self.presigned("PUT", &req.name, &[(CHECKSUM_SHA256, &checksum)]);
+                let headers = BTreeMap::from([(CHECKSUM_SHA256.to_string(), checksum)]);
+                PresignReply { already_present: false, url: Some(url), headers: Some(headers), expires_at_ms }
             }
             Err(m) => return error_reply(502, "storage_unavailable", &m),
         };
@@ -291,9 +329,9 @@ impl PartsCentral {
         if part.origin.is_empty() || part.origin.len() > 128 || part.min_unix_nano > part.max_unix_nano {
             return error_reply(422, "bad_part", "origin is 1 to 128 characters and min_unix_nano is at most max_unix_nano");
         }
-        match self.head(&part.name) {
-            Ok(Some(size)) if size == part.size => {}
-            Ok(_) => return error_reply(409, "not_uploaded", "no object of that name and size is in storage; upload it first"),
+        match self.stored_intact(&part.name, part.size, &part.sha256) {
+            Ok(true) => {}
+            Ok(false) => return error_reply(409, "not_uploaded", "no object of that name, size and SHA-256 checksum is in storage; upload it first"),
             Err(m) => return error_reply(502, "storage_unavailable", &m),
         }
         let recorded = crate::catalog::Catalog::open(&self.catalog_path).and_then(|c| c.record_peer_part(&part, now_ms()));
@@ -690,17 +728,40 @@ mod tests {
         };
         let central = PartsCentral::new(config, PathBuf::from("/nonexistent/catalog.sqlite")).unwrap();
         let name = format!("{HEX}.parquet");
-        let (url, expires) = central.presigned("PUT", &name);
+        let (url, expires) = central.presigned("PUT", &name, &[]);
         assert!(url.starts_with(&format!("http://127.0.0.1:9000/logs/edge%20parts/{name}?X-Amz-Algorithm=AWS4-HMAC-SHA256&")), "{url}");
         assert!(url.contains("X-Amz-Expires=60&") && url.contains("&X-Amz-Signature="), "{url}");
         assert!(expires.abs_diff(now_ms() + 60_000) < 2_000);
+        let (url, _) = central.presigned("PUT", &name, &[(CHECKSUM_SHA256, "x")]);
+        assert!(url.contains("&X-Amz-SignedHeaders=host%3Bx-amz-checksum-sha256&"), "{url}");
+    }
+
+    #[test]
+    fn the_checksum_header_is_base64_of_the_digest() {
+        // The SHA-256 of no bytes, and its base64.
+        let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(Some("47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=".to_string()), checksum_b64(empty));
+        assert_eq!(("", "Zg==", "Zm8=", "Zm9v"), (base64(b"").as_str(), base64(b"f").as_str(), base64(b"fo").as_str(), base64(b"foo").as_str()));
+        assert_eq!(None, checksum_b64(&HEX[1..]));
+        assert_eq!(None, checksum_b64(&format!("{}zz", &HEX[2..])));
     }
 
     // ---- a fake S3 server ----------------------------------------------------------------
 
+    /// A stored object: its bytes and the SHA-256 checksum it was uploaded with, if any.
+    #[derive(Clone)]
+    struct Object {
+        body: Vec<u8>,
+        checksum: Option<String>,
+    }
+
+    fn b64_sha256(body: &[u8]) -> String {
+        base64(&Sha256::digest(body))
+    }
+
     #[derive(Default)]
     struct Fake {
-        objects: Mutex<Map<String, Vec<u8>>>,
+        objects: Mutex<Map<String, Object>>,
         puts: AtomicU64,
         heads: AtomicU64,
         /// The next this many PUTs answer 500.
@@ -737,13 +798,18 @@ mod tests {
                 let mut parts = first.split_whitespace();
                 let (method, target) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("").to_string());
                 let mut length = 0usize;
+                let (mut checksum, mut checksum_mode) = (None, false);
                 loop {
                     let mut line = String::new();
                     if input.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
                         break;
                     }
-                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = v.trim().parse().unwrap_or(0);
+                    let Some((name, value)) = line.split_once(':') else { continue };
+                    match name.trim().to_ascii_lowercase().as_str() {
+                        "content-length" => length = value.trim().parse().unwrap_or(0),
+                        "x-amz-checksum-sha256" => checksum = Some(value.trim().to_string()),
+                        "x-amz-checksum-mode" => checksum_mode = value.trim().eq_ignore_ascii_case("enabled"),
+                        _ => {}
                     }
                 }
                 let key = target.split('?').next().unwrap_or("").to_string();
@@ -756,7 +822,11 @@ mod tests {
                     "HEAD" => {
                         state.heads.fetch_add(1, Ordering::SeqCst);
                         match state.objects.lock().unwrap().get(&key) {
-                            Some(o) if signed => reply(&mut out, "200 OK", &format!("content-length: {}\r\n", o.len())),
+                            Some(o) if signed => {
+                                // As S3: the stored checksum only when asked for, and only if there is one.
+                                let sum = o.checksum.as_ref().filter(|_| checksum_mode).map(|c| format!("x-amz-checksum-sha256: {c}\r\n")).unwrap_or_default();
+                                reply(&mut out, "200 OK", &format!("content-length: {}\r\n{sum}", o.body.len()))
+                            }
                             _ => reply(&mut out, "404 Not Found", "content-length: 0\r\n"),
                         }
                     }
@@ -765,12 +835,17 @@ mod tests {
                         let _ = input.read_exact(&mut body);
                         state.puts.fetch_add(1, Ordering::SeqCst);
                         let take = |n: &AtomicU64| n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1)).is_ok();
-                        if take(&state.expire_puts) || !signed {
+                        // A checksum header sent but not signed into the URL fails the signature.
+                        let checksum_signed = target.contains("X-Amz-SignedHeaders=host%3Bx-amz-checksum-sha256&");
+                        if take(&state.expire_puts) || !signed || (checksum.is_some() != checksum_signed) {
                             reply(&mut out, "403 Forbidden", "content-length: 0\r\n");
+                        } else if checksum.as_ref().is_some_and(|c| *c != b64_sha256(&body)) {
+                            // As S3: a body that does not match the checksum it came with is not stored.
+                            reply(&mut out, "400 Bad Request", "content-length: 0\r\n");
                         } else if take(&state.fail_puts) || !take(&state.fail_after) {
                             reply(&mut out, "500 Internal Server Error", "content-length: 0\r\n");
                         } else {
-                            state.objects.lock().unwrap().insert(key, body);
+                            state.objects.lock().unwrap().insert(key, Object { body, checksum });
                             reply(&mut out, "200 OK", "content-length: 0\r\n");
                         }
                     }
@@ -831,7 +906,7 @@ mod tests {
     struct Edge {
         control: Arc<SyncControl>,
         data: tempfile::TempDir,
-        _store: tempfile::TempDir,
+        store: tempfile::TempDir,
     }
 
     fn edge(url: &str, hours: &[u64]) -> Edge {
@@ -841,7 +916,7 @@ mod tests {
         let target = SyncTarget { url: url.into(), token: Some("tok".into()), min_severity: 0, fidelity: 100, anomaly_boost: false };
         let control = SyncControl::new("edge".into(), SyncStore::new(data.path()), Some(target));
         control.set_store_dir(store.path().to_path_buf());
-        Edge { control, data, _store: store }
+        Edge { control, data, store }
     }
 
     const FAST: Tuning = Tuning { attempts: 4, backoff: Duration::from_millis(5) };
@@ -873,9 +948,10 @@ mod tests {
         let keys: Vec<String> = fake.objects.lock().unwrap().keys().cloned().collect();
         assert!(keys.iter().all(|k| k.starts_with("/logs/edges/") && valid_name(&k["/logs/edges/".len()..])), "{keys:?}");
         // The stored bytes are the file: the name is their hash.
-        for (k, body) in fake.objects.lock().unwrap().iter() {
-            let hash: String = Sha256::digest(body).iter().map(|b| format!("{b:02x}")).collect();
+        for (k, o) in fake.objects.lock().unwrap().iter() {
+            let hash: String = Sha256::digest(&o.body).iter().map(|b| format!("{b:02x}")).collect();
             assert_eq!(&k["/logs/edges/".len()..64 + "/logs/edges/".len()], hash);
+            assert_eq!(Some(b64_sha256(&o.body)), o.checksum, "uploaded with its checksum");
         }
         let catalog = crate::catalog::Catalog::open(&c.catalog).unwrap();
         assert_eq!(2, catalog.peer_part_count().unwrap());
@@ -961,6 +1037,81 @@ mod tests {
         // Without the token, nothing.
         let r = ureq::post(format!("http://{a}{PRESIGN_PATH}")).config().http_status_as_error(false).build().send("{}").unwrap();
         assert_eq!(401, r.status().as_u16());
+        c.receiver.shutdown();
+        stop.store(true, Ordering::Release);
+    }
+
+    /// The one Parquet file of an edge store: its bytes and `(name, sha256 hex)`.
+    fn only_file(e: &Edge) -> (Vec<u8>, String, String) {
+        let files = crate::store::list_parquet_files(e.store.path());
+        assert_eq!(1, files.len());
+        let (sha, _) = sha256_file(&files[0]).unwrap();
+        (std::fs::read(&files[0]).unwrap(), name_for(&sha), sha)
+    }
+
+    #[test]
+    fn a_same_size_object_with_other_content_is_never_present_or_committed_and_is_replaced() {
+        let (s3, fake, stop) = fake_s3();
+        let c = central(&s3, 512 * 1024 * 1024);
+        let a = c.receiver.local_addr();
+        let e = edge(&format!("http://{a}"), &[5_000]);
+        let (body, name, sha) = only_file(&e);
+        let key = format!("/logs/edges/{name}");
+        let mut wrong = body.clone();
+        wrong[body.len() / 2] ^= 0x01;
+        let commit = serde_json::json!({"name": name, "size": body.len(), "sha256": sha, "rows": 20, "min_unix_nano": 1, "max_unix_nano": 2, "origin": "edge"});
+        let presign = serde_json::json!({"name": name, "size": body.len(), "sha256": sha});
+        // Same size, other bytes: uploaded with no checksum, and uploaded with its own (true) checksum.
+        for checksum in [None, Some(b64_sha256(&wrong))] {
+            fake.objects.lock().unwrap().insert(key.clone(), Object { body: wrong.clone(), checksum });
+            let (status, v) = post(a, PRESIGN_PATH, presign.clone());
+            assert_eq!((200, false), (status, v["already_present"].as_bool().unwrap()), "{v}");
+            assert_eq!(b64_sha256(&body), v["headers"][CHECKSUM_SHA256].as_str().unwrap(), "{v}");
+            assert_eq!(409, post(a, COMMIT_PATH, commit.clone()).0);
+        }
+        assert_eq!(0, crate::catalog::Catalog::open(&c.catalog).unwrap().peer_part_count().unwrap());
+
+        // The job uploads the real file over it, and that commits.
+        let status = run(&e, 5_000 * HOUR_MS, 5_001 * HOUR_MS);
+        assert_eq!(("done", 1, 0), (status.state.as_str(), status.uploaded, status.already_present), "{status:?}");
+        assert_eq!(body, fake.objects.lock().unwrap()[&key].body);
+        assert_eq!(1, crate::catalog::Catalog::open(&c.catalog).unwrap().peer_part_count().unwrap());
+        // Now stored intact: present, and a repeated commit is accepted and records nothing new.
+        assert_eq!(true, post(a, PRESIGN_PATH, presign).1["already_present"]);
+        let (status, v) = post(a, COMMIT_PATH, commit);
+        assert_eq!((200, false), (status, v["recorded"].as_bool().unwrap()), "{v}");
+        c.receiver.shutdown();
+        stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn a_put_whose_body_does_not_match_the_signed_checksum_is_refused_by_storage() {
+        let (s3, fake, stop) = fake_s3();
+        let c = central(&s3, 512 * 1024 * 1024);
+        let a = c.receiver.local_addr();
+        let e = edge(&format!("http://{a}"), &[6_000]);
+        let (body, name, sha) = only_file(&e);
+        let (_, v) = post(a, PRESIGN_PATH, serde_json::json!({"name": name, "size": body.len(), "sha256": sha}));
+        let url = v["url"].as_str().unwrap();
+        let checksum = v["headers"][CHECKSUM_SHA256].as_str().unwrap();
+        let put = |payload: &[u8], header: Option<&str>| {
+            let mut r = ureq::put(url).config().http_status_as_error(false).build();
+            if let Some(h) = header {
+                r = r.header(CHECKSUM_SHA256, h);
+            }
+            r.send(payload).unwrap().status().as_u16()
+        };
+        let mut wrong = body.clone();
+        wrong[0] ^= 0xff;
+        assert_eq!(400, put(&wrong, Some(checksum)), "same size, other bytes");
+        // Dropping the header breaks the signature (the fake checks no more of it than that).
+        assert_eq!(403, put(&wrong, None));
+        assert!(fake.objects.lock().unwrap().is_empty());
+        let commit = serde_json::json!({"name": name, "size": body.len(), "sha256": sha, "rows": 20, "min_unix_nano": 1, "max_unix_nano": 2, "origin": "edge"});
+        assert_eq!(409, post(a, COMMIT_PATH, commit.clone()).0);
+        // The right bytes with the header go in and commit.
+        assert_eq!(200, put(&body, Some(checksum)));
+        assert_eq!(200, post(a, COMMIT_PATH, commit).0);
         c.receiver.shutdown();
         stop.store(true, Ordering::Release);
     }
