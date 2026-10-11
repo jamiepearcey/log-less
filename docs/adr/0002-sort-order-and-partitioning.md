@@ -1,6 +1,8 @@
 # ADR 0002: Partition on event time, use 8k-row row groups, keep the sort order
 
-Status: proposed (decision for Plane 73; the migration is Plane 74 and 16 and is not implemented here).
+Status: accepted and implemented (Plane LOG-172, "layout v3 at the edge"). The store is cut on the event hour with 8k-row row
+groups and sort key 3 is `timestamp`; the write fan-out this ADR left open is bounded by the late spool. What was built and
+how it measures with the store's own arrow-rs writer: `docs/evidence/layout-v3.md` and `docs/architecture.md` section 2.
 Date: 2026-10-11. Evidence: `docs/evidence/sort-layout-bench.md`, script `scripts/sort-layout-bench.py`.
 
 ## Context
@@ -50,6 +52,10 @@ query) at 12 h, so observed-hour partitioning has no safe event-time prune but `
    `observed` for ordering; recommended with the migration, not measured separately.
 
 ## Consequences and migration notes for Plane 74 and 16
+
+(Written before the implementation. Each item below was done as it says, except where `docs/evidence/layout-v3.md` notes
+otherwise: the fan-out fix is the late spool, the compaction rule is "skip a partition written to in the last
+`compact_quiet`", and an existing store is rewritten offline by `logless migrate-layout` rather than read in both layouts.)
 
 Retention stays "delete a directory", now on event time. A replayed row older than the retention horizon is deleted by the next
 pass; that is probably right but is a behaviour change to state in the retention docs. Pressure relief is file-granular and

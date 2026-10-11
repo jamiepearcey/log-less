@@ -228,7 +228,7 @@ plus 2 aggregate events covering the other 78 (**0.17% of raw bytes**).
   load-shedding system by design.
 - **Account for everything.** `received == enqueued + dropped_*` is asserted in
   tests and checked at runtime. Nothing vanishes silently.
-- **Retention is a directory delete.** Partitions are `hour=…/level=…`; expiry
+- **Retention is a directory delete.** Partitions are `tenant=…/index=…/hour=<event hour>/level=…`; expiry
   removes a directory. No per-row bookkeeping.
 - **Retention granularity drives partition granularity.** If your policy retains
   `error` for 90d and `warn` for 14d, they become separate buckets.

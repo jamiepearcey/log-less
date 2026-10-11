@@ -62,8 +62,19 @@ not `<64 hex>.parquet` are counted as `ignored_keys` and never fetched.
 
 For each part, in order: fetch to `<to>/.restore-tmp/`, SHA-256 equals the name, size equals the inventory's, the Parquet
 footer is readable, the row count equals the inventory's, every row group decodes and the decoded row count equals the
-footer's. Only then is the part moved to `<to>/store/hour=…/level=…/<name>.parquet` (hour from the part's first row's
-`observed`, level bucket from its severity, using the edge config's buckets or the defaults). Then:
+footer's. Only then is the part moved to `<to>/store/tenant=…/index=…/hour=…/level=…/node=…/<name>.parquet`:
+
+* the hour is the **event hour** of the part's first row (its `timestamp`, not `observed`). A file the store writes holds
+  one event hour and one level, so the first row speaks for all of them; a part that does not is counted in
+  `multi_partition_parts` and still placed by its first row;
+* the level is the bucket of its severity under its index's buckets (`--config`, the edge's config; otherwise the
+  default buckets);
+* tenant, index and node are what the part's Parquet footer says it was written under (`logless.tenant`, `logless.index`,
+  `logless.node`, written since layout v3). A part without them (written by an older build) goes under the first tenant of
+  `--config` (or `default`), that tenant's default index, and `node=<--node>` (or `node=restored`).
+
+Parts are still `<node>/<sha256>.parquet` on central (their move into the tree is a later slice), so the footer is the only
+thing that says which index a part belongs to. Then:
 
 * `<to>/catalog.sqlite` is rebuilt from the installed files (`Catalog::rebuild`),
 * template ids are kept: `templates` (id, count, first/last seen) and `template_services` ((id, service), first/last

@@ -338,6 +338,13 @@ impl SplitWal {
         Ok(self.main.records_written + self.late.records_written)
     }
 
+    /// Closes the main segment now and starts the next. The agent rolls on
+    /// size; a measurement that replays a corpus rolls where it wants its
+    /// segment boundaries.
+    pub fn roll_main(&mut self) -> Result<(), WalError> {
+        self.main.roll()
+    }
+
     /// Ids of the segments being written, main then late. A merge must skip
     /// each in its own directory.
     pub fn active_segments(&self) -> (u64, u64) {

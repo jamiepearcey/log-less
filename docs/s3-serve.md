@@ -1,7 +1,7 @@
 # Serving the store over S3
 
 log-less can expose its hive-partitioned Parquet store
-(`store/hour=YYYY-MM-DDTHH/level=<bucket>/*.parquet`) as a **read-only**
+(`store/tenant=<t>/index=<i>/hour=YYYY-MM-DDTHH/level=<bucket>/node=<writer>/*.parquet`, where `hour` is the event hour) as a **read-only**
 S3-compatible endpoint. DuckDB (httpfs), Polars and Grafana then read the logs
 in place with HTTP Range requests, instead of log-less forwarding them to a
 vendor. Only reads are implemented: there is no PUT, DELETE or multipart.
@@ -13,7 +13,10 @@ thread and spool only start when destinations are non-empty, the outbound send
 is guarded, and the Sentry upstream is `None` without a DSN. Audit run: the real
 binary with an `init` config (no destinations line), 20000 lines piped in,
 reported `received=20000 written=20000`, logged a merge, and left 3 Parquet
-files under `store/hour=.../level={warn_plus,info,debug}`.
+files under `store/tenant=default/index=default/hour=.../level={warn_plus,info,debug}/node=<id>`. With
+`hive_partitioning = true` the five directories are columns (`tenant`, `index`, `hour`, `level`, `node`); pass
+`hive_types = {'tenant': VARCHAR, 'index': VARCHAR, 'node': VARCHAR, 'hour': VARCHAR, 'level': VARCHAR}` if a reader
+should not guess their types. `WHERE hour = ...` now selects by event time (`timestamp`), not by when a row arrived.
 
 ## Running it
 

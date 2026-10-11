@@ -1,4 +1,6 @@
-<!-- Status: PROPOSED (2026-10-11). Consultant design recommendation, not yet accepted by the owner and not built.
+<!-- Slice 1 of section 9 ("layout v3 at the edge") is built: docs/architecture.md section 2, docs/evidence/layout-v3.md.
+     Slices 2 to 7 are not. The rest of this header is as written before the owner decisions at the end.
+     Status: PROPOSED (2026-10-11). Consultant design recommendation, not yet accepted by the owner and not built.
      Numbers in section 8 are estimates. Owner decisions are listed in section 10. Tracked in Plane (LOG project). -->
 
 # Multi-tenancy and indexing for log-less: design recommendation
