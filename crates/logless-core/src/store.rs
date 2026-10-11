@@ -264,6 +264,15 @@ pub fn read_file_scope(path: &Path) -> Result<[Option<String>; 3], StoreError> {
     Ok([META_TENANT, META_INDEX, META_NODE].map(|name| kv.and_then(|kv| kv.iter().find(|e| e.key == name)).and_then(|e| e.value.clone())))
 }
 
+/// The `logless.schema_version` a file's footer declares (`None` for a file that does not say).
+pub fn read_schema_version(path: &Path) -> Result<Option<String>, StoreError> {
+    let file = File::open(path).map_err(|source| StoreError::Io { path: path.to_path_buf(), source })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|source| StoreError::Parquet { path: path.to_path_buf(), source })?;
+    let kv = builder.metadata().file_metadata().key_value_metadata();
+    Ok(kv.and_then(|kv| kv.iter().find(|e| e.key == "logless.schema_version")).and_then(|e| e.value.clone()))
+}
+
 /// The typed columns a file declares in its footer (`logless.typed_columns`).
 /// How the catalog's registry is rebuilt, like every other catalog row.
 pub fn read_typed_columns(path: &Path) -> Result<Vec<TypedColumn>, StoreError> {

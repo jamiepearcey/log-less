@@ -58,7 +58,10 @@ built (see below).
 * the **index**: a record the sender filed under an index other than its default carries `logless.index`, and the
   receiver files it under its own index of that name (or, if it has none, its default index or nowhere, by its
   `unknown_index`; counted in `GET /admin/v1/info`);
-* the **template id** the sender already mined.
+* the **template id** the sender already mined: the content hash of the template text, the same on every node, so the
+  receiver keeps it without mining and rollups for one shape from different senders add up. A record sent without one is
+  mined by the receiver's own miner. (A receiver does not learn the text of a hash it never mined; its dictionary has no
+  row for it until dictionaries travel with the parts.)
 
 A plain OTLP collector remains a valid destination through the OTLP receiver; this is the log-less-to-log-less path.
 

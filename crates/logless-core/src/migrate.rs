@@ -14,12 +14,12 @@
 //! again when repeated instead of doubling the rows. The catalog's file table
 //! is rebuilt from the new tree at the end.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use crate::catalog::{Catalog, CatalogError};
+use crate::catalog::{Catalog, CatalogError, TemplateSighting};
 use crate::config::Tenancy;
 use crate::model::LogRecord;
 use crate::partition::{self, PartitionKey};
@@ -44,6 +44,26 @@ pub struct MigrateReport {
     pub rows_moved_hour: u64,
     /// Files in the catalog after the rebuild.
     pub catalog_files: u64,
+    /// Files rewritten in place, or into the new tree, to replace counter template ids with content hashes.
+    pub files_rekeyed: u64,
+    /// Rows whose counter template id was replaced by a hash.
+    pub rows_rekeyed: u64,
+    /// Rows whose counter template id the catalog does not know: they lose their template id.
+    pub rows_unmapped: u64,
+}
+
+/// Replaces the counter ids in `records` by content hashes, counting what it did.
+fn rekey(records: &mut [LogRecord], counters: &HashMap<u64, u64>, report: &mut MigrateReport) {
+    for r in records {
+        if let Some(counter) = r.template_id {
+            r.template_id = counters.get(&counter).copied();
+            if r.template_id.is_some() {
+                report.rows_rekeyed += 1;
+            } else {
+                report.rows_unmapped += 1;
+            }
+        }
+    }
 }
 
 /// Old-layout files: `<store>/hour=<h>/level=<l>/<file>.parquet`, with the hour.
@@ -68,9 +88,13 @@ pub fn migrate(store_dir: &Path, catalog: &mut Catalog, tenancy: &Tenancy) -> Re
     let layout = catalog.typed_layout()?;
     let index = tenancy.default_index();
     let buckets = tenancy.default_buckets();
+    let counters = catalog.counter_to_hash()?;
     for (old, old_hour) in old_files(store_dir) {
         let mut by_key: BTreeMap<PartitionKey, Vec<LogRecord>> = BTreeMap::new();
-        for record in crate::compact::read_all(&old)? {
+        let mut old_rows = crate::compact::read_all(&old)?;
+        // The old layout is from before content-hash ids: every id in it is a counter.
+        rekey(&mut old_rows, &counters, &mut report);
+        for record in old_rows {
             let hour = record.timestamp_unix_nano / partition::NANOS_PER_HOUR;
             report.rows += 1;
             report.rows_moved_hour += u64::from(hour != old_hour);
@@ -85,6 +109,7 @@ pub fn migrate(store_dir: &Path, catalog: &mut Catalog, tenancy: &Tenancy) -> Re
             // Segment id 0, like a compacted file: no WAL segment has it.
             store::write_partition_file_with(&key.dir(store_dir).join(store::file_name_for_segment(0, id)), &records, &layout)?;
             report.files_written += 1;
+            report.files_rekeyed += 1;
         }
         std::fs::remove_file(&old).map_err(|source| StoreError::Io { path: old.clone(), source })?;
         report.files_read += 1;
@@ -93,6 +118,33 @@ pub fn migrate(store_dir: &Path, catalog: &mut Catalog, tenancy: &Tenancy) -> Re
             let _ = std::fs::remove_dir(dir);
         }
     }
+    // Files of the current layout written before ids were hashes: rewritten where they are (the write is
+    // a temp file and a rename, so a reader sees the old file or the new one). Every file is read for its
+    // sightings whether or not it needed rewriting, so the table ends up complete.
+    let mut sightings: BTreeMap<(String, String, u64, Option<String>), (u64, i64, i64)> = BTreeMap::new();
+    for path in store::list_parquet_files(store_dir) {
+        let mut records = crate::compact::read_all(&path)?;
+        if store::read_schema_version(&path)?.as_deref() != Some(schema::SCHEMA_VERSION) {
+            rekey(&mut records, &counters, &mut report);
+            store::write_partition_file_with(&path, &records, &layout)?;
+            report.files_rekeyed += 1;
+        }
+        let Some(key) = partition::key_of_path(&path) else { continue };
+        for r in &records {
+            if let Some(id) = r.template_id {
+                let t = r.observed_unix_nano as i64;
+                let s = sightings.entry((key.tenant.clone(), key.index.clone(), id, r.service.clone())).or_insert((0, t, t));
+                s.0 += 1;
+                s.1 = s.1.min(t);
+                s.2 = s.2.max(t);
+            }
+        }
+    }
+    let sightings: Vec<TemplateSighting> = sightings
+        .into_iter()
+        .map(|((tenant, index, template_id, service), (rows, lo, hi))| TemplateSighting { tenant, index, template_id, service, rows, first_observed_nanos: lo, last_observed_nanos: hi })
+        .collect();
+    catalog.replace_sightings(&sightings)?;
     report.catalog_files = catalog.rebuild(store_dir)? as u64;
     Ok(report)
 }
@@ -129,7 +181,7 @@ mod tests {
         let mut catalog = Catalog::open_in_memory().unwrap();
         let tenancy = Tenancy::default();
         let report = migrate(&store, &mut catalog, &tenancy).unwrap();
-        assert_eq!(report, MigrateReport { files_read: 2, files_written: 3, rows: 51, rows_moved_hour: 20, catalog_files: 3 });
+        assert_eq!(report, MigrateReport { files_read: 2, files_written: 3, rows: 51, rows_moved_hour: 20, catalog_files: 3, files_rekeyed: 3, ..Default::default() });
         assert!(!partition::is_old_layout(&store) && !store.join("hour=1970-01-21T20").exists());
         assert!(store.join("_meta/templates.pq").exists());
 
@@ -157,5 +209,118 @@ mod tests {
         let mut catalog = Catalog::open_in_memory().unwrap();
         let report = migrate(&store, &mut catalog, &tenancy).unwrap();
         assert_eq!((report.files_written, report.catalog_files, catalog.totals().unwrap().0), (1, 1, 10));
+    }
+
+    /// Rewrites `path` with its footer claiming `version`: how a file from before the version existed looks.
+    fn stamp_version(path: &Path, version: &str) {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut kv: Vec<_> = builder.metadata().file_metadata().key_value_metadata().cloned().unwrap_or_default();
+        kv.iter_mut().filter(|e| e.key == "logless.schema_version").for_each(|e| e.value = Some(version.into()));
+        let schema = builder.schema().clone();
+        let batches: Vec<_> = builder.build().unwrap().map(Result::unwrap).collect();
+        let props = parquet::file::properties::WriterProperties::builder().set_key_value_metadata(Some(kv)).build();
+        let mut w = parquet::arrow::ArrowWriter::try_new(std::fs::File::create(path).unwrap(), schema, Some(props)).unwrap();
+        for b in &batches {
+            w.write(b).unwrap();
+        }
+        w.close().unwrap();
+    }
+
+    fn with_counter(mut r: LogRecord, counter: u64) -> LogRecord {
+        r.template_id = Some(counter);
+        r
+    }
+
+    fn catalog_with_templates(texts: &[(u64, &str)]) -> Catalog {
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        let templates: Vec<_> = texts
+            .iter()
+            .map(|(id, text)| crate::drain::Template {
+                id: *id,
+                tokens: text.split(' ').map(str::to_string).collect(),
+                count: 1,
+                first_seen_unix_secs: 0,
+                last_seen_unix_secs: 0,
+                lineage_id: crate::drain::fingerprint_of(text),
+            })
+            .collect();
+        catalog.save_templates(&templates).unwrap();
+        catalog
+    }
+
+    fn template_ids(store: &Path) -> Vec<Option<u64>> {
+        let mut ids: Vec<_> = crate::scan::scan(store, &crate::scan::Query { limit: 1000, ..Default::default() }).unwrap().records.iter().map(|r| r.template_id).collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn counter_template_ids_in_the_old_layout_and_in_version_3_files_become_content_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("store");
+        let (user, pay) = (crate::drain::fingerprint_of("user <NUM> logged in"), crate::drain::fingerprint_of("payment <NUM> failed"));
+        // Counters 1 and 2 are templates this catalog knows; 9 is one it lost.
+        let mut catalog = catalog_with_templates(&[(1, "user <NUM> logged in"), (2, "payment <NUM> failed")]);
+
+        let old: Vec<_> = vec![with_counter(row(500, 500, 1, Severity::INFO), 1), with_counter(row(500, 500, 2, Severity::INFO), 2), with_counter(row(500, 500, 3, Severity::INFO), 9), row(500, 500, 4, Severity::INFO)];
+        store::write_partition_file(&store.join("hour=1970-01-21T20/level=info/s000000000001-abc.parquet"), &old).unwrap();
+        // A file already in the current layout, written before ids were hashes.
+        let v3 = PartitionKey::new("default", "default", 501, "info", "node-a").dir(&store).join("s000000000002-def.parquet");
+        store::write_partition_file(&v3, &[with_counter(row(501, 501, 5, Severity::INFO), 2), with_counter(row(501, 501, 6, Severity::INFO), 2)]).unwrap();
+        stamp_version(&v3, "3");
+        // And one that is current and must not be touched: ids that look like counters are hashes there.
+        let v4 = PartitionKey::new("default", "default", 502, "info", "node-a").dir(&store).join("s000000000003-ghi.parquet");
+        store::write_partition_file(&v4, &[with_counter(row(502, 502, 7, Severity::INFO), 1)]).unwrap();
+        let v4_before = std::fs::read(&v4).unwrap();
+
+        let tenancy = Tenancy::default();
+        let report = migrate(&store, &mut catalog, &tenancy).unwrap();
+        assert_eq!((report.rows_rekeyed, report.rows_unmapped), (2 + 2, 1));
+        assert_eq!(report.files_rekeyed, 1 + 1, "the old-layout file's one output and the version 3 file");
+        assert_eq!(std::fs::read(&v4).unwrap(), v4_before, "a version 4 file is not rewritten");
+        let mut want = vec![None, None, Some(1), Some(user), Some(pay), Some(pay), Some(pay)];
+        want.sort();
+        assert_eq!(template_ids(&store), want);
+        assert_eq!(store::read_schema_version(&v3).unwrap().as_deref(), Some("4"));
+
+        // The sightings are refilled under the hash, per tenant and index, with the rows counted.
+        let mut seen: Vec<_> = catalog.load_template_services().unwrap().into_iter().map(|(_, id)| id).collect();
+        seen.sort();
+        let mut want = vec![1, user, pay];
+        want.sort();
+        assert_eq!(seen, want, "{seen:?}");
+
+        // Repeating it changes nothing.
+        let again = migrate(&store, &mut catalog, &tenancy).unwrap();
+        assert_eq!((again.files_rekeyed, again.rows_rekeyed, again.rows_unmapped), (0, 0, 0));
+        let mut want = vec![None, None, Some(1), Some(user), Some(pay), Some(pay), Some(pay)];
+        want.sort();
+        assert_eq!(template_ids(&store), want);
+    }
+
+    #[test]
+    fn a_catalog_from_before_hash_ids_loses_its_counter_keyed_sightings_and_keeps_its_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE templates (id INTEGER PRIMARY KEY, text TEXT NOT NULL, tokens TEXT NOT NULL,
+                    count INTEGER NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, lineage_id INTEGER);
+                 INSERT INTO templates VALUES (4, 'a <*> c', 'a\t<*>\tc', 9, 1, 2, 77);
+                 CREATE TABLE template_services (template_id INTEGER NOT NULL, has_service INTEGER NOT NULL, service TEXT NOT NULL,
+                    first_observed INTEGER NOT NULL, last_observed INTEGER NOT NULL, PRIMARY KEY (template_id, has_service, service));
+                 INSERT INTO template_services VALUES (4, 1, 'api', 1, 2);",
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let cat = Catalog::open(&path).unwrap();
+            assert_eq!(cat.load_templates().unwrap().len(), 1, "the miner's state is kept");
+            assert!(cat.load_template_services().unwrap().is_empty(), "counter-keyed sightings are dropped, to be refilled by migrate-layout");
+            assert_eq!(cat.counter_to_hash().unwrap()[&4], crate::drain::fingerprint_of("a <*> c"));
+            assert!(cat.knows_shape(crate::drain::fingerprint_of("a <*> c")).unwrap(), "its current text is a registered shape");
+        }
     }
 }

@@ -273,8 +273,10 @@ sql_csv() { "$DUCKDB_BIN" -noheader -csv -c "$1"; }
 by_template() { sql_csv "select coalesce(cast(template_id as varchar), 'none') t, count(*) from read_parquet('$1/**/*.parquet', union_by_name = true) group by 1 order by 1"; }
 by_pair() { sql_csv "select coalesce(cast(template_id as varchar), 'none') t, coalesce(service, '~') s, count(*) from read_parquet('$1/**/*.parquet', union_by_name = true) group by 1, 2 order by 1, 2"; }
 total_rows() { sql_csv "select count(*) from read_parquet('$1/**/*.parquet', union_by_name = true)"; }
-dict_keys() { sql_csv "select template_id, coalesce(service, '~') from read_parquet('$1/_meta/templates.pq') order by 1, 2"; }
-cat_templates() { sqlite3 "$1" "select id, count from templates order by id"; }
+dict_keys() { sql_csv "select template_id, coalesce(service, '~') from read_parquet('$1/tenant=*/index=*/_meta/templates/*.pq') order by 1, 2"; }
+# The catalog's templates table is the miner's private counter state (a restore numbers it afresh); what rows carry
+# and what the catalog keys its sightings on is the content hash, so that is what must survive.
+cat_templates() { sqlite3 "$1" "select template_id, sum(rows) from template_services group by 1 order by 1"; }
 
 BEFORE_ROWS=$(total_rows "$EDGE_STORE")
 by_template "$EDGE_STORE" > "$R/before.tpl"; by_pair "$EDGE_STORE" > "$R/before.pair"; dict_keys "$EDGE_STORE" > "$R/before.dict"
@@ -445,7 +447,7 @@ by_template "$R/restored/store" > "$R/after.tpl"; by_pair "$R/restored/store" > 
 cat_templates "$R/restored/catalog.sqlite" > "$R/after.cat"
 check "restore: per-template row counts identical" "$(eq "$(cat "$R/before.tpl")" "$(cat "$R/after.tpl")")" "$(wc -l < "$R/after.tpl" | tr -d ' ') groups"
 check "restore: per-(template,service) row counts identical" "$(eq "$(cat "$R/before.pair")" "$(cat "$R/after.pair")")" "$(wc -l < "$R/after.pair" | tr -d ' ') groups"
-check "restore: catalog templates (id,count) and dictionary keys identical" "$( [ "$(cat "$R/before.cat")" = "$(cat "$R/after.cat")" ] && [ "$(cat "$R/before.dict")" = "$(cat "$R/after.dict")" ] && echo 1 || echo 0)" \
+check "restore: catalog sightings (template_id,rows) and dictionary keys identical" "$( [ "$(cat "$R/before.cat")" = "$(cat "$R/after.cat")" ] && [ "$(cat "$R/before.dict")" = "$(cat "$R/after.dict")" ] && echo 1 || echo 0)" \
   "$(wc -l < "$R/after.cat" | tr -d ' ') templates, $(wc -l < "$R/after.dict" | tr -d ' ') keys"
 
 stop_within "$B_PID" 15; check "central B stops cleanly" "$(eq $? 0)" "${STOP_MS} ms"

@@ -702,6 +702,14 @@ if [ "$SENTRY_RAN" = 1 ]; then
 fi
 check "central total == edge total, ids unique" "$( [ "$c_all" = "$e_all" ] && [ "$c_all_ids" = "$c_all" ] && [ "$e_all_ids" = "$e_all" ] && echo 1 || echo 0)" \
   "central rows=$c_all ids=$c_all_ids; edge rows=$e_all ids=$e_all_ids"
+# Template ids are content hashes the edge assigned and central keeps (it does not re-mine a record that has one), so
+# the per-template row counts of the edge's store and of central's are the same table, and no id is a small counter.
+# (One sending edge here; two independent miners agreeing is tests/template_hash_ids.rs.)
+by_tpl() { "$DUCKDB_BIN" -noheader -csv -c "select coalesce(cast(template_id as varchar), 'none'), count(*) from read_parquet('$1/**/*.parquet', union_by_name = true) group by 1 order by 1"; }
+e_tpl=$(by_tpl "$R/edge/data/store"); c_tpl=$(by_tpl "$R/central/data/store")
+n_tpl=$(echo "$e_tpl" | grep -vc '^none,'); small_ids=$(echo "$c_tpl" | grep -v '^none,' | awk -F, '$1 < 1000000' | wc -l | tr -d ' ')
+check "central keeps the edge's content-hash template ids" "$( [ "$e_tpl" = "$c_tpl" ] && [ "$n_tpl" -ge 3 ] && [ "$small_ids" = 0 ] && echo 1 || echo 0)" \
+  "template ids: edge=$n_tpl central=$(echo "$c_tpl" | grep -vc '^none,'); per-template counts identical: $([ "$e_tpl" = "$c_tpl" ] && echo yes || echo no); central ids below 1000000: $small_ids"
 # Fidelity 100: nothing is left out, so a total is the rollup counts (none expected) plus the records that are not
 # supplements, and it must equal what the edge wrote.
 recon=$("$DUCKDB_BIN" -noheader -csv -c "

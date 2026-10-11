@@ -249,8 +249,8 @@ impl std::fmt::Display for Problem {
 #[derive(Debug, Default, Clone)]
 struct Derived {
     templates: BTreeMap<u64, TemplateAcc>,
-    /// `(template_id, service)` to `(first, last)` observed nanoseconds.
-    sightings: BTreeMap<(u64, Option<String>), (i64, i64)>,
+    /// `(tenant, index, template_id, service)` to `(rows, first, last)` observed nanoseconds.
+    sightings: BTreeMap<(String, String, u64, Option<String>), (u64, i64, i64)>,
     /// Rows per `template_id` (`None`: no template).
     rows_by_template: BTreeMap<Option<u64>, u64>,
 }
@@ -277,10 +277,11 @@ impl Derived {
                 }
             }
         }
-        for (k, (lo, hi)) in other.sightings {
-            let e = self.sightings.entry(k).or_insert((lo, hi));
-            e.0 = e.0.min(lo);
-            e.1 = e.1.max(hi);
+        for (k, (n, lo, hi)) in other.sightings {
+            let e = self.sightings.entry(k).or_insert((0, lo, hi));
+            e.0 += n;
+            e.1 = e.1.min(lo);
+            e.2 = e.2.max(hi);
         }
         for (k, n) in other.rows_by_template {
             *self.rows_by_template.entry(k).or_default() += n;
@@ -365,9 +366,10 @@ pub fn verify_part(path: &Path, name: &str, expected: Option<Expected>, tenancy:
                 t.first_secs = t.first_secs.min(secs);
                 t.last_secs = t.last_secs.max(secs);
                 let nanos = r.observed_unix_nano as i64;
-                let s = derived.sightings.entry((id, r.service.clone())).or_insert((nanos, nanos));
-                s.0 = s.0.min(nanos);
-                s.1 = s.1.max(nanos);
+                let s = derived.sightings.entry((tenant.clone(), index.clone(), id, r.service.clone())).or_insert((0, nanos, nanos));
+                s.0 += 1;
+                s.1 = s.1.min(nanos);
+                s.2 = s.2.max(nanos);
             }
         }
     }
@@ -518,25 +520,33 @@ pub fn restore(source: &dyn PartSource, opts: &Options) -> Result<Report, Restor
 
     let mut catalog = Catalog::open(&catalog_path)?;
     catalog.rebuild(&store_dir)?;
-    let templates: Vec<Template> = derived
-        .templates
-        .iter()
-        .map(|(id, t)| {
-            let mut template = Template { id: *id, tokens: t.exemplar.clone(), count: t.count, first_seen_unix_secs: t.first_secs, last_seen_unix_secs: t.last_secs, lineage_id: *id };
-            // Birth text is not in the bucket; the exemplar is the best identity available.
-            template.lineage_id = template.fingerprint();
-            template
-        })
-        .collect();
+    // The id in a part's rows is a content hash and is kept as it is. The miner needs its own counters, so
+    // each hash gets one; the lineage is the hash itself (the birth text is not in the bucket) and the text
+    // is the exemplar, the best name for the shape the bucket can give.
+    let mut templates = Vec::with_capacity(derived.templates.len());
+    let mut shapes = Vec::with_capacity(derived.templates.len());
+    for (counter, (hash, t)) in (1u64..).zip(&derived.templates) {
+        let template = Template { id: counter, tokens: t.exemplar.clone(), count: t.count, first_seen_unix_secs: t.first_secs, last_seen_unix_secs: t.last_secs, lineage_id: *hash };
+        shapes.push(crate::catalog::ShapeRow { template_id: *hash, lineage_id: *hash, text: template.text() });
+        templates.push(template);
+    }
     let sightings: Vec<TemplateSighting> = derived
         .sightings
         .iter()
-        .map(|((id, service), (lo, hi))| TemplateSighting { template_id: *id, service: service.clone(), first_observed_nanos: *lo, last_observed_nanos: *hi })
+        .map(|((tenant, index, id, service), (rows, lo, hi))| TemplateSighting {
+            tenant: tenant.clone(),
+            index: index.clone(),
+            template_id: *id,
+            service: service.clone(),
+            rows: *rows,
+            first_observed_nanos: *lo,
+            last_observed_nanos: *hi,
+        })
         .collect();
-    catalog.restore_templates(&templates, &sightings)?;
+    catalog.restore_templates(&templates, &shapes, &sightings)?;
     report.templates = templates.len() as u64;
     report.template_services = sightings.len() as u64;
-    report.dictionary_rows = crate::template_dict::export(&store_dir, &catalog)?.rows as u64;
+    report.dictionary_rows = crate::template_dict::export(&store_dir, opts.tenancy.node(), &catalog)?.rows as u64;
     let (rows, bytes) = catalog.totals()?;
     report.catalog_rows = rows;
     report.catalog_bytes = bytes;
@@ -624,7 +634,12 @@ mod tests {
         // Templates 1 and 2 appear only in "api"; 3 only in "db".
         assert_eq!(r.template_services, 3);
         assert_eq!(r.dictionary_rows, 3);
-        assert!(crate::template_dict::dict_path(&f.to.join("store")).exists());
+        let dict = crate::template_dict::dict_path(&f.to.join("store"), "default", "default", "node-a");
+        assert!(dict.exists());
+        // The ids in the rows are content hashes and are kept as they are; with no birth text in the
+        // bucket the lineage is the id itself.
+        let rows = crate::template_dict::read(&dict, "default", "default").unwrap();
+        assert_eq!(rows.iter().map(|r| (r.template_id, r.lineage_id, r.service.as_deref().unwrap_or(""), r.count)).collect::<Vec<_>>(), vec![(1, 1, "api", 20), (2, 2, "api", 20), (3, 3, "db", 25)]);
         // Placed by hour and level bucket: info and warn_plus are distinct directories.
         let files = crate::store::list_parquet_files(&f.to.join("store"));
         assert_eq!(files.len(), 3);

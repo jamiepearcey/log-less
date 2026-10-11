@@ -88,6 +88,7 @@ All agents run with `--tail` on an empty file, which keeps them running until SI
 | central sentry records == edge | central holds the same number of Sentry records as the edge stored (and the proxy's `items_received` is shown) |
 | sentry proxy counted nothing forwarded | with no upstream, the proxy reports `items_forwarded=0` and `held_locally == items_received` |
 | central total == edge total, ids unique | same row count on both, every event id distinct on both |
+| central keeps the edge's content-hash template ids | `template_id` is the content hash of the template text, assigned by the edge and kept by central: rows per `template_id` are the same table in both stores, at least 3 ids, and none is a small counter (below 1000000). Only one edge sends records here; two independent miners agreeing is `crates/logless-core/tests/template_hash_ids.rs` |
 | rollup reconciliation (fidelity 100) | no rollup records on central, and rollup counts + records that are not supplements == what the edge wrote |
 
 Counts are taken with `duckdb` over each store's Parquet files after both agents have stopped.

@@ -42,7 +42,7 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 - [x] Rust Drain port; fixed-depth parse tree; stable `template_id`; wildcard merging; bounded fan-out and template cap.
 - [x] Template dictionary persisted in the catalog and restored on startup, so ids survive restarts.
 - [x] Templating wired into the merge path; `template_id` lands in Parquet.
-- [x] Template dictionary exported as `store/_meta/templates.pq` after every merge (atomic rewrite), one row per (template_id, service) with text, first/last seen, the catalog's id space (`agent`) and a content-derived `global_id`; served over the S3 endpoint. `.pq` keeps it out of the logs glob.
+- [x] Template dictionary exported after every merge (atomic rewrite) as `store/tenant=<t>/index=<i>/_meta/templates/writer=<node>.pq`, one row per (template_id, service) with text, count, first/last seen and `lineage_id`, plus `_meta/shape_history/writer=<node>.pq`; served over the S3 endpoint. `template_id` is the content hash of the text (it was a per-catalog counter with an `agent` and a `global_id` column before). `.pq` keeps it out of the logs glob.
 - [x] **Benched: 775,617 lines/s/core release (target ≥500k, met); 15 templates from 2M lines; 0% untemplated.** Debug build is ~39k/s — never bench unoptimised.
 - [x] Fallback path intact: nothing depends on templating: a `None` match writes the record untemplated.
 - [x] **Benchmarked against the 11 real LogHub corpora** with their published ground-truth template counts (`scripts/loghub.sh`). 568k lines/s/core on real logs. **This changed a default**: see below.
@@ -132,7 +132,7 @@ Design: `docs/architecture.md`. Strategy: `.context/project-brief.md`.
 
 The Sentry fingerprint was `logless:<template_id>`, where the id is a **per-agent counter minted in arrival order**. Within one agent that is stable and correct — it survives restart through the catalog. Across a fleet it is meaningless: node A's template 7 and node B's template 7 are different shapes, so one issue splits across nodes while unrelated errors merge on a shared index. For a feature whose selling point is *deterministic* grouping, and a deployment model of hundreds of nodes, that was wrong on every node from the start.
 
-Fingerprints are now derived from the masked template text (FNV-1a, not `DefaultHasher`, which is explicitly not stable across processes). Every agent watching the same service agrees without coordinating. The cost is that widening a template changes its fingerprint and starts a new Sentry issue at that point; that is rare, and the alternative was wrong always rather than occasionally.
+Fingerprints are now derived from the masked template text (an FNV-style hash, not `DefaultHasher`, which is explicitly not stable across processes). Since content-hash template ids the stored `template_id` is that same hash. Every agent watching the same service agrees without coordinating. The cost is that widening a template changes its fingerprint and starts a new Sentry issue at that point; that is rare, and the alternative was wrong always rather than occasionally.
 
 ### The compression step that was not there
 
@@ -236,8 +236,8 @@ Two datasets still over-split (Proxifier 3.25×, Apache 2.00×); both are domina
 - [ ] Parameter columns from unstructured bodies (template parameters) are still not extracted.
 
 ## Known gaps worth stating plainly
-- **The template dictionary is not rebuildable from Parquet.** `catalog --rebuild` restores `files` only; the per-service sightings behind `_meta/templates.pq` (like the templates themselves) live only in the catalog. A lost catalog restarts template ids under a new `agent` id, and rows written before the loss keep ids the new dictionary does not describe.
-- **Rows carry no agent column.** `_meta/templates.pq` names its id space, but a store that mixes files from several agents under one prefix cannot tell their `template_id`s apart; join such stores on `global_id` via each agent's own dictionary, or keep one prefix per agent.
+- **The template dictionary is only partly rebuildable from Parquet.** `catalog --rebuild` restores `files` only; the per-service sightings and template text behind `_meta/templates/` live in the catalog. `logless restore` and `logless migrate-layout` refill the sightings from the rows (the ids are content hashes, so they stay valid), but the text of a hash is an exemplar after a restore, and a widened shape's history is lost. Uploading the dictionary with the parts is a later slice.
+- ~~Rows carry no agent column.~~ Fixed by content-hash template ids (`docs/evidence/template-hash-ids.md`): a store that mixes files from several agents is correct under `GROUP BY template_id`. Parquet written before that carries the writer's counter until `logless migrate-layout` re-keys it.
 - ~~HEC index routing is ignored.~~ Done with layout v3 (`docs/architecture.md` section 2): `index` routes the event to that index of the tenant, and one that does not exist is refused with code 7 when the tenant has `unknown_index = "refuse"` (the default sends it to the default index and counts it).
 - **No real Splunk to test against.** Ingest was driven by a third-party HEC client, but the ack contract was polled by hand — no OSS client implements `useACK`. The shapes match Splunk's documented ones; they have not been checked against Splunk itself.
 - **An acked batch could still lose records to severity shedding** if another source fills the ingest queue between the capacity check and the submit. The window is small and the check makes it unlikely, but "unlikely" is not "cannot".
