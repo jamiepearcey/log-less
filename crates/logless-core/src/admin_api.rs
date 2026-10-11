@@ -392,7 +392,9 @@ impl AdminService {
         let receiver = self.peer.get().map(|p| p.snapshot());
         // Where uploaded parts are kept when that is this instance's own disk: bytes used, the budget, refusals.
         let parts_store = self.parts_store.get().and_then(|p| p.store_status());
-        (200, json!({ "source": source, "instance_id": control.instance(), "status": control.status(), "receiver": receiver, "parts_store": parts_store }))
+        // When this central is a replica: the source, and what the last (or current) run found and did.
+        let parts_replication = self.parts_store.get().and_then(|p| p.replication_status());
+        (200, json!({ "source": source, "instance_id": control.instance(), "status": control.status(), "receiver": receiver, "parts_store": parts_store, "parts_replication": parts_replication }))
     }
 
     /// `PUT /admin/v1/sync`: set the peer. Applies to the running sender at once and is kept in the data
@@ -610,6 +612,25 @@ impl AdminService {
         match central.sweep((self.clock)().saturating_mul(1_000), req.dry_run) {
             Ok(report) => (200, json!(report)),
             Err(m) => err(500, "sweep_failed", m),
+        }
+    }
+
+    /// `GET /admin/v1/parts/replicate`: the replication status. `POST` starts a run in the background and
+    /// answers 202 with it; progress is the same document, and `parts_replication` in `GET /admin/v1/sync`.
+    pub fn parts_replicate(&self, start: bool) -> Resp {
+        let Some(central) = self.parts_store.get() else {
+            return err(409, "parts_disabled", "[peer.parts] is not enabled on this instance");
+        };
+        if start {
+            match central.replicate_in_background() {
+                Ok(()) => {}
+                Err(crate::parts::ReplicateRefused::NotAReplica) => return err(409, "not_a_replica", "there is no [peer.parts.replicate] in this configuration"),
+                Err(crate::parts::ReplicateRefused::Running) => return err(409, "already_running", "a replication run is under way; see GET /admin/v1/parts/replicate"),
+            }
+        }
+        match central.replication_status() {
+            Some(status) => (if start { 202 } else { 200 }, json!({ "replication": status })),
+            None => err(409, "not_a_replica", "there is no [peer.parts.replicate] in this configuration"),
         }
     }
 
@@ -1132,6 +1153,8 @@ impl Handler for Api {
             (Method::Get, "/admin/v1/parts") => reply(s.parts_list(req.query)),
             (Method::Get, "/admin/v1/parts/audit") => reply(s.parts_audit(req.query)),
             (Method::Post, "/admin/v1/parts/sweep") => reply(s.parts_sweep(&req.body)),
+            (Method::Get, "/admin/v1/parts/replicate") => reply(s.parts_replicate(false)),
+            (Method::Post, "/admin/v1/parts/replicate") => reply(s.parts_replicate(true)),
             (Method::Get, "/admin/v1/sync") => reply(s.sync_get()),
             (Method::Put, "/admin/v1/sync") => reply(s.sync_put(&req.body)),
             (Method::Post, "/admin/v1/sync/test") => reply(s.sync_test(&req.body)),
@@ -1155,6 +1178,7 @@ impl Handler for Api {
                 | "/admin/v1/parts"
                 | "/admin/v1/parts/audit"
                 | "/admin/v1/parts/sweep"
+                | "/admin/v1/parts/replicate"
                 | "/admin/v1/templates/merge-suggestions"
                 | "/admin/v1/sync/test"
                 | "/admin/v1/sync/backfill"
@@ -2292,6 +2316,50 @@ mod tests {
         assert_eq!(400, r.call("POST", "/admin/v1/sync/backfill", &[], Some(json!({"from_ms": 1}))).0);
         assert_eq!(200, r.call("POST", "/admin/v1/sync/backfill/cancel", &[], None).0);
         assert_eq!(405, r.call("GET", "/admin/v1/sync/backfill", &[], None).0);
+    }
+
+    #[test]
+    fn a_replication_run_is_started_and_read_through_the_admin_api() {
+        let r = rig();
+        let (status, v) = r.call("POST", "/admin/v1/parts/replicate", &[], None);
+        assert_eq!((409, "parts_disabled"), (status, v["error"].as_str().unwrap()), "{v}");
+        let parts = |replicate| {
+            let config = crate::parts::PartsConfig { enabled: true, replicate, ..crate::parts::PartsConfig::default() };
+            Arc::new(crate::parts::PartsCentral::new(config, r.config.catalog_path()).unwrap())
+        };
+        // Not a replica: there is nothing to start.
+        r.service.set_parts(parts(None));
+        let (status, v) = r.call("POST", "/admin/v1/parts/replicate", &[], None);
+        assert_eq!((409, "not_a_replica"), (status, v["error"].as_str().unwrap()), "{v}");
+        assert_eq!(405, r.call("PUT", "/admin/v1/parts/replicate", &[], None).0);
+    }
+
+    #[test]
+    fn a_replica_starts_a_run_on_request_and_reports_where_it_got_to() {
+        let r = rig();
+        // Nothing listens on port 1, so the run ends at once with the reason.
+        let replicate = crate::parts::ReplicateConfig { url: "http://127.0.0.1:1".into(), token: "t".into(), interval_secs: 0, bytes_per_sec: 0, page_size: 10 };
+        let config = crate::parts::PartsConfig { enabled: true, replicate: Some(replicate), ..crate::parts::PartsConfig::default() };
+        let central = Arc::new(crate::parts::PartsCentral::new(config, r.config.catalog_path()).unwrap());
+        r.service.set_parts(Arc::clone(&central));
+        let (status, v) = r.call("GET", "/admin/v1/parts/replicate", &[], None);
+        assert_eq!((200, "idle", 0), (status, v["replication"]["state"].as_str().unwrap(), v["replication"]["runs"].as_u64().unwrap()), "{v}");
+        assert_eq!("http://127.0.0.1:1", v["replication"]["source"]);
+        assert!(!v.to_string().contains("\"t\""), "the token is never shown");
+        let (status, v) = r.call("POST", "/admin/v1/parts/replicate", &[], None);
+        assert_eq!(202, status, "{v}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let v = loop {
+            let (_, v) = r.call("GET", "/admin/v1/parts/replicate", &[], None);
+            if v["replication"]["state"] == "idle" && v["replication"]["runs"] == 1 {
+                break v;
+            }
+            assert!(std::time::Instant::now() < deadline, "{v}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(false, v["replication"]["run"]["complete"]);
+        assert!(v["replication"]["run"]["error"].as_str().unwrap().contains("could not be reached"), "{v}");
+        central.stop_replication();
     }
 
     #[test]

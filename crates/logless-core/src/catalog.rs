@@ -65,7 +65,7 @@ pub struct Catalog {
 }
 
 /// One catalogued part (`peer_parts`).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PeerPartRow {
     pub node: String,
     pub name: String,
@@ -120,6 +120,21 @@ fn partition_from_path(path: &Path) -> (u64, String) {
         }
     }
     (hour, bucket)
+}
+
+fn read_peer_part(r: &rusqlite::Row<'_>) -> rusqlite::Result<PeerPartRow> {
+    Ok(PeerPartRow {
+        node: r.get(0)?,
+        name: r.get(1)?,
+        size: r.get::<_, i64>(2)? as u64,
+        rows: r.get::<_, i64>(3)? as u64,
+        min_unix_nano: r.get::<_, i64>(4)? as u64,
+        max_unix_nano: r.get::<_, i64>(5)? as u64,
+        origin: r.get(6)?,
+        committed_ms: r.get::<_, i64>(7)? as u64,
+        tier: r.get(8)?,
+        tier_ms: r.get::<_, i64>(9)? as u64,
+    })
 }
 
 impl Catalog {
@@ -506,22 +521,58 @@ impl Catalog {
         )?;
         let rows = stmt.query_map(
             params![filter.node, filter.tier, filter.from_nano.map(|v| v as i64), filter.to_nano.map(|v| v as i64), filter.limit as i64, filter.newest_before_nano.map(|v| v as i64)],
-            |r| {
-                Ok(PeerPartRow {
-                    node: r.get(0)?,
-                    name: r.get(1)?,
-                    size: r.get::<_, i64>(2)? as u64,
-                    rows: r.get::<_, i64>(3)? as u64,
-                    min_unix_nano: r.get::<_, i64>(4)? as u64,
-                    max_unix_nano: r.get::<_, i64>(5)? as u64,
-                    origin: r.get(6)?,
-                    committed_ms: r.get::<_, i64>(7)? as u64,
-                    tier: r.get(8)?,
-                    tier_ms: r.get::<_, i64>(9)? as u64,
-                })
-            },
+            read_peer_part,
         )?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Up to `limit` parts in `(node, name)` order, strictly after `after`: one page of the listing a replica pages through.
+    pub fn peer_parts_after(&self, after: Option<(&str, &str)>, limit: usize) -> Result<Vec<PeerPartRow>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node, name, size, rows, min_observed, max_observed, origin, committed_ms, tier, tier_ms FROM peer_parts
+             WHERE (?1 IS NULL OR (node, name) > (?1, ?2)) ORDER BY node, name LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![after.map(|a| a.0), after.map(|a| a.1), limit as i64], read_peer_part)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// One catalogued part.
+    pub fn peer_part(&self, node: &str, name: &str) -> Result<Option<PeerPartRow>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node, name, size, rows, min_observed, max_observed, origin, committed_ms, tier, tier_ms FROM peer_parts WHERE node = ?1 AND name = ?2",
+        )?;
+        Ok(stmt.query_row(params![node, name], read_peer_part).optional()?)
+    }
+
+    /// `(node, name, tier)` of the parts strictly after `after` and, when there is an `upto`, up to and including it.
+    pub fn peer_part_keys(&self, after: Option<(&str, &str)>, upto: Option<(&str, &str)>) -> Result<Vec<(String, String, String)>, CatalogError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT node, name, tier FROM peer_parts
+             WHERE (?1 IS NULL OR (node, name) > (?1, ?2)) AND (?3 IS NULL OR (node, name) <= (?3, ?4)) ORDER BY node, name",
+        )?;
+        let rows = stmt.query_map(params![after.map(|a| a.0), after.map(|a| a.1), upto.map(|a| a.0), upto.map(|a| a.1)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Records a part copied from another central, under the node that first uploaded it, with the tier the
+    /// source had. `committed_ms` is when this catalog took it. Returns false when the part is already here
+    /// (nothing changes); otherwise the audit row says where it came from.
+    pub fn record_replicated_part(&mut self, part: &PeerPartRow, at_ms: u64, source: &str) -> Result<bool, CatalogError> {
+        self.conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let tx = self.conn.transaction()?;
+        let n = tx.execute(
+            "INSERT OR IGNORE INTO peer_parts (node, name, size, rows, min_observed, max_observed, origin, committed_ms, tier, tier_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![part.node, part.name, part.size as i64, part.rows as i64, part.min_unix_nano as i64, part.max_unix_nano as i64, part.origin, at_ms as i64, part.tier, part.tier_ms as i64],
+        )?;
+        if n > 0 {
+            tx.execute(
+                "INSERT INTO peer_parts_audit (at_ms, action, node, name, tier, size, outcome, detail) VALUES (?1, 'replicate', ?2, ?3, ?4, ?5, 'ok', ?6)",
+                params![at_ms as i64, part.node, part.name, part.tier, part.size as i64, format!("copied from {source}")],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n > 0)
     }
 
     /// Records the outcome of expiring `part`: when the object is gone (`deleted`) the catalog row goes

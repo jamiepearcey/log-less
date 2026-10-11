@@ -173,6 +173,35 @@ Left open, and known:
 * **A token is a bearer credential for one upload** until it expires (900 s by default). It is returned in the presign
   answer's body, to the authenticated node, and sent in a header.
 
+### Part replication between centrals (`GET /v1/parts/replica/*` and the replica's fetch)
+
+Added on `wf/parts-repl` (LOG-168, ADR 0003 "Replica"). Two read-only paths on the peer listener, opened by their own
+credential, and a replica that writes files named by what a source tells it. All rows passed
+(`cargo test -p logless-core -- parts:: admin_api::`).
+
+| Abuse case | Defence | Test |
+|---|---|---|
+| No token, a wrong token, a node token, an ingest token on the replica paths | 401 / 403 from the head, counted in `parts_store.refused_replica`; a central with no `replication_tokens` answers 404 | `parts::replicate::tests::the_replica_paths_open_only_with_a_replication_token_and_nothing_else_opens_with_it`, `...::a_central_with_no_replication_tokens_offers_nothing_and_a_replica_says_so` |
+| A replication token used for anything else (presign, the capability document) | 403: `authenticated` knows only ingest and node tokens | same first test |
+| A replication token that is also a node or ingest token | the listener refuses to start (`replication_tokens must differ`) | `parts::replicate::tests::replication_is_configured_only_where_it_can_work` |
+| Reading a file that was never committed, or by a traversal path | only catalogued `(node, name)` pairs are served, each validated (`valid_node`, `valid_name`) before a path is built; the path is not decoded; 404 | first test (an uncommitted file on disk, `../`, a name under the wrong node) |
+| A source that lists a name or node that is not one (traversal, a dot directory), a size or hash that does not fit, an unknown tier | the entry is skipped as `invalid`; nothing is written | `parts::replicate::tests::an_entry_that_could_not_be_a_file_in_a_node_directory_is_never_believed` |
+| A source serving other bytes than the name (a damaged file, a hostile source) | hashed while streaming; a body whose SHA-256 is not the name is removed, not catalogued, reported | `parts::replicate::tests::a_damaged_source_part_is_refused_reported_and_never_catalogued_and_is_fetched_once_repaired` |
+| A source that lists what it cannot serve, or serves a size other than the listed one | skipped and reported (`unservable`, `damaged`); the rest are copied | `parts::replicate::tests::a_source_that_lists_a_part_it_cannot_serve_is_reported_and_the_rest_are_copied` |
+| A source that ignores `Range`, or answers a range from elsewhere | the partial copy is thrown away and the part is read from byte 0 | by construction (`fetch_into_place`); not covered by a test of its own |
+| Filling the replica's disk | each fetch reserves its size against `disk_budget_bytes` first; a full budget or disk ends the run | by construction; the budget itself is `parts::tests::the_disk_budget_refuses_with_507_counts_it_and_frees_with_a_delete` |
+| A source deleting the replica's parts | it cannot: the replica never deletes; a retired part is reported as `only_here` | `parts::replicate::tests::a_replica_that_already_holds_some_parts_fetches_only_the_rest_and_never_deletes` |
+
+Left open, and known:
+
+* **A replication token reads every node's parts** and the whole catalog (origins, times, sizes). It is read-only and
+  distinct from the admin token, but it is not per node. Give one to each replica and rotate by editing the list.
+* **The link is plain HTTP unless the URLs say `https`.** The bytes are verified against their names, the catalog page is
+  not authenticated beyond the token: on an open network, use TLS in front of the peer listener.
+* **A replica trusts the source's catalog for what exists** (not for what a file contains). A hostile source can list parts
+  that were never uploaded, up to the replica's disk budget.
+* **No per-replica cap on concurrent reads**; they share the peer listener's connection cap with ingest.
+
 ## S3 serve (`crates/logless-core/src/s3_serve.rs`)
 
 Defect fix: the listener was `tiny_http::Server::http` (HEAD line 173) with a request pool and detached stream threads;
