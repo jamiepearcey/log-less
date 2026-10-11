@@ -260,6 +260,27 @@ URL, streams the file to it and commits. Progress is `parts` in `GET /admin/v1/s
   minutes (not yet merged from the WAL) are not included, and a file compacted after upload is a new part with the same
   rows: a reader of the bucket dedupes on event id, as with records.
 
+### Damage to a stored part: what is and is not checked
+
+Central trusts the storage for the integrity of what it holds. When a part is uploaded the storage verifies the content against
+the SHA-256 in the part's name, and central later accepts a part as present when a HEAD returns the same size and the same
+recorded checksum. Central never downloads a part to hash it again, so **a byte that changes inside the storage afterwards (bitrot,
+a failed disk, tampering with the data files) while the size stays the same is not detected by log-less.** Measured on MinIO
+(`docs/evidence/parts-minio.md`): HEAD keeps returning the checksum recorded at upload, while MinIO's own bitrot check refuses to
+serve the damaged object, so a read of it fails.
+
+What an operator does about it:
+
+* Run the storage's own scrub. On MinIO that is its background healing and scanner (`mc admin heal`, and `mc admin scanner status`
+  to see it running); on AWS S3 and other managed stores durability and checksum scrubbing are the provider's. Run it on a
+  schedule the retention policy can live with.
+* A read that fails with a checksum or bitrot error means the part is damaged. Delete the object and its row in `peer_parts`, then
+  upload the part again from the edge (`POST /admin/v1/sync/parts` over the range, after removing its entry from
+  `parts-uploaded.jsonl` in the edge's data dir if the edge still has the file). Parts whose edge copy has been retired cannot be
+  rebuilt this way: keep storage-level replication or versioning for them.
+* This was a decision, not an oversight: a periodic hash-everything job would make central carry every part's bytes, which the
+  design avoids. If that trade changes, the job belongs on the edge or beside the storage, not in the request path.
+
 ## Not built yet
 
 * **Query pushdown** (a filtered scan or partial aggregate answered by the instance). Measure first: the S3 path's bytes
