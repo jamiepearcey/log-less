@@ -101,6 +101,10 @@ pub struct TailSource {
     /// Service attached to lines that do not name one themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
+    /// The index this source's lines are stored in. Left out, the tenant's
+    /// default index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
 }
 
 struct Source {
@@ -108,6 +112,7 @@ struct Source {
     exclude: Vec<String>,
     from_end: bool,
     service: Option<String>,
+    index: Option<String>,
 }
 
 /// Tails a set of paths and patterns.
@@ -319,6 +324,7 @@ impl Tailer {
             exclude: Vec::new(),
             from_end: start_at_end,
             service: None,
+            index: None,
         }])
     }
 
@@ -341,6 +347,7 @@ impl Tailer {
                 exclude: source.exclude,
                 from_end: source.from_end,
                 service: source.service,
+                index: source.index,
             });
             for path in literals {
                 tailer.claim(index, path);
@@ -408,14 +415,19 @@ impl Tailer {
 
     /// Like `poll`, also passing the owning source's service label.
     pub fn poll_labeled(&mut self, mut emit: impl FnMut(&Path, Option<&str>, &str)) {
+        self.poll_routed(|path, service, _, line| emit(path, service, line));
+    }
+
+    /// Like `poll`, also passing the owning source's service label and index.
+    pub fn poll_routed(&mut self, mut emit: impl FnMut(&Path, Option<&str>, Option<&str>, &str)) {
         self.expand_patterns();
         let initial = !self.started;
         self.started = true;
         for path in self.paths.clone() {
             let source = &self.sources[self.origin[&path]];
-            let service = source.service.clone();
+            let (service, index) = (source.service.clone(), source.index.clone());
             let start_at_end = source.from_end && initial;
-            self.poll_one(&path, start_at_end, &mut |p, line| emit(p, service.as_deref(), line));
+            self.poll_one(&path, start_at_end, &mut |p, line| emit(p, service.as_deref(), index.as_deref(), line));
         }
         self.save_checkpoint();
     }
@@ -947,7 +959,7 @@ mod source_tests {
     use super::*;
 
     fn source(paths: Vec<PathBuf>) -> TailSource {
-        TailSource { paths, exclude: vec![], from_end: false, service: None }
+        TailSource { paths, exclude: vec![], from_end: false, service: None, index: None }
     }
 
     fn poll_all(tailer: &mut Tailer) -> Vec<(Option<String>, String)> {
@@ -1011,6 +1023,22 @@ mod source_tests {
         ]);
         assert_eq!(poll_all(&mut tailer), [(Some("db".into()), "old db".into())]);
         assert!(poll_all(&mut tailer).is_empty());
+    }
+
+    #[test]
+    fn each_source_names_the_index_its_lines_go_to() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pay.log"), "charged\n").unwrap();
+        std::fs::write(dir.path().join("web.log"), "served\n").unwrap();
+        let mut tailer = Tailer::from_sources(vec![
+            TailSource { index: Some("payments".into()), ..source(vec![dir.path().join("pay.log")]) },
+            source(vec![dir.path().join("web.log")]),
+        ]);
+        let mut out = Vec::new();
+        tailer.poll_routed(|_, _, index, line| out.push((index.map(str::to_string), line.to_string())));
+        assert_eq!(out, [(Some("payments".to_string()), "charged".to_string()), (None, "served".to_string())]);
+        let parsed: TailSource = toml::from_str("paths = [\"/var/log/pay.log\"]\nindex = \"payments\"\n").unwrap();
+        assert_eq!(parsed.index.as_deref(), Some("payments"));
     }
 
     #[test]

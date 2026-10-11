@@ -6,7 +6,7 @@ use std::net::TcpStream;
 
 use logless_core::s3_serve::{S3ServeConfig, S3Server};
 
-const KEY: &str = "hour=2026-10-02T23/level=info/a.parquet";
+const KEY: &str = "tenant=default/index=default/hour=2026-10-02T23/level=info/node=node-a/a.parquet";
 
 fn start(dir: &std::path::Path) -> S3Server {
     let file = dir.join(KEY);

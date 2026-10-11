@@ -22,6 +22,19 @@ use crate::wal;
 pub struct Locations<'a> {
     pub store_dir: &'a Path,
     pub wal_dir: &'a Path,
+    /// The tenants and indexes of the config file. A policy document's
+    /// `retention` replaces the buckets of the default index; every other
+    /// index keeps the file's.
+    pub tenancy: &'a crate::config::Tenancy,
+}
+
+impl Locations<'_> {
+    /// The tenancy a pass under `policies` would enforce.
+    fn tenancy_under(&self, policies: &Policies) -> Result<crate::config::Tenancy, crate::config::ConfigError> {
+        let mut tenancy = self.tenancy.clone();
+        tenancy.set_default_buckets(policies.buckets()?);
+        Ok(tenancy)
+    }
 }
 
 /// Everything a pass under one policy would delete.
@@ -96,7 +109,7 @@ pub fn plan(
     policies: &Policies,
     now_unix_secs: u64,
 ) -> Result<Plan, PlanError> {
-    let buckets = policies.buckets().map_err(|e| PlanError::Policy(e.to_string()))?;
+    let buckets = loc.tenancy_under(policies).map_err(|e| PlanError::Policy(e.to_string()))?;
     let wm = policies.watermarks();
     let budget = policies.storage.disk_budget_bytes;
 
@@ -112,7 +125,7 @@ pub fn plan(
         *expired_files.entry(e.key.bucket.clone()).or_default() += count_files(&e.path);
     }
 
-    let wal_bytes = wal::dir_bytes(loc.wal_dir);
+    let wal_bytes = wal::dir_bytes(loc.wal_dir) + wal::dir_bytes(&wal::late_dir_beside(loc.wal_dir));
     let store_bytes_all = catalog.totals()?.1;
     let used_before = wal_bytes + store_bytes_all;
     let usage_after = DiskUsage {
@@ -228,11 +241,14 @@ pub fn orphan_problems(
     proposed: &Policies,
     now_unix_secs: u64,
 ) -> Result<Vec<Problem>, PlanError> {
-    let Ok(new_buckets) = proposed.buckets() else { return Ok(Vec::new()) };
+    let Ok(new_buckets) = loc.tenancy_under(proposed) else { return Ok(Vec::new()) };
     let report = retention::enforce(loc.store_dir, &new_buckets, now_unix_secs, true);
     let mut counts: BTreeMap<&str, u64> = BTreeMap::new();
     for k in &report.orphan_buckets {
-        if current.retention.iter().any(|r| r.name == k.bucket) {
+        // The document's buckets are the default index's; an orphan under
+        // another index or tenant is not this change's doing.
+        let default_index = k.tenant == loc.tenancy.tenant() && k.index == loc.tenancy.default_index();
+        if default_index && current.retention.iter().any(|r| r.name == k.bucket) {
             *counts.entry(k.bucket.as_str()).or_default() += 1;
         }
     }
@@ -265,10 +281,11 @@ mod tests {
     use crate::policy::test_policies;
 
     fn partition(store: &Path, hour: u64, bucket: &str, bytes: usize) -> PathBuf {
-        let dir = PartitionKey { epoch_hour: hour, bucket: bucket.into() }.dir(store);
+        let dir = PartitionKey::at(hour, bucket).dir(store);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("000001.parquet"), vec![0u8; bytes]).unwrap();
-        dir
+        // The directory retention deletes, which holds the writer's leaf.
+        PartitionKey::at(hour, bucket).level_dir(store)
     }
 
     struct Fixture {
@@ -276,6 +293,7 @@ mod tests {
         store: PathBuf,
         wal: PathBuf,
         catalog: Catalog,
+        tenancy: crate::config::Tenancy,
     }
 
     fn fixture() -> Fixture {
@@ -283,7 +301,7 @@ mod tests {
         let store = tmp.path().join("store");
         let wal = tmp.path().join("wal");
         fs::create_dir_all(&store).unwrap();
-        Fixture { store, wal, catalog: Catalog::open_in_memory().unwrap(), _tmp: tmp }
+        Fixture { store, wal, catalog: Catalog::open_in_memory().unwrap(), tenancy: Default::default(), _tmp: tmp }
     }
 
     #[test]
@@ -293,7 +311,7 @@ mod tests {
         let now = 101 * SECS_PER_HOUR + 3 * 86_400;
         let debug = partition(&f.store, 100, "debug", 10);
         let info = partition(&f.store, 100, "info", 20);
-        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal };
+        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal, tenancy: &f.tenancy };
 
         let current = test_policies();
         let mut proposed = current.clone();
@@ -313,7 +331,7 @@ mod tests {
         let f = fixture();
         let now = 101 * SECS_PER_HOUR + 3 * 86_400;
         partition(&f.store, 100, "debug", 10); // already past its 1d retention
-        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal };
+        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal, tenancy: &f.tenancy };
         let current = test_policies();
         let mut proposed = current.clone();
         proposed.retention[2].retention_secs += 1; // unrelated tweak
@@ -327,7 +345,7 @@ mod tests {
         let f = fixture();
         let now = 101 * SECS_PER_HOUR + 3 * 86_400;
         partition(&f.store, 100, "debug", 10);
-        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal };
+        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal, tenancy: &f.tenancy };
         let current = test_policies();
         let mut proposed = current.clone();
         proposed.retention[0].retention_secs = 30 * 86_400;
@@ -343,7 +361,7 @@ mod tests {
         use crate::store;
         let mut f = fixture();
         let mut seed = |hour: u64, bucket: &str, segment: u64| {
-            let key = PartitionKey { epoch_hour: hour, bucket: bucket.into() };
+            let key = PartitionKey::at(hour, bucket);
             let path = key.dir(&f.store).join(store::file_name_for_segment(segment, uuid::Uuid::from_u128(segment as u128)));
             let base = hour * 3600 * 1_000_000_000 + segment;
             let recs: Vec<_> = (0..200)
@@ -364,7 +382,7 @@ mod tests {
         let w = seed(100, "warn_plus", 3);
         let total = d + i + w;
 
-        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal };
+        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal, tenancy: &f.tenancy };
         let now = 100 * SECS_PER_HOUR + 10; // nothing expires by retention
         let mut current = test_policies();
         current.storage.disk_budget_bytes = total * 10;
@@ -384,7 +402,7 @@ mod tests {
     fn orphan_protection_names_the_bucket_and_what_to_do() {
         let f = fixture();
         partition(&f.store, 100, "info", 5);
-        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal };
+        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal, tenancy: &f.tenancy };
         let now = 100 * SECS_PER_HOUR;
         let current = test_policies();
 
@@ -409,7 +427,7 @@ mod tests {
     fn an_orphan_that_already_existed_does_not_block_unrelated_changes() {
         let f = fixture();
         partition(&f.store, 100, "legacy", 5); // not in the current policy either
-        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal };
+        let loc = Locations { store_dir: &f.store, wal_dir: &f.wal, tenancy: &f.tenancy };
         let current = test_policies();
         let mut proposed = current.clone();
         proposed.retention[1].retention_secs = 60;

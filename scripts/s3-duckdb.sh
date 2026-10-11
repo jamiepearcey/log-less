@@ -80,10 +80,12 @@ awk -v n="$LINES" 'BEGIN {
   }
 }' > "$WORK/app.log"
 "$BIN" run --config "$WORK/config.toml" < "$WORK/app.log" > /dev/null 2>&1
-# Everything ingests into the current hour; a copy under the previous hour gives a second partition.
-cur=$(ls "$WORK/data/store" | head -1)
+# The store is tenant=/index=/hour=<event hour>/level=/node=/. Everything here is the default tenant and index, and
+# ingests into the current hour; a copy under the previous hour gives a second partition.
+IDX="tenant=default/index=default"
+cur=$(ls "$WORK/data/store/$IDX" | grep '^hour=' | head -1)
 prev="hour=$(date -u -v-1H +%Y-%m-%dT%H 2>/dev/null || date -u -d '1 hour ago' +%Y-%m-%dT%H)"
-[[ "$cur" == "$prev" ]] || cp -r "$WORK/data/store/$cur" "$WORK/data/store/$prev"
+[[ "$cur" == "$prev" ]] || cp -r "$WORK/data/store/$IDX/$cur" "$WORK/data/store/$IDX/$prev"
 find "$WORK/data/store" -name '*.parquet' -exec ls -l {} \; | awk '{print $5, $9}' | sed "s#$WORK/data/store/##"
 GLOB="$WORK/data/store/**/*.parquet"
 LOCAL_COUNT=$(local_duck "select count(*) from read_parquet('$GLOB', hive_partitioning=true)")
@@ -98,6 +100,8 @@ run_duck_checks() { # port, key, secret
   local port="$1" key="$2" secret="${3:-$SK}"
   check "count(*) over S3 equals local" "$LOCAL_COUNT" "$(duck "$port" "$key" "select count(*) from read_parquet('s3://logs/**/*.parquet', hive_partitioning=true)" "$secret")"
   check "hour filter rows" "$LOCAL_HOUR" "$(duck "$port" "$key" "select count(*) from read_parquet('s3://logs/**/*.parquet', hive_partitioning=true) where hour='${prev#hour=}'" "$secret")"
+  check "one index is one prefix; tenant, index and node are hive columns" "$LOCAL_COUNT default default 1" \
+    "$(duck "$port" "$key" "select count(*) || ' ' || any_value(tenant) || ' ' || any_value(\"index\") || ' ' || count(distinct node) from read_parquet('s3://logs/$IDX/**/*.parquet', hive_partitioning=true)" "$secret")"
   check "trace_id equality rows" "$LOCAL_TRACE" "$(duck "$port" "$key" "select count(*) from read_parquet('s3://logs/**/*.parquet', hive_partitioning=true) where $TRACE_SQL" "$secret")"
 }
 
@@ -116,7 +120,8 @@ bad=$("$DUCKDB" -noheader -list -c "LOAD httpfs; SET s3_endpoint='127.0.0.1:$POR
 if grep -qiE '403|forbidden|signature' <<< "$bad"; then echo "ok    wrong secret rejected by DuckDB (403)"; else echo "FAIL  wrong secret was not rejected: $bad"; FAILS=$((FAILS + 1)); fi
 
 say "4. curl checks (credentialed)"
-KEY="$cur/level=debug/$(ls "$WORK/data/store/$cur/level=debug" | head -1)"
+LEAF="$IDX/$cur/level=debug/$(ls "$WORK/data/store/$IDX/$cur/level=debug" | head -1)"   # .../node=<this node>
+KEY="$LEAF/$(ls "$WORK/data/store/$LEAF" | head -1)"
 URL="http://127.0.0.1:$PORT/logs/$KEY"
 SIZE=$(stat -f %z "$WORK/data/store/$KEY" 2>/dev/null || stat -c %s "$WORK/data/store/$KEY")
 CURL=(curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user "$AK:$SK")
@@ -144,7 +149,7 @@ measure() { # label, sql
     "$(awk -v b="$BYTES" -v s="$SIZE" 'BEGIN {printf "%.2f", 100 * b / s}')" "$SIZE"
 }
 # A glob takes the object size from the listing; a bare key makes DuckDB HEAD for it first.
-GLOBF="s3://logs/$cur/level=debug/*.parquet"
+GLOBF="s3://logs/$LEAF/*.parquet"
 measure "listed: template_id where trace_id=X" "select count(template_id) from read_parquet('$GLOBF') where $TRACE_SQL"
 measure "listed: body, full scan" "select sum(length(body)) from read_parquet('$GLOBF')"
 measure "listed: count(*) only (footer)" "select count(*) from read_parquet('$GLOBF')"

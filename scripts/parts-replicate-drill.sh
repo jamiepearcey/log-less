@@ -147,8 +147,9 @@ OTLP_PORT=$(free_port); EDGE_ADMIN=$(free_port); EDGE_TOKEN="$(rand 24)"
 mkdir -p "$R/edge"; : > "$R/edge/empty.log"
 BUCKETS=$(python3 -c '
 for i, s in enumerate([0] + list(range(3, 24, 2))):
-    print(f"[[retention]]\nname = \"sev{s:02d}\"\nmin_severity = {s}\nretention = \"1day\"\n")')
+    print(f"[[tenants.indexes.retention]]\nname = \"sev{s:02d}\"\nmin_severity = {s}\nretention = \"1day\"\n")')
 render_config "$R/edge/data" "
+node|id|\"$NODE\"
 storage|wal_segment_bytes|$WAL_SEGMENT
 otlp|enabled|true
 otlp|addr|\"127.0.0.1:$OTLP_PORT\"
@@ -167,7 +168,7 @@ anomaly_boost = false
 import sys
 skip = False
 for line in sys.stdin.read().splitlines():
-    if line.strip() == "[[retention]]":
+    if line.strip() == "[[tenants.indexes.retention]]":   # the default buckets of the default index; replaced below
         skip = True
         continue
     if skip and line.strip().startswith("["):

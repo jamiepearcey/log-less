@@ -21,10 +21,12 @@
 //! read, so a client without a token is answered without buffering or inflating
 //! a byte of what it sent.
 //!
-//! Not implemented: index routing (we have level buckets, not indexes, and
-//! silently accepting an `index` we cannot honour is better than refusing the
-//! data, so it is kept as an attribute), and `/services/collector/raw` with
-//! `HTTP 1.0` chunk semantics.
+//! An event's `index` routes it to that index of the store
+//! (`config::Tenancy::route_record`); the sink decides, and for an index the
+//! tenant does not have and refuses it answers [`Admitted::IncorrectIndex`],
+//! which is Splunk's code 7 for the whole request.
+//!
+//! Not implemented: `/services/collector/raw` with `HTTP 1.0` chunk semantics.
 
 pub mod ack;
 pub mod event;
@@ -49,6 +51,7 @@ mod code {
     pub const INVALID_TOKEN: u32 = 4;
     pub const NO_DATA: u32 = 5;
     pub const INVALID_DATA_FORMAT: u32 = 6;
+    pub const INCORRECT_INDEX: u32 = 7;
     pub const SERVER_BUSY: u32 = 9;
     pub const DATA_CHANNEL_MISSING: u32 = 10;
     pub const INVALID_DATA_CHANNEL: u32 = 11;
@@ -123,6 +126,9 @@ impl Default for HecConfig {
 pub enum Admitted {
     Accepted,
     Busy,
+    /// An event named an index that does not exist and the tenant refuses
+    /// those. Nothing of the request is stored: an acked batch must be whole.
+    IncorrectIndex,
 }
 
 #[derive(Debug, Default)]
@@ -344,6 +350,10 @@ impl HecHandler {
                 self.stats.busy.fetch_add(1, Ordering::Relaxed);
                 reply(503, code::SERVER_BUSY, "Server is busy")
                     .with_header("Retry-After", "1")
+            }
+            Admitted::IncorrectIndex => {
+                self.stats.bad_request.fetch_add(1, Ordering::Relaxed);
+                reply(400, code::INCORRECT_INDEX, "Incorrect index")
             }
         }
     }
@@ -631,6 +641,32 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert_eq!(seen[0].service.as_deref(), Some("checkout"));
         assert!(h.stats().accounts_for_everything());
+    }
+
+    #[test]
+    fn a_sink_that_refuses_the_index_answers_code_7_and_stores_nothing() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let config = HecConfig { enabled: true, addr: "127.0.0.1:0".into(), tokens: vec!["secret".into()], ..HecConfig::default() };
+        let receiver = Receiver::start(&config, AckTable::new(Arc::new(AtomicU64::new(0))), move |batch: Batch| {
+            let asked = |r: &LogRecord| r.attributes.iter().any(|a| a.key == "index" && a.value == crate::model::AttrValue::Str("nope".into()));
+            if batch.records.iter().any(asked) {
+                return Admitted::IncorrectIndex;
+            }
+            sink_seen.lock().unwrap().extend(batch.records);
+            Admitted::Accepted
+        })
+        .unwrap();
+        let url = format!("http://{}/services/collector/event", receiver.local_addr());
+        // One bad event refuses the whole request, as Splunk does.
+        let (status, body) = post(&url, r#"{"event":"kept?","index":"main"}{"event":"x","index":"nope"}"#, &[AUTH]);
+        assert_eq!((status, body.as_str()), (400, r#"{"text":"Incorrect index","code":7}"#));
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(post(&url, r#"{"event":"fine","index":"main"}"#, &[AUTH]).0, 200);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let stats = receiver.shutdown();
+        assert_eq!((stats.bad_request, stats.accepted), (1, 1));
+        assert!(stats.accounts_for_everything());
     }
 
     #[test]

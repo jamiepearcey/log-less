@@ -18,12 +18,19 @@
 //! appending to. Deleting a file out from under an open append handle loses
 //! every record written after the unlink, silently. Skipping `>= active` closes
 //! that window; the newer segments are simply merged on the next pass.
+//!
+//! A record's partition is `(tenant, index, event hour, level bucket, node)`:
+//! the instance's own tenant and node, the index the record was routed to at
+//! ingest (`config::ATTR_INDEX`, absent for the default index), the hour of its
+//! `timestamp`, and the bucket its severity falls in under that index. The
+//! late spool (`wal-late/`, `wal::SplitWal`) is a second directory of the same
+//! segments and is merged by calling [`merge_all`] on it.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::catalog::{Catalog, CatalogError, FileEntry, TemplateSighting};
-use crate::config::LevelBuckets;
+use crate::config::{Route, Tenancy, ATTR_INDEX};
 use crate::drain::Drain;
 use crate::model::LogRecord;
 use crate::partition::PartitionKey;
@@ -68,6 +75,31 @@ pub struct MergeReport {
     pub dictionary_error: Option<String>,
     /// Attribute keys promoted to typed columns by this merge.
     pub columns_promoted: u64,
+    /// Records whose index is no longer configured (it was when they were
+    /// accepted): stored in the default index rather than lost.
+    pub index_rerouted: u64,
+}
+
+impl MergeReport {
+    /// Adds the report of a second merge of the same pass (the late spool's)
+    /// to this one.
+    pub fn absorb(&mut self, other: MergeReport) {
+        self.segments_merged += other.segments_merged;
+        self.segments_skipped += other.segments_skipped;
+        self.records += other.records;
+        self.files_written += other.files_written;
+        self.bytes_written += other.bytes_written;
+        self.wal_bytes_freed += other.wal_bytes_freed;
+        self.truncated += other.truncated;
+        self.temp_files_cleaned += other.temp_files_cleaned;
+        self.templated += other.templated;
+        self.untemplated += other.untemplated;
+        self.new_templates += other.new_templates;
+        self.columns_promoted += other.columns_promoted;
+        self.index_rerouted += other.index_rerouted;
+        self.dictionary_rows = other.dictionary_rows.or(self.dictionary_rows);
+        self.dictionary_error = other.dictionary_error.or(self.dictionary_error.take());
+    }
 }
 
 /// Merge every eligible WAL segment.
@@ -82,7 +114,7 @@ pub fn merge_all(
     wal_dir: &Path,
     store_dir: &Path,
     catalog: &mut Catalog,
-    buckets: &LevelBuckets,
+    tenancy: &Tenancy,
     drain: &mut Drain,
     typed_config: &TypedColumnsConfig,
     active_segment: Option<u64>,
@@ -124,13 +156,41 @@ pub fn merge_all(
         // `wal_segment_bytes`, so this is bounded too — the reason merge works
         // per segment rather than over the whole WAL.
         let mut partitions: BTreeMap<PartitionKey, Vec<LogRecord>> = BTreeMap::new();
+        let mut rerouted = 0u64;
         let outcome = wal::replay_segment(&path, true, |batch| {
-            for record in batch {
-                let bucket = buckets.bucket_for(record.severity);
-                let key = PartitionKey::from_nanos(record.observed_unix_nano, &bucket.name);
+            for mut record in batch {
+                // The index is a directory, not a column: the routing
+                // attribute is taken off the record here.
+                let asked = record.attributes.iter().position(|a| a.key == ATTR_INDEX).map(|at| record.attributes.remove(at));
+                let asked = asked.as_ref().and_then(|a| match &a.value {
+                    crate::model::AttrValue::Str(s) => Some(s.as_str()),
+                    _ => None,
+                });
+                let index = match tenancy.route(asked) {
+                    Route::Known(index) => index,
+                    // Routed at ingest to an index the config has since lost.
+                    // The record was accepted, so it is kept.
+                    Route::Defaulted(index) => {
+                        rerouted += 1;
+                        index
+                    }
+                    Route::Refused => {
+                        rerouted += 1;
+                        tenancy.default_index()
+                    }
+                };
+                let buckets = tenancy.buckets(tenancy.tenant(), index).unwrap_or_else(|| tenancy.default_buckets());
+                let key = PartitionKey::new(
+                    tenancy.tenant(),
+                    index,
+                    record.timestamp_unix_nano / crate::partition::NANOS_PER_HOUR,
+                    &buckets.bucket_for(record.severity).name,
+                    tenancy.node(),
+                );
                 partitions.entry(key).or_default().push(record);
             }
         })?;
+        report.index_rerouted += rerouted;
         if outcome.truncated_to.is_some() {
             report.truncated += 1;
         }
@@ -285,7 +345,7 @@ mod tests {
             &wal_dir,
             &store_dir,
             &mut cat,
-            &LevelBuckets::default(),
+            &Tenancy::default(),
             &mut Drain::default(),
             &TypedColumnsConfig::default(),
             None,
@@ -318,6 +378,113 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_row_lands_in_the_hour_of_its_event_not_the_hour_it_arrived() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, store_dir) = (tmp.path().join("wal"), tmp.path().join("store"));
+        let mut replayed = record(5 * SECS_PER_HOUR + 7, Severity::INFO, "happened in hour 5");
+        replayed.observed_unix_nano = (90 * SECS_PER_HOUR + 1) * 1_000_000_000;
+        let live = record(90 * SECS_PER_HOUR + 2, Severity::INFO, "happened in hour 90");
+        write_wal(&wal_dir, vec![vec![replayed, live]]);
+
+        let mut cat = Catalog::open_in_memory().unwrap();
+        merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
+        let files = cat.list_files().unwrap();
+        assert_eq!(files.iter().map(|f| f.key.epoch_hour).collect::<Vec<_>>(), [5, 90]);
+        let early = &files[0];
+        assert_eq!(early.path, store_dir.join("tenant=default/index=default/hour=1970-01-01T05/level=info/node=node-a").join(early.path.file_name().unwrap()));
+        // Event time and observed time are both kept, and differ for the replay.
+        assert_eq!(early.stats.min_ts_nanos, ((5 * SECS_PER_HOUR + 7) * 1_000_000_000) as i64);
+        assert_eq!(early.stats.min_observed_nanos, ((90 * SECS_PER_HOUR + 1) * 1_000_000_000) as i64);
+        assert_eq!(cat.files_overlapping("default", "default", 0, (6 * SECS_PER_HOUR * 1_000_000_000) as i64, None).unwrap().len(), 1);
+    }
+
+    fn two_indexes(unknown: crate::config::UnknownIndex) -> Tenancy {
+        use crate::config::{IndexConfig, LevelBucket, LevelBuckets, TenantConfig};
+        let all = LevelBuckets::new(vec![LevelBucket { name: "all".into(), min_severity: 0, retention: Duration::from_secs(3600) }]).unwrap();
+        Tenancy::new(
+            vec![TenantConfig {
+                id: "acme".into(),
+                unknown_index: unknown,
+                indexes: vec![
+                    IndexConfig { name: "default".into(), retention: LevelBuckets::default() },
+                    IndexConfig { name: "payments".into(), retention: all },
+                ],
+            }],
+            "edge-1",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn records_go_to_their_index_under_its_buckets_and_the_routing_attribute_is_not_stored() {
+        use crate::model::{Attr, AttrValue};
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, store_dir) = (tmp.path().join("wal"), tmp.path().join("store"));
+        let tenancy = two_indexes(crate::config::UnknownIndex::Default);
+        let to = |mut r: LogRecord, index: &str| {
+            r.attributes.push(Attr { key: ATTR_INDEX.into(), value: AttrValue::Str(index.into()) });
+            r
+        };
+        write_wal(
+            &wal_dir,
+            vec![vec![
+                record(10, Severity::INFO, "plain"),
+                to(record(20, Severity::INFO, "paid"), "payments"),
+                to(record(30, Severity::ERROR, "declined"), "payments"),
+                // Routed at ingest to an index the config no longer has.
+                to(record(40, Severity::INFO, "orphan"), "retired"),
+            ]],
+        );
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let report =
+            merge_all(&wal_dir, &store_dir, &mut cat, &tenancy, &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
+        assert_eq!((report.records, report.files_written, report.index_rerouted), (4, 2, 1));
+        let dirs: Vec<String> = store::list_parquet_files(&store_dir)
+            .iter()
+            .map(|p| p.parent().unwrap().strip_prefix(&store_dir).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            dirs,
+            [
+                "tenant=acme/index=default/hour=1970-01-01T00/level=info/node=edge-1",
+                // One bucket for every level in `payments`, so info and error share a file.
+                "tenant=acme/index=payments/hour=1970-01-01T00/level=all/node=edge-1",
+            ]
+        );
+        let all = crate::scan::scan(&store_dir, &crate::scan::Query { limit: 100, ..Default::default() }).unwrap();
+        assert_eq!(all.records.len(), 4);
+        assert!(all.records.iter().all(|r| r.attributes.is_empty()), "the index is the directory, not an attribute");
+    }
+
+    #[test]
+    fn origin_is_this_node_for_local_rows_and_the_sender_for_relayed_ones() {
+        use crate::model::{Attr, AttrValue};
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, store_dir) = (tmp.path().join("wal"), tmp.path().join("store"));
+        let mut relayed = record(20, Severity::INFO, "from an edge");
+        relayed.attributes.push(Attr { key: crate::peer::ATTR_ORIGIN.into(), value: AttrValue::Str("edge-9".into()) });
+        write_wal(&wal_dir, vec![vec![record(10, Severity::INFO, "local"), relayed]]);
+        let mut cat = Catalog::open_in_memory().unwrap();
+        merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
+
+        let path = &store::list_parquet_files(&store_dir)[0];
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(path).unwrap()).unwrap();
+        let version = reader.metadata().file_metadata().key_value_metadata().unwrap().iter().find(|e| e.key == "logless.schema_version").unwrap().value.clone();
+        assert_eq!(version.as_deref(), Some("3"));
+        let mut by_body = BTreeMap::new();
+        for batch in reader.build().unwrap() {
+            let batch = batch.unwrap();
+            let origin = arrow::compute::cast(batch.column_by_name("origin").unwrap(), &arrow::datatypes::DataType::Utf8).unwrap();
+            let origin = origin.as_any().downcast_ref::<arrow::array::StringArray>().unwrap().clone();
+            let body = batch.column_by_name("body").unwrap().as_any().downcast_ref::<arrow::array::StringArray>().unwrap().clone();
+            for i in 0..batch.num_rows() {
+                by_body.insert(body.value(i).to_string(), origin.value(i).to_string());
+            }
+        }
+        assert_eq!(by_body, BTreeMap::from([("local".to_string(), "node-a".to_string()), ("from an edge".to_string(), "edge-9".to_string())]));
+    }
+
+    #[test]
     fn re_merging_after_a_crash_before_commit_does_not_duplicate() {
         let tmp = tempfile::tempdir().unwrap();
         let (wal_dir, store_dir) = (tmp.path().join("wal"), tmp.path().join("store"));
@@ -328,13 +495,13 @@ mod tests {
         let segment = wal::list_segments(&wal_dir).unwrap()[0].1.clone();
         let saved = std::fs::read(&segment).unwrap();
         let mut doomed = Catalog::open_in_memory().unwrap();
-        merge_all(&wal_dir, &store_dir, &mut doomed, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
+        merge_all(&wal_dir, &store_dir, &mut doomed, &Tenancy::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
         std::fs::write(&segment, &saved).unwrap();
 
         // Restart with a catalog that never saw the commit.
         let mut cat = Catalog::open_in_memory().unwrap();
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
 
         assert_eq!(report.segments_merged, 1);
         assert_eq!(cat.totals().unwrap().0, 50, "rows must not double");
@@ -353,7 +520,7 @@ mod tests {
         cat.commit_merge(1, uuid, &[], &[], 0).unwrap();
 
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
 
         assert_eq!(report.segments_skipped, 1);
         assert_eq!(report.segments_merged, 0);
@@ -377,7 +544,7 @@ mod tests {
             &wal_dir,
             &store_dir,
             &mut cat,
-            &LevelBuckets::default(),
+            &Tenancy::default(),
             &mut Drain::default(),
             &TypedColumnsConfig::default(),
             Some(active),
@@ -411,7 +578,7 @@ mod tests {
             &wal_dir,
             &store_dir,
             &mut cat,
-            &LevelBuckets::default(),
+            &Tenancy::default(),
             &mut Drain::default(),
             &TypedColumnsConfig::default(),
             Some(segments[0].0),
@@ -435,7 +602,7 @@ mod tests {
 
         let mut cat = Catalog::open_in_memory().unwrap();
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), Some(99), 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut Drain::default(), &TypedColumnsConfig::default(), Some(99), 0).unwrap();
         assert_eq!(report.records, 10, "segments behind the empty one still merge");
         assert!(wal::list_segments(&wal_dir).unwrap().is_empty(), "empty segments freed");
     }
@@ -463,7 +630,7 @@ mod tests {
 
         let mut cat = Catalog::open_in_memory().unwrap();
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut Drain::default(), &TypedColumnsConfig::default(), None, 0).unwrap();
 
         assert_eq!(report.truncated, 1);
         assert_eq!(report.records, 10);
@@ -511,7 +678,7 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         let mut drain = Drain::default();
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
         assert_eq!(report.dictionary_rows, Some(3));
         assert_eq!(report.dictionary_error, None);
 
@@ -539,7 +706,7 @@ mod tests {
             ]],
         );
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
         assert_eq!(report.dictionary_rows, Some(4));
         let rows = template_dict::read(&path).unwrap();
         let api = rows.iter().find(|r| r.service.as_deref() == Some("api")).unwrap();
@@ -550,12 +717,12 @@ mod tests {
 
         // A pass that merges nothing leaves an existing file alone...
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
         assert_eq!(report.dictionary_rows, None);
         // ...but restores one that went missing.
         std::fs::remove_file(&path).unwrap();
         let report =
-            merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
+            merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut drain, &TypedColumnsConfig::default(), None, 0).unwrap();
         assert_eq!(report.dictionary_rows, Some(4));
         assert_eq!(template_dict::read(&path).unwrap(), rows);
     }
@@ -574,7 +741,7 @@ mod tests {
         let mut cat = Catalog::open_in_memory().unwrap();
         let mut drain = Drain::default();
         let first = merge_all(
-            &wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0,
+            &wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut drain, &TypedColumnsConfig::default(), None, 0,
         )
         .unwrap();
 
@@ -593,7 +760,7 @@ mod tests {
         );
         let mut restored = Drain::restore(Default::default(), cat.load_templates().unwrap());
         let second = merge_all(
-            &wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut restored, &TypedColumnsConfig::default(), None, 0,
+            &wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut restored, &TypedColumnsConfig::default(), None, 0,
         )
         .unwrap();
 
@@ -620,7 +787,7 @@ mod tests {
 
         write_wal(&wal_dir, vec![vec![record(1, Severity::INFO, "first run")]]);
         assert_eq!(wal::list_segments(&wal_dir).unwrap()[0].0, 1);
-        merge_all(&wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0)
+        merge_all(&wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut drain, &TypedColumnsConfig::default(), None, 0)
             .unwrap();
         assert!(wal::list_segments(&wal_dir).unwrap().is_empty(), "wal drained");
 
@@ -629,7 +796,7 @@ mod tests {
         assert_eq!(wal::list_segments(&wal_dir).unwrap()[0].0, 1, "id reused");
 
         let second = merge_all(
-            &wal_dir, &store_dir, &mut cat, &LevelBuckets::default(), &mut drain, &TypedColumnsConfig::default(), None, 0,
+            &wal_dir, &store_dir, &mut cat, &Tenancy::default(), &mut drain, &TypedColumnsConfig::default(), None, 0,
         )
         .unwrap();
 
@@ -652,7 +819,7 @@ mod tests {
             &tmp.path().join("wal"),
             &tmp.path().join("store"),
             &mut cat,
-            &LevelBuckets::default(),
+            &Tenancy::default(),
             &mut Drain::default(),
             &TypedColumnsConfig::default(),
             None,
@@ -683,7 +850,7 @@ mod tests {
         let cfg = TypedColumnsConfig { min_rows: 10, ..Default::default() };
         let mut cat = Catalog::open_in_memory().unwrap();
         let run = |cat: &mut Catalog| {
-            merge_all(&wal_dir, &store_dir, cat, &LevelBuckets::default(), &mut Drain::default(), &cfg, None, 0)
+            merge_all(&wal_dir, &store_dir, cat, &Tenancy::default(), &mut Drain::default(), &cfg, None, 0)
                 .unwrap()
         };
         let report = run(&mut cat);

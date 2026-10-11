@@ -95,14 +95,38 @@ At-least-once with idempotency keys (UUIDv7 per event, assigned at ingest). Exac
 
 ## 2. Partitioning and retention
 
-- **Partition key: `(hour, level_class)`** — hour **first**. `level_class ∈ {debug, info, warn_plus}` — coarse buckets, not seven levels, to keep file counts sane.
-- Hour-first gives time pruning (every real query is time-bounded). Level second exists for exactly one reason: **retention becomes `rm -rf` of a directory** plus a catalog delete.
-- **Sort order inside files**: `(service, trace_id, timestamp)` where trace_id exists, else `(service, timestamp)`. This clusters templates (good for zstd + dictionary encoding) and makes "everything for trace X" a range scan. Write row-group stats; the replay scanner (and any external engine) prunes on them.
+Decided in ADR 0002 and `docs/design/multi-tenancy-and-indexing.md` (slice 1), measured in `docs/evidence/layout-v3.md`.
 
-  **Measured 2026-08-07, decided 2026-10-11 (ADR 0001, `docs/evidence/sort-layout-bench.md`, Plane 73): this sort order costs event-time pruning when `observed` and `timestamp` diverge** (replayed and clock-skewed sources, which headline #2 is made of); on a real store the median row group spans 46.5% of the time range and a one-hour window reads 47.1% of rows against 12.3% time-sorted (`docs/platform-thesis.md` section 15). The benchmark on a 3.36M-row corpus with a replay and a skewed service says the sort order is not the lever: **partition on event time and use 8k-row row groups, keep the sort order.** Event-hour partitioning reads 1 file and 0.28 MB for an issue-list hour against 9.3 files and 1.87 MB, costs +2.3% bytes and about the same file count after compaction, and trades "retention is a directory delete on ingest time" for the same delete on event time. Its price is 5-10x more files before compaction because skewed and replayed rows touch many hours per segment; that is a Plane 74 design item. Time-first sort is rejected (2-3x worse on template and service shapes). Unbounded trace lookup prunes under no layout; it needs a bloom filter or index. Not yet implemented: the text above still describes the code.
+```
+<data_dir>/store/tenant=<t>/index=<i>/hour=YYYY-MM-DDTHH/level=<bucket>/node=<writer>/<file>.parquet
+```
+
+- **Partition key: `(tenant, index, hour, level, node)`**, in that order (`partition.rs`).
+  - `tenant` is the isolation boundary and `index` the dataset inside it: retention is set per `(tenant, index)`, a read of one index is one prefix, and offboarding a tenant is a subtree delete. An install that configures neither is one tenant `default` with one index `default`.
+  - `hour` is the **event hour**: the hour of the row's `timestamp`, not of `observed`. Every real query is bounded on event time, so replayed and clock-skewed rows prune by directory (one file for an issue-list hour, where observed-hour partitioning has to open every later hour). `observed` stays a column.
+  - `level_class ∈ {debug, info, warn_plus}` by default: coarse buckets, not seven levels, to keep file counts sane. It exists for exactly one reason: **retention becomes `rm -rf` of a directory** plus a catalog delete. It sits above `node` so one delete takes every writer's files for the partition.
+  - `node` is the writer that owns the file: `[node] id`, or an id generated on first run and kept in `<data_dir>/node-id`. A writer only ever writes and compacts its own leaf, so several writers need no coordination.
+- **Identifiers** (tenant, index, node): 1 to 64 of `A-Za-z0-9._-`, not starting with a dot, unique ignoring case, and **at least one ASCII letter**. Without the letter DuckDB's hive partitioning reads `tenant=1234` as a BIGINT and a reader's string predicate matches nothing.
+- **Index routing at ingest.** A record names its index in a HEC event's `index`, the OTLP resource attribute `logless.index`, or `[[tail]] index`; Sentry items and everything else go to the tenant's default index. The name is checked against the tenant's `[[tenants.indexes]]`. An unknown one is sent to the default index or refused, by `unknown_index = "default" | "refuse"` (default `default`); HEC refuses the whole request with Splunk's code 7, other receivers do not store the record. Both are counted in `GET /admin/v1/info` (`ingest.unknown_index`). The index is a directory, never a column: the routing attribute is taken off the record when it is merged.
+- **Sort order inside files**: `(service, trace_id, timestamp, event_id)`. This clusters templates (good for zstd + dictionary encoding) and puts a trace's rows together within a service. Time-first was measured and rejected (2-3x worse on template and service filters, ADR 0002).
+- **Row groups are 8,192 rows** (`store::ROW_GROUP_ROWS`), so min/max statistics on the sorted `service` and what clusters behind it prune inside a file.
+- **`origin` column** (dictionary-encoded string): the instance that first received the row. For a row another instance relayed it is that row's `logless.origin` attribute, otherwise the node that wrote the file. Not the same as the path's `node`, which is the file's writer. Schema version 3.
 - **Timestamps are UTC-qualified in the Parquet schema** (`Timestamp(ns, "UTC")`), not naive. Written without a timezone, DuckDB and Polars read them as *local* time and every "last hour" filter silently returns the wrong rows — observed in testing, where an errors-in-the-last-hour query returned 0 instead of 17,088. The schema is the long-lived contract; this had to be right before anyone builds on it.
-- **Retention = file-level drop only.** Deletion vectors are for compliance deletes, not time expiry — never pay per-row bookkeeping for something a directory delete solves. A file straddling a boundary just lives a few extra hours.
+- **Retention = file-level drop only**, per `(tenant, index, level)`, on **event time**: a partition expires when its hour has ended and its bucket's retention has passed. A row replayed today with a timestamp older than the horizon lands in a partition that is already past it and is deleted by the next pass. A tenant, index or bucket that is on disk but not in the config is never deleted, only reported. Deletion vectors are for compliance deletes, not time expiry — never pay per-row bookkeeping for something a directory delete solves.
 - Partition-by-level does **not** fight pushdown: pushdown is served from memory (§4), and cross-partition reads on one local disk are cheap.
+
+### Write fan-out and the late spool
+
+The merger writes one file per (WAL segment, partition). Under event-time partitioning a segment that carries replayed or clock-skewed rows touches many event hours, so it writes many small files. Two things bound that:
+
+- **The late spool.** A record whose event time is already older than `storage.late_threshold` (2 h) when it is written goes to a second WAL, `wal-late/`, instead of the main one (`wal::SplitWal`). That log rolls on age (`late_roll`, 30 min) or size (`late_segment_bytes`, 64 MiB), not with the main WAL, so a replay makes one file per partition per late segment instead of one per main segment. Both logs are fsynced together (the acknowledged record count is only published with both on disk) and merged by the same code, so a late record is exactly as durable as any other; what it gives up is reaching Parquet before its segment rolls, up to `late_roll` later.
+- **Compaction** merges a writer's small files in a partition once it holds at least four. It used to skip "the hour being written", by the wall clock; under event time any partition can gain a file, so it now skips a partition whose newest file is younger than `storage.compact_quiet` (10 min). The order (write the replacement, record it, unlink the inputs) already makes a late arrival safe: it is simply not an input.
+
+`logless restore` installs whole part files and takes neither path. A backfill received from another instance is ordinary ingest: its old rows take the late spool.
+
+### Existing stores
+
+A store written before this layout (`hour=…/level=…` at the top, cut on `observed`) is refused at startup with a message naming `logless migrate-layout --config <file>`. That command, run with the agent stopped, rewrites each old file by event hour into `tenant=<own>/index=<default>/…/node=<own>/` and rebuilds the catalog's file table; it can be repeated after an interruption without doubling rows.
 
 ## 3. Templating and compression
 

@@ -105,10 +105,11 @@ pub struct LogRecord {
     /// UUIDv7 — time-ordered, assigned at ingest, never downstream. Doubles as
     /// the idempotency key for at-least-once delivery upstream.
     pub event_id: Uuid,
-    /// Event time as claimed by the source.
+    /// Event time as claimed by the source. The store is partitioned,
+    /// sorted and expired on this one.
     pub timestamp_unix_nano: u64,
     /// Time we received it. Diverges from `timestamp_unix_nano` on replay and
-    /// on sources with skewed clocks; partitioning uses this one.
+    /// on sources with skewed clocks; kept as a column so that can be seen.
     pub observed_unix_nano: u64,
     pub severity: Severity,
     pub severity_text: Option<String>,

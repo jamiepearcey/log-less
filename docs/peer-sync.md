@@ -38,7 +38,8 @@ headers count as none. The full list, with the test that covers each, is in `doc
 
 ## The handshake
 
-`GET /.well-known/logless` returns what the peer is and offers: version, instance id, wire formats, auth, size limit,
+`GET /.well-known/logless` returns what the peer is and offers: version, instance id (its node id: `[node] id`, or the one
+it generated and keeps in `<data_dir>/node-id`), wire formats, auth, size limit,
 `max_hops`, whether it serves its store over S3, and its clock (so a sender reports skew). It needs the token when the
 peer has tokens, so an unauthenticated probe learns nothing about the build. `parts` is `true` when the peer takes
 Parquet part uploads (see "Uploading Parquet parts"); where a part goes is in each presign answer, not here. `query` is in the document and is `false`: scan pushdown is not
@@ -51,7 +52,12 @@ built (see below).
 
 * the **event id**, so a retried batch is dropped by the receiver (`dedupe_window` recent ids, kept on disk; see
   "Duplicates and restarts");
-* the **observed time**, which partitions the store, so a backlog lands in the hour it happened;
+* the **event time and the observed time**, both as the sender had them. The store is partitioned on event time
+  (`timestamp`), so a backlog lands in the hour it happened whenever it is sent; rows more than `storage.late_threshold`
+  (2 h) old on arrival go through the receiver's late spool (`docs/architecture.md` section 2);
+* the **index**: a record the sender filed under an index other than its default carries `logless.index`, and the
+  receiver files it under its own index of that name (or, if it has none, its default index or nowhere, by its
+  `unknown_index`; counted in `GET /admin/v1/info`);
 * the **template id** the sender already mined.
 
 A plain OTLP collector remains a valid destination through the OTLP receiver; this is the log-less-to-log-less path.
@@ -145,9 +151,10 @@ counts it and a warning is logged: this process still recognises a resend, a res
 
 ## Loops and provenance
 
-Every record carries `logless.origin` (the first sender's instance id, kept by every later hop) and `logless.hops`.
+Every record carries `logless.origin` (the first sender's node id, kept by every later hop) and `logless.hops`.
 A receiver refuses a record whose origin is itself or whose hops reached 8, so a ring stops after one lap. The
-attributes stay in the store: "which node produced this line" is answerable centrally.
+attributes stay in the store, and the origin is also the `origin` column of every row (for a row an instance received
+itself, its own node id), so "which node produced this line" is one column centrally, whoever wrote the file.
 
 Provenance is strict. A record is refused as a loop (and counted in `loops`) when `logless.hops` is not a whole number
 from 0 up (an integer, or a string of digits only: `"lots"`, `"-1"`, `"+1"`, `-5`, `1.0` and `true` are all refused),
@@ -343,7 +350,8 @@ URL, streams the file to it and commits. Progress is `parts` in `GET /admin/v1/s
 On central's admin API (bearer token as the rest of `/admin/v1`):
 
 * `GET /admin/v1/parts?node=&tier=warm|cold&from_ms=&to_ms=&limit=` lists catalogued parts, oldest data first
-  (`limit` 1 to 1000, default 100; a part matches a time range when its observed-time span overlaps it).
+  (`limit` 1 to 1000, default 100; a part matches a time range when its observed-time span overlaps it: the part
+  catalog still records observed time, unlike the store's own file table, which records both).
   `tier=hot` is a 400 that says why. Each part carries `node, name, size, rows, min_unix_nano, max_unix_nano,
   origin, committed_ms, tier, tier_ms`.
 * `POST /admin/v1/parts/sweep {"dry_run": false}` expires catalogued parts whose newest data is older than their

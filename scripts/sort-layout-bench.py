@@ -26,6 +26,14 @@ Usage:
         [--replay-frac 0.12] [--layouts L0,L1,...] [--json result.json]
     scripts/sort-layout-bench.py --quick        # 150k rows, smoke test
 
+The same corpus and queries can also measure a tree some other writer made
+(the store's own arrow-rs writer, via the `layout-bench` binary):
+    scripts/sort-layout-bench.py --hours 12 --export-corpus corpus.parquet --layouts none
+    layout-bench --corpus corpus.parquet --out DIR --mode v3
+    scripts/sort-layout-bench.py --hours 12 --layouts none --external v3=DIR/store:event
+`--external NAME=DIR:event|observed` says which clock DIR's `hour=` is cut on.
+See docs/evidence/layout-v3.md.
+
 Fidelity caveats are in docs/evidence/sort-layout-bench.md: files are written
 with DuckDB's Parquet writer (zstd 3, dictionary) rather than the store's
 arrow-rs writer, so absolute sizes differ; layout-versus-layout ratios are the
@@ -305,8 +313,8 @@ def load_metadata(con, out):
     rgs = {}
     q = f"""
       SELECT file_name, row_group_id, any_value(row_group_num_rows),
-        min(epoch_ns(TRY_CAST(stats_min_value AS TIMESTAMP_NS))) FILTER (WHERE path_in_schema='timestamp'),
-        max(epoch_ns(TRY_CAST(stats_max_value AS TIMESTAMP_NS))) FILTER (WHERE path_in_schema='timestamp'),
+        min(coalesce(epoch_ns(TRY_CAST(stats_min_value AS TIMESTAMP_NS)), epoch_ns(TRY_CAST(stats_min_value AS TIMESTAMPTZ)))) FILTER (WHERE path_in_schema='timestamp'),
+        max(coalesce(epoch_ns(TRY_CAST(stats_max_value AS TIMESTAMP_NS)), epoch_ns(TRY_CAST(stats_max_value AS TIMESTAMPTZ)))) FILTER (WHERE path_in_schema='timestamp'),
         min(stats_min_value) FILTER (WHERE path_in_schema='service'),
         max(stats_max_value) FILTER (WHERE path_in_schema='service'),
         min(hex(TRY_CAST(stats_min_value AS BLOB))) FILTER (WHERE path_in_schema='trace_id'),
@@ -318,6 +326,8 @@ def load_metadata(con, out):
     for r in con.execute(q).fetchall():
         rgs[(r[0], r[1])] = dict(file=r[0], rows=r[2], tmin=r[3], tmax=r[4], smin=r[5], smax=r[6],
                                  trmin=r[7], trmax=r[8], tpmin=r[9], tpmax=r[10], cols={})
+    if rgs and all(rg["tmin"] is None for rg in rgs.values()):
+        raise SystemExit(f"no timestamp statistics could be read from {out}: every time window would prune everything")
     for f, g, c, sz, bf in con.execute(
             f"SELECT file_name, row_group_id, path_in_schema, total_compressed_size, bloom_filter_length "
             f"FROM parquet_metadata('{glob}')").fetchall():
@@ -386,7 +396,9 @@ class Q:
     def sql_where(self, with_level=False):
         w = []
         if self.tlo is not None:
-            w.append(f"timestamp >= TIMESTAMP_NS '{iso(self.tlo)}' AND timestamp < TIMESTAMP_NS '{iso(self.thi)}'")
+            # The store writes `timestamp` as TIMESTAMP WITH TIME ZONE (UTC); DuckDB's own files here are TIMESTAMP_NS.
+            lit = (lambda ns: f"TIMESTAMPTZ '{iso(ns)}+00'") if TS_WITH_ZONE else (lambda ns: f"TIMESTAMP_NS '{iso(ns)}'")
+            w.append(f"timestamp >= {lit(self.tlo)} AND timestamp < {lit(self.thi)}")
         if self.service: w.append(f"service = '{self.service}'")
         if self.trace: w.append(f"hex(trace_id) = '{self.trace}'")
         if self.template is not None: w.append(f"template_id = {self.template}")
@@ -430,6 +442,7 @@ class Q:
         return True
 
 
+TS_WITH_ZONE = False  # set while measuring a tree the store's writer made
 HTTP_MAX_REQUESTS = 2500  # est. GETs; beyond this the loopback port budget runs out
 ALL = DATA_COLS
 
@@ -579,6 +592,7 @@ def run_query_http(root, layout_name, files, q, stats):
 def _run_query_http(port, layout_name, files, q, stats):
     con = duckdb.connect()
     con.execute("LOAD httpfs")
+    con.execute("SET TimeZone='UTC'")
     con.execute("SET enable_external_file_cache=false")
     con.execute("SET threads=4")
     urls = [f"http://127.0.0.1:{port}/{layout_name}/{quote(f, safe='/=')}" for f in files]
@@ -601,6 +615,103 @@ def _run_query_http(port, layout_name, files, q, stats):
     return row[0]
 
 
+def measure(con, L, out, http_root, http_name, queries, truth, stats, args, wall, fan, nseg):
+    """Counts and bytes per query shape for the tree at `out`, laid out as `L` says."""
+    files, rgs = load_metadata(con, out)
+    rel = lambda f: os.path.relpath(f, out)
+    nfiles = len(files)
+    size = sum(f["size"] for f in files.values())
+    rows_per_file = sorted(f["rows"] for f in files.values())
+    lay = dict(desc=L.desc, write_wall_s=round(wall, 2) if wall is not None else None, files=nfiles, bytes=size,
+               row_groups=len(rgs), rows=sum(rows_per_file),
+               partitions=len({os.path.dirname(rel(f)) for f in files}),
+               precompaction_files=fan, segments=nseg,
+               median_rows_per_file=rows_per_file[nfiles // 2],
+               footer_bytes_total=sum(f["footer"] for f in files.values()))
+    print(f"  files {nfiles}  row groups {len(rgs)}  bytes {size:,}  "
+          f"pre-compaction files {fan} from {nseg} segments")
+    by_file = defaultdict(list)
+    for (f, g), rg in sorted(rgs.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+        rg["id"] = g
+        by_file[f].append(rg)
+    hv_of = {f: hive(rel(f)) for f in files}
+    per_kind = defaultdict(list)
+    for i, q in enumerate(queries):
+        cols = q.pred_cols() | set(q.proj)
+        opened = [f for f in files if q.partition_ok(L, hv_of[f])]
+        surv = [rg for f in opened for rg in by_file[f] if q.rg_ok(rg)]
+        total_rgs = sum(len(by_file[f]) for f in opened)
+        bytes_model = sum(files[f]["footer"] + 8 for f in opened) + \
+            sum(sum(rg["cols"].get(c, 0) for c in cols) for rg in surv)
+        t = time.time()
+        if not args.no_http and 3 * len(opened) + 4 * len(surv) <= HTTP_MAX_REQUESTS:
+            try:
+                got = run_query_http(http_root, http_name, [rel(f) for f in opened], q, stats)
+                s = stats.snap()
+            except duckdb.Error as e:
+                print(f"  (http failed for {q.label}: {str(e)[:60]})")
+                got, s = None, dict(bytes=None, gets=None, files=None)
+            if got is not None and got != truth[i]:
+                print(f"  !! rows mismatch {q.kind} {q.label}: got {got} truth {truth[i]}")
+        else:  # loopback port budget: ~3 connections per file
+            got, s = None, dict(bytes=None, gets=None, files=None)
+        if got is None and opened:
+            # No HTTP run: still check that the files partition pruning kept hold every matching row.
+            lst = ", ".join(f"'{f}'" for f in opened)
+            (got,) = con.execute(f"SELECT count(*) FROM read_parquet([{lst}], union_by_name=true) WHERE {q.sql_where()}").fetchone()
+            if got != truth[i]:
+                print(f"  !! rows mismatch {q.kind} {q.label}: got {got} truth {truth[i]}")
+        qwall = time.time() - t
+        # Oracle: row groups that really hold a matching row. Any index
+        # (bloom filter, page index, inverted index) can do no better, and
+        # min/max pruning must never drop one of them.
+        ideal = oracle_rgs(con, opened, q, files, by_file)
+        surv_ids = {(rg["file"], rg["id"]) for rg in surv}
+        if not ideal <= surv_ids:
+            print(f"  !! min/max pruning dropped {len(ideal - surv_ids)} row groups holding matches: {q.label}")
+        bytes_ideal = sum(files[f]["footer"] + 8 for f in {f for f, _ in ideal}) + \
+            sum(sum(rgs[(f, g)]["cols"].get(c, 0) for c in cols) for f, g in ideal)
+        per_kind[q.kind].append(dict(
+            kind=q.kind, label=q.label, files_opened=len(opened),
+            files_with_data=len({rg["file"] for rg in surv}), rgs_in_opened=total_rgs,
+            rgs_read=len(surv), bytes_model=bytes_model, bytes_http=s["bytes"],
+            http_gets=s["gets"], http_files=s["files"], rows=got, truth=truth[i], rgs_ideal=len(ideal), bytes_ideal=bytes_ideal,
+            wall_s=round(qwall, 3)))
+    lay["queries"] = {}
+    for kind, recs in sorted(per_kind.items()):
+        n = len(recs)
+        def m(k):
+            v = [r[k] for r in recs if r[k] is not None]
+            return sum(v) / len(v) if v else float("nan")
+        lay["queries"][kind] = dict(
+            n=n, files_opened=m("files_opened"), files_with_data=m("files_with_data"),
+            rgs_in_opened=m("rgs_in_opened"), rgs_read=m("rgs_read"),
+            bytes_model=m("bytes_model"), bytes_http=m("bytes_http"),
+            rgs_ideal=m("rgs_ideal"), bytes_ideal=m("bytes_ideal"), http_gets=m("http_gets"),
+            rows=m("rows"), wall_s=m("wall_s"), detail=recs)
+        print(f"  {kind:4s} n={n:2d} files {m('files_opened'):7.1f} (data {m('files_with_data'):6.1f}) "
+              f"rg {m('rgs_read'):7.1f}/{m('rgs_in_opened'):7.1f} (ideal {m('rgs_ideal'):6.1f}) model {m('bytes_model')/1e6:8.2f}MB "
+              f"ideal {m('bytes_ideal')/1e6:7.2f}MB http {m('bytes_http')/1e6:8.2f}MB gets {m('http_gets'):6.1f} rows {m('rows'):9.1f}")
+    # recall of a reader that assumes observed ~= timestamp (not the safe rule)
+    if "evhour" not in L.parts and L.name not in EVENT_HOUR_LAYOUTS:
+        rec = []
+        for i, q in enumerate(queries):
+            if q.tlo is None or truth[i] == 0:
+                continue
+            nf = [f for f in files if q.naive_partition_ok(hv_of[f])]
+            if not nf:
+                rec.append(0.0)
+                continue
+            lst = ", ".join(f"'{f}'" for f in nf)
+            (c,) = con.execute(f"SELECT count(*) FROM read_parquet([{lst}]) WHERE {q.sql_where()}").fetchone()
+            rec.append(c / truth[i])
+        lay["naive_recall_mean"] = sum(rec) / len(rec)
+        lay["naive_recall_min"] = min(rec)
+        print(f"  naive observed~=timestamp pruning recall: mean {lay['naive_recall_mean']:.3f} "
+              f"min {lay['naive_recall_min']:.3f}")
+    return lay
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.expanduser("~/tmp/logless-sort-bench"))
@@ -612,6 +723,10 @@ def main():
     ap.add_argument("--json", default="")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--keep", action="store_true", help="keep the written layouts")
+    ap.add_argument("--export-corpus", default="", help="write the corpus in arrival order to this Parquet file")
+    ap.add_argument("--external", action="append", default=[], metavar="NAME=DIR:event|observed",
+                    help="also measure an existing hive tree written elsewhere; says which clock its hour= is cut on")
+    ap.add_argument("--no-http", action="store_true", help="skip the DuckDB-over-HTTP byte count")
     args = ap.parse_args()
     if args.quick:
         args.rows, args.seg_rows = 150_000, 2_000
@@ -622,11 +737,23 @@ def main():
     if free < 15:
         raise SystemExit("under 15 GiB free; stopping")
     layouts = [l for l in LAYOUTS if not args.layouts or l.name in args.layouts.split(",")]
+    if args.external or args.export_corpus:
+        args.keep = True  # --out is only removed when this run wrote every tree in it
 
     con = duckdb.connect()
     con.execute("SET threads=4")
+    con.execute("SET TimeZone='UTC'")
     t = time.time()
     build_corpus(con, args.rows, args.replay_frac, args.seg_rows)
+    if args.export_corpus:
+        # One row per record in arrival order, with the WAL segment it falls in: what `layout-bench` replays.
+        con.execute(f"""
+          COPY (SELECT event_id, epoch_ns(timestamp)::BIGINT AS ts, epoch_ns(observed)::BIGINT AS obs, severity, body, service,
+                       trace_id, span_id, template_id, json_extract_string(attributes, '$.host') AS host,
+                       json_extract_string(attributes, '$.region') AS region, seg::BIGINT AS seg
+                FROM logs ORDER BY observed, event_id)
+          TO '{args.export_corpus}' (FORMAT parquet, COMPRESSION zstd)""")
+        print(f"corpus exported to {args.export_corpus} ({os.path.getsize(args.export_corpus):,} bytes)")
     (total,) = con.execute("SELECT count(*) FROM logs").fetchone()
     print(f"corpus: {total} rows built in {time.time() - t:.1f}s")
     corpus = dict(rows=total)
@@ -655,96 +782,25 @@ def main():
         for L in layouts:
             print(f"\n=== {L.name}: {L.desc}")
             out, wall = write_layout(con, L, args.out)
-            files, rgs = load_metadata(con, out)
-            rel = lambda f: os.path.relpath(f, out)
-            nfiles = len(files)
-            size = sum(f["size"] for f in files.values())
             fan, nseg = segment_fanout(con, L)
-            rows_per_file = sorted(f["rows"] for f in files.values())
-            lay = dict(desc=L.desc, write_wall_s=round(wall, 2), files=nfiles, bytes=size,
-                       row_groups=len(rgs), rows=sum(rows_per_file),
-                       partitions=len({os.path.dirname(rel(f)) for f in files}),
-                       precompaction_files=fan, segments=nseg,
-                       median_rows_per_file=rows_per_file[nfiles // 2],
-                       footer_bytes_total=sum(f["footer"] for f in files.values()))
-            print(f"  files {nfiles}  row groups {len(rgs)}  bytes {size:,}  write {wall:.1f}s  "
-                  f"pre-compaction files {fan} from {nseg} segments")
-            by_file = defaultdict(list)
-            for (f, g), rg in sorted(rgs.items(), key=lambda kv: (kv[0][0], kv[0][1])):
-                rg["id"] = g
-                by_file[f].append(rg)
-            hv_of = {f: hive(rel(f)) for f in files}
-            per_kind = defaultdict(list)
-            for i, q in enumerate(queries):
-                cols = q.pred_cols() | set(q.proj)
-                opened = [f for f in files if q.partition_ok(L, hv_of[f])]
-                surv = [rg for f in opened for rg in by_file[f] if q.rg_ok(rg)]
-                total_rgs = sum(len(by_file[f]) for f in opened)
-                bytes_model = sum(files[f]["footer"] + 8 for f in opened) + \
-                    sum(sum(rg["cols"].get(c, 0) for c in cols) for rg in surv)
-                t = time.time()
-                if 3 * len(opened) + 4 * len(surv) <= HTTP_MAX_REQUESTS:
-                    try:
-                        got = run_query_http(args.out, L.name, [rel(f) for f in opened], q, stats)
-                        s = stats.snap()
-                    except duckdb.Error as e:
-                        print(f"  (http failed for {q.label}: {str(e)[:60]})")
-                        got, s = None, dict(bytes=None, gets=None, files=None)
-                    if got is not None and got != truth[i]:
-                        print(f"  !! rows mismatch {q.kind} {q.label}: got {got} truth {truth[i]}")
-                else:  # loopback port budget: ~3 connections per file
-                    got, s = None, dict(bytes=None, gets=None, files=None)
-                qwall = time.time() - t
-                # Oracle: row groups that really hold a matching row. Any index
-                # (bloom filter, page index, inverted index) can do no better, and
-                # min/max pruning must never drop one of them.
-                ideal = oracle_rgs(con, opened, q, files, by_file)
-                surv_ids = {(rg["file"], rg["id"]) for rg in surv}
-                if not ideal <= surv_ids:
-                    print(f"  !! min/max pruning dropped {len(ideal - surv_ids)} row groups holding matches: {q.label}")
-                bytes_ideal = sum(files[f]["footer"] + 8 for f in {f for f, _ in ideal}) + \
-                    sum(sum(rgs[(f, g)]["cols"].get(c, 0) for c in cols) for f, g in ideal)
-                per_kind[q.kind].append(dict(
-                    kind=q.kind, label=q.label, files_opened=len(opened),
-                    files_with_data=len({rg["file"] for rg in surv}), rgs_in_opened=total_rgs,
-                    rgs_read=len(surv), bytes_model=bytes_model, bytes_http=s["bytes"],
-                    http_gets=s["gets"], http_files=s["files"], rows=got, truth=truth[i], rgs_ideal=len(ideal), bytes_ideal=bytes_ideal,
-                    wall_s=round(qwall, 3)))
-            lay["queries"] = {}
-            for kind, recs in sorted(per_kind.items()):
-                n = len(recs)
-                def m(k):
-                    v = [r[k] for r in recs if r[k] is not None]
-                    return sum(v) / len(v) if v else float("nan")
-                lay["queries"][kind] = dict(
-                    n=n, files_opened=m("files_opened"), files_with_data=m("files_with_data"),
-                    rgs_in_opened=m("rgs_in_opened"), rgs_read=m("rgs_read"),
-                    bytes_model=m("bytes_model"), bytes_http=m("bytes_http"),
-                    rgs_ideal=m("rgs_ideal"), bytes_ideal=m("bytes_ideal"), http_gets=m("http_gets"),
-                    rows=m("rows"), wall_s=m("wall_s"), detail=recs)
-                print(f"  {kind:4s} n={n:2d} files {m('files_opened'):7.1f} (data {m('files_with_data'):6.1f}) "
-                      f"rg {m('rgs_read'):7.1f}/{m('rgs_in_opened'):7.1f} (ideal {m('rgs_ideal'):6.1f}) model {m('bytes_model')/1e6:8.2f}MB "
-                      f"ideal {m('bytes_ideal')/1e6:7.2f}MB http {m('bytes_http')/1e6:8.2f}MB gets {m('http_gets'):6.1f} rows {m('rows'):9.1f}")
-            # recall of a reader that assumes observed ~= timestamp (not the safe rule)
-            if "evhour" not in L.parts and L.name not in EVENT_HOUR_LAYOUTS:
-                rec = []
-                for i, q in enumerate(queries):
-                    if q.tlo is None or truth[i] == 0:
-                        continue
-                    nf = [f for f in files if q.naive_partition_ok(hv_of[f])]
-                    if not nf:
-                        rec.append(0.0)
-                        continue
-                    lst = ", ".join(f"'{f}'" for f in nf)
-                    (c,) = con.execute(f"SELECT count(*) FROM read_parquet([{lst}]) WHERE {q.sql_where()}").fetchone()
-                    rec.append(c / truth[i])
-                lay["naive_recall_mean"] = sum(rec) / len(rec)
-                lay["naive_recall_min"] = min(rec)
-                print(f"  naive observed~=timestamp pruning recall: mean {lay['naive_recall_mean']:.3f} "
-                      f"min {lay['naive_recall_min']:.3f}")
+            lay = measure(con, L, out, args.out, L.name, queries, truth, stats, args, wall, fan, nseg)
             results["layouts"][L.name] = lay
             if not args.keep:
                 shutil.rmtree(out)
+        global TS_WITH_ZONE
+        TS_WITH_ZONE = bool(args.external)
+        for spec in args.external:
+            name, rest = spec.split("=", 1)
+            out, clock = rest.rsplit(":", 1)
+            out = os.path.abspath(os.path.expanduser(out))
+            if clock not in ("event", "observed"):
+                raise SystemExit("--external NAME=DIR:event|observed")
+            L = Layout(name, f"external tree {out}, hour= cut on {clock} time", ["hour", "level"], BASE_ORDER)
+            if clock == "event":
+                EVENT_HOUR_LAYOUTS.add(name)
+            print(f"\n=== {L.name}: {L.desc}")
+            results["layouts"][name] = measure(con, L, out, os.path.dirname(out), os.path.basename(out), queries, truth,
+                                               stats, args, None, None, None)
     finally:
         pass
     if args.json:

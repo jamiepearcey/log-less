@@ -20,9 +20,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, FileEntry};
 use crate::model::LogRecord;
-use crate::partition::{self, PartitionKey};
+use crate::partition::PartitionKey;
 use crate::schema;
 use crate::store::{self, StoreError};
 
@@ -52,6 +52,9 @@ pub struct CompactConfig {
     pub keep_above_bytes: u64,
     /// Partitions compacted per pass, so one maintenance tick stays short.
     pub max_partitions: usize,
+    /// A partition whose newest file was written less than this long ago is
+    /// left for a later pass (`storage.compact_quiet`).
+    pub quiet: std::time::Duration,
 }
 
 impl Default for CompactConfig {
@@ -62,6 +65,7 @@ impl Default for CompactConfig {
             target_bytes: 128 * 1024 * 1024,
             keep_above_bytes: 32 * 1024 * 1024,
             max_partitions: 4,
+            quiet: crate::config::default_compact_quiet(),
         }
     }
 }
@@ -89,21 +93,30 @@ impl CompactReport {
     }
 }
 
-/// Compacts the store, skipping the partition currently being written to.
+/// Compacts the store, skipping partitions that are still being written to.
 ///
-/// `active_hour` is the epoch hour the merger may still be appending files for;
-/// compacting it would race the writer for no benefit, since it is about to
-/// gain more files anyway.
+/// Partitions are cut on event time, so there is no "current hour" that alone
+/// receives files: a replay or a late segment can add one to any partition.
+/// What says a partition has settled is that nothing was written to it
+/// lately, so one whose newest file is younger than `config.quiet` at
+/// `now_unix_secs` is left for a later pass. Compacting it sooner is safe (the
+/// replacement is written and recorded before its inputs are unlinked, and a
+/// file that lands meanwhile is simply not an input) but wasted: the next
+/// file would have it rewritten again. `None` applies no such rule, for when
+/// no writer is running (`logless compact`, the last pass of a shutdown).
+///
+/// A partition here is one writer's leaf (`…/level=<bucket>/node=<writer>`):
+/// files of two writers are never merged into one.
 pub fn compact(
     store_dir: &Path,
     catalog: &mut Catalog,
     config: &CompactConfig,
-    active_hour: Option<u64>,
+    now_unix_secs: Option<u64>,
 ) -> Result<CompactReport, CompactError> {
     let mut report = CompactReport::default();
     let mut by_partition: HashMap<PartitionKey, Vec<PathBuf>> = HashMap::new();
     for path in store::list_parquet_files(store_dir) {
-        if let Some(key) = partition_of(&path) {
+        if let Some(key) = crate::partition::key_of_path(&path) {
             by_partition.entry(key).or_default().push(path);
         }
     }
@@ -111,14 +124,20 @@ pub fn compact(
     let mut partitions: Vec<_> = by_partition.into_iter().collect();
     // Oldest first: a partition that will not grow again is the one worth
     // rewriting, and doing them in a stable order makes a pass reproducible.
-    partitions.sort_by(|a, b| a.0.epoch_hour.cmp(&b.0.epoch_hour).then(a.0.bucket.cmp(&b.0.bucket)));
+    partitions.sort_by(|a, b| a.0.epoch_hour.cmp(&b.0.epoch_hour).then_with(|| a.0.cmp(&b.0)));
 
     for (key, mut files) in partitions {
         if report.partitions_compacted as usize >= config.max_partitions {
             break;
         }
-        if active_hour == Some(key.epoch_hour) {
+        if files.len() < config.min_files {
             continue;
+        }
+        if let Some(now) = now_unix_secs {
+            let newest = files.iter().filter_map(|p| written_unix_secs(p)).max().unwrap_or(0);
+            if now.saturating_sub(newest) < config.quiet.as_secs() {
+                continue;
+            }
         }
         files.sort();
         let candidates: Vec<PathBuf> = files
@@ -174,7 +193,8 @@ pub fn compact(
 
         // Recorded before the inputs are removed. A crash here leaves both, and
         // duplicate rows are recoverable; a gap is not.
-        catalog.record_compaction(&out_path, &stats, &consumed)?;
+        let bytes_after = stats.bytes;
+        catalog.record_compaction(&FileEntry { path: out_path, key, stats }, &consumed)?;
 
         for path in &consumed {
             let _ = std::fs::remove_file(path);
@@ -185,27 +205,19 @@ pub fn compact(
         report.files_written += 1;
         report.rows += rows;
         report.bytes_before += bytes_before;
-        report.bytes_after += stats.bytes;
+        report.bytes_after += bytes_after;
     }
 
     Ok(report)
 }
 
-fn partition_of(path: &Path) -> Option<PartitionKey> {
-    let mut hour = None;
-    let mut bucket = None;
-    for component in path.components() {
-        let text = component.as_os_str().to_string_lossy();
-        if let Some(value) = text.strip_prefix("hour=") {
-            hour = partition::parse_hour(value);
-        } else if let Some(value) = text.strip_prefix("level=") {
-            bucket = Some(value.to_string());
-        }
-    }
-    Some(PartitionKey { epoch_hour: hour?, bucket: bucket? })
+/// When a file was last written, from its modification time.
+fn written_unix_secs(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(modified.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs())
 }
 
-fn read_all(path: &Path) -> Result<Vec<LogRecord>, StoreError> {
+pub(crate) fn read_all(path: &Path) -> Result<Vec<LogRecord>, StoreError> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let file = std::fs::File::open(path)
         .map_err(|source| StoreError::Io { path: path.to_path_buf(), source })?;
@@ -231,7 +243,7 @@ mod tests {
     const HOUR_NS: u64 = 3_600 * 1_000_000_000;
 
     fn write_file(store: &Path, hour: u64, bucket: &str, segment: u64, count: usize) -> PathBuf {
-        let key = PartitionKey { epoch_hour: hour, bucket: bucket.to_string() };
+        let key = PartitionKey::at(hour, bucket);
         let dir = key.dir(store);
         std::fs::create_dir_all(&dir).unwrap();
         let records: Vec<LogRecord> = (0..count)
@@ -283,7 +295,7 @@ mod tests {
         // Four files, each too small (60 rows) for a merge to have promoted
         // anything; together they clear `min_rows`.
         for segment in 1..=4u64 {
-            let key = PartitionKey { epoch_hour: 10, bucket: "info".into() };
+            let key = PartitionKey::at(10, "info");
             let records: Vec<LogRecord> = (0..60u64)
                 .map(|i| {
                     let ts = 10 * HOUR_NS + segment * 1000 + i;
@@ -354,16 +366,42 @@ mod tests {
     }
 
     #[test]
-    fn the_partition_being_written_to_is_skipped() {
-        // Compacting the hour the merger is still appending to races a writer
-        // for no benefit — it is about to gain more files anyway.
+    fn a_partition_written_to_lately_is_left_until_it_has_been_quiet() {
+        // Any partition can still gain a file (a replay, a late segment), so
+        // what is skipped is a recently written one, whatever its hour.
         let tmp = tempfile::tempdir().unwrap();
         let mut catalog = Catalog::open_in_memory().unwrap();
         for segment in 1..=8 {
             write_file(tmp.path(), 10, "warn_plus", segment, 10);
         }
-        let report = compact(tmp.path(), &mut catalog, &CompactConfig::default(), Some(10)).unwrap();
-        assert_eq!(report.partitions_compacted, 0);
+        let config = CompactConfig { quiet: std::time::Duration::from_secs(600), ..Default::default() };
+        // The moment the newest file was written, so the test does not depend on which second it runs in.
+        let now = store::list_parquet_files(tmp.path()).iter().filter_map(|p| written_unix_secs(p)).max().unwrap();
+        let report = compact(tmp.path(), &mut catalog, &config, Some(now)).unwrap();
+        assert_eq!(report.partitions_compacted, 0, "written a moment ago");
+        let report = compact(tmp.path(), &mut catalog, &config, Some(now + 599)).unwrap();
+        assert_eq!(report.partitions_compacted, 0, "still inside the quiet period");
+        // An old event hour is no reason to compact, and the current hour no reason not to.
+        let report = compact(tmp.path(), &mut catalog, &config, Some(now + 600)).unwrap();
+        assert_eq!((report.partitions_compacted, report.files_replaced), (1, 8));
+    }
+
+    #[test]
+    fn files_of_two_writers_in_one_partition_are_not_merged_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::open_in_memory().unwrap();
+        for segment in 1..=4 {
+            let own = write_file(tmp.path(), 10, "info", segment, 10);
+            // The same partition, another writer's leaf.
+            let other = PartitionKey::new("default", "default", 10, "info", "node-b").dir(tmp.path());
+            std::fs::create_dir_all(&other).unwrap();
+            std::fs::copy(&own, other.join(own.file_name().unwrap())).unwrap();
+        }
+        let report = compact(tmp.path(), &mut catalog, &CompactConfig::default(), None).unwrap();
+        assert_eq!((report.partitions_compacted, report.files_written, report.rows), (2, 2, 80));
+        let files = catalog.list_files().unwrap();
+        assert_eq!(files.iter().map(|f| f.key.node.as_str()).collect::<Vec<_>>(), ["node-a", "node-b"]);
+        assert!(files.iter().all(|f| f.stats.rows == 40));
     }
 
     #[test]
@@ -381,7 +419,7 @@ mod tests {
         // Retention still works on the result: the level directories survive.
         let dirs: Vec<String> = store::list_parquet_files(tmp.path())
             .iter()
-            .map(|p| p.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned())
+            .map(|p| p.parent().unwrap().parent().unwrap().file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(dirs.contains(&"level=debug".to_string()));
         assert!(dirs.contains(&"level=warn_plus".to_string()));

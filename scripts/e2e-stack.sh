@@ -193,6 +193,7 @@ PEER_TOKEN="$(rand 24)"; CENTRAL_TOKEN="$(rand 24)"   # PEER_TOKEN is the edge n
 NODE3="edge-3"; PEER_TOKEN3="$(rand 24)"                # the second edge (upload timer), see "edge lifecycle" below
 mkdir -p "$R/central"; : > "$R/central/empty.log"
 render_config "$R/central/data" "
+node|id|\"central-1\"
 peer|enabled|true
 peer|addr|\"127.0.0.1:$PEER_PORT\"
 peer|nodes|[{ id = \"$NODE\", token = \"$PEER_TOKEN\" }, { id = \"$NODE3\", token = \"$PEER_TOKEN3\" }]
@@ -202,7 +203,10 @@ peer.parts|cold_retention_secs|2$PARTS_CONFIG
 admin|enabled|true
 admin|addr|\"127.0.0.1:$CENTRAL_ADMIN\"
 admin|token|\"$CENTRAL_TOKEN\"
-" "" > "$R/central/config.toml"
+" "
+[[tenants.indexes]]
+name = \"audit\"
+" > "$R/central/config.toml"
 start_central() { # appends to the log, so a restart keeps the first run's lines
   "$LOGLESS_BIN" run --config "$R/central/config.toml" --tail "$R/central/empty.log" >> "$R/central/agent.log" 2>&1 &
   CENTRAL_PID=$!; PIDS="$PIDS $CENTRAL_PID"
@@ -216,6 +220,8 @@ OTLP_PORT=$(free_port); HEC_PORT=$(free_port); SENTRY_PORT=$(free_port); EDGE_AD
 HEC_TOKEN="$(rand 16)"; EDGE_TOKEN="$(rand 24)"
 mkdir -p "$R/edge"; : > "$R/edge/empty.log"
 render_config "$R/edge/data" "
+node|id|\"$NODE\"
+tenants|unknown_index|\"refuse\"
 storage|wal_segment_bytes|131072
 otlp|enabled|true
 otlp|addr|\"127.0.0.1:$OTLP_PORT\"
@@ -232,6 +238,9 @@ admin|enabled|true
 admin|addr|\"127.0.0.1:$EDGE_ADMIN\"
 admin|token|\"$EDGE_TOKEN\"
 " "
+[[tenants.indexes]]
+name = \"audit\"
+
 [[destinations]]
 type = \"logless\"
 url = \"http://127.0.0.1:$PEER_PORT\"
@@ -285,6 +294,29 @@ for f in "$R"/payloads/hec-*.txt; do
 done
 check "hec batches answered 200" "$(eq $send_fail 0)" "$N_HEC events over /services/collector/event"
 
+# Index routing. The edge has a second index, audit, and refuses an index it does not have. 20 HEC events name audit in
+# the event's `index`, 10 OTLP records in the resource attribute logless.index; one HEC event and 5 OTLP records name an
+# index that does not exist. Their service names are not e2e-otlp or e2e-hec, so the counts above are untouched.
+N_AUDIT_HEC=20; N_AUDIT_OTLP=10; N_BAD_OTLP=5
+python3 -c '
+import json, sys, time
+n_hec, n_otlp, n_bad, out = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+open(f"{out}/audit-hec.txt", "w").write("".join(json.dumps({"time": time.time(), "sourcetype": "e2e-audit-hec", "index": "audit", "event": f"audit hec seq={i}"}) for i in range(n_hec)))
+def otlp(index, n, service):
+    records = [{"timeUnixNano": str(time.time_ns() + i), "severityNumber": 9, "severityText": "INFO", "body": {"stringValue": f"audit otlp seq={i}"}} for i in range(n)]
+    attrs = [{"key": "service.name", "value": {"stringValue": service}}, {"key": "logless.index", "value": {"stringValue": index}}]
+    return json.dumps({"resourceLogs": [{"resource": {"attributes": attrs}, "scopeLogs": [{"logRecords": records}]}]})
+open(f"{out}/audit-otlp.json", "w").write(otlp("audit", n_otlp, "e2e-audit-otlp"))
+open(f"{out}/bad-otlp.json", "w").write(otlp("nope", n_bad, "e2e-bad-index"))
+' "$N_AUDIT_HEC" "$N_AUDIT_OTLP" "$N_BAD_OTLP" "$R/payloads"
+hec_post() { curl -s -w '\n%{http_code}' --max-time 15 -H "Authorization: Splunk $HEC_TOKEN" --data-binary "$1" "http://127.0.0.1:$HEC_PORT/services/collector/event"; }
+audit_hec=$(hec_post "@$R/payloads/audit-hec.txt" | tail -1)
+bad_hec=$(hec_post '{"event":"wrong index","sourcetype":"e2e-bad-index","index":"nope"}' | tr '\n' ' ')
+audit_otlp=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -H 'Content-Type: application/json' --data-binary "@$R/payloads/audit-otlp.json" "http://127.0.0.1:$OTLP_PORT/v1/logs")
+bad_otlp=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -H 'Content-Type: application/json' --data-binary "@$R/payloads/bad-otlp.json" "http://127.0.0.1:$OTLP_PORT/v1/logs")
+check "hec refuses an unknown index with code 7" "$( [ "$audit_hec" = 200 ] && echo "$bad_hec" | grep -q '"code":7' && echo "$bad_hec" | grep -q ' 400 *$' && echo 1 || echo 0)" \
+  "index=audit -> $audit_hec; index=nope -> $bad_hec"
+
 SENTRY_RAN=0
 if [ -f "$SENTRY_DEMO/app.mjs" ] && [ -d "$SENTRY_DEMO/node_modules/@sentry/node" ] && command -v node >/dev/null 2>&1; then
   log "sentry: $SENTRY_REQUESTS requests through @sentry/node"
@@ -321,6 +353,9 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 check "edge synced everything it wrote" "$( [ "$stable" -ge 2 ] && echo 1 || echo 0)" \
   "received=$received written=$written sent_records=$sent backlog_bytes=$backlog"
+unknown=$(admin "$EDGE_ADMIN" "$EDGE_TOKEN" GET /admin/v1/info | jq_py '"%d %d %s %s" % (v["ingest"]["unknown_index"]["refused"], v["ingest"]["unknown_index"]["defaulted"], v["node"]["id"], v["node"]["tenant"])')
+check "records for an unknown index are refused and counted" "$( [ "$audit_otlp" = 200 ] && [ "$unknown" = "$(( N_BAD_OTLP + 1 )) 0 $NODE default" ] && echo 1 || echo 0)" \
+  "otlp index=audit -> $audit_otlp, index=nope -> $bad_otlp; edge info: refused defaulted node tenant = $unknown (sent $N_BAD_OTLP over OTLP and 1 over HEC)"
 
 # --- parts upload ------------------------------------------------------------------------------------------------
 # Wait for the edge to have merged at least one Parquet file, then upload the range around this run.
@@ -485,6 +520,7 @@ check "peer ack counters sane" "$(echo "$counters" | cut -f1)" "$(echo "$counter
 E3_OTLP=$(free_port); E3_ADMIN=$(free_port); E3_TOKEN="$(rand 24)"
 mkdir -p "$R/edge3"; : > "$R/edge3/empty.log"
 render_config "$R/edge3/data" "
+node|id|\"$NODE3\"
 storage|wal_segment_bytes|131072
 otlp|enabled|true
 otlp|addr|\"127.0.0.1:$E3_OTLP\"
@@ -676,6 +712,33 @@ recon=$("$DUCKDB_BIN" -noheader -csv -c "
 read n_rollups rollup_sum plain <<< "$recon"
 check "rollup reconciliation (fidelity 100)" "$( [ "$n_rollups" = 0 ] && [ $(( rollup_sum + plain )) = "$e_all" ] && echo 1 || echo 0)" \
   "rollup records=$n_rollups rollup counts=$rollup_sum + plain records=$plain = $(( rollup_sum + plain )); edge wrote $e_all"
+
+# --- layout ------------------------------------------------------------------------------------------------------
+# Every file is at tenant=/index=/hour=/level=/node=/, written by the instance's own node id; the audit index holds
+# exactly the records sent to it, on the edge and (routed again by the attribute the edge sent) on central; a refused
+# record is in neither; central's rows say which edge they came from.
+LEAF='^tenant=default/index=(default|audit)/hour=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}/level=(debug|info|warn_plus)/node='
+shape() { # store dir, node id -> files not at a leaf of that node
+  (cd "$1" && find . -name '*.parquet' | sed 's|^\./||' | grep -Evc "$LEAF$2/[^/]+\.parquet$")
+}
+off_edge=$(shape "$R/edge/data/store" "$NODE"); off_central=$(shape "$R/central/data/store" "central-1"); off_e3=$(shape "$R/edge3/data/store" "$NODE3")
+check "every store file is at tenant/index/hour/level/node" "$( [ "$off_edge" = 0 ] && [ "$off_central" = 0 ] && [ "$off_e3" = 0 ] && echo 1 || echo 0)" \
+  "files elsewhere: edge=$off_edge central=$off_central edge3=$off_e3 (of $(find "$R/edge/data/store" "$R/central/data/store" -name '*.parquet' | wc -l | tr -d ' '))"
+hive() { # store dir -> "audit rows, bad-index rows, distinct tenants, distinct nodes, schema versions"
+  "$DUCKDB_BIN" -noheader -csv -c "select count(*) filter (where \"index\" = 'audit'), count(*) filter (where service = 'e2e-bad-index'),
+    count(distinct tenant), string_agg(distinct node, '+'), count(*) filter (where \"index\" = 'audit' and service not like 'e2e-audit-%')
+    from read_parquet('$1/**/*.parquet', hive_partitioning = true, union_by_name = true)" | tr ',' ' '
+}
+e_hive=$(hive "$R/edge/data/store"); c_hive=$(hive "$R/central/data/store")
+N_AUDIT=$(( N_AUDIT_HEC + N_AUDIT_OTLP ))
+check "the audit index holds what was sent to it, on the edge and on central" "$( [ "$e_hive" = "$N_AUDIT 0 1 $NODE 0" ] && [ "$c_hive" = "$N_AUDIT 0 1 central-1 0" ] && echo 1 || echo 0)" \
+  "audit rows, refused rows, tenants, nodes, other rows in audit: edge='$e_hive' central='$c_hive' (sent $N_AUDIT)"
+origins=$("$DUCKDB_BIN" -noheader -csv -c "select origin, count(*) from read_parquet('$R/central/data/store/**/*.parquet', union_by_name = true) group by 1 order by 1" | tr '\n' ' ')
+e_origins=$("$DUCKDB_BIN" -noheader -csv -c "select origin, count(*) from read_parquet('$R/edge/data/store/**/*.parquet', union_by_name = true) group by 1 order by 1" | tr '\n' ' ')
+check "origin is the node that first received the row" "$( [ "$origins" = "$NODE,$c_all " ] && [ "$e_origins" = "$NODE,$e_all " ] && echo 1 || echo 0)" \
+  "central: $origins edge: $e_origins"
+late_e=$(find "$R/edge/data/wal-late" -name '*.wal' 2>/dev/null | wc -l | tr -d ' ')
+check "the late spool exists and is drained" "$( [ -d "$R/edge/data/wal-late" ] && [ "$late_e" = 0 ] && echo 1 || echo 0)" "wal-late segments left on the edge after the offline merge: $late_e"
 
 # --- report ------------------------------------------------------------------------------------------------------
 echo

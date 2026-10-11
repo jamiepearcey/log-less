@@ -115,8 +115,10 @@ impl Policies {
     /// The file's view of the policy document.
     pub fn from_config(c: &Config) -> Self {
         Self {
+            // The default index's buckets: the document has one `retention`
+            // list, and other indexes are set in the config file only.
             retention: c
-                .retention
+                .default_buckets()
                 .iter()
                 .map(|b| RetentionRule {
                     name: b.name.clone(),
@@ -146,7 +148,7 @@ impl Policies {
     /// value in the code that sizes things from `Config`.
     pub fn apply_to_config(&self, base: &Config) -> Result<Config, crate::config::ConfigError> {
         let mut c = base.clone();
-        c.retention = self.buckets()?;
+        c.set_default_buckets(self.buckets()?);
         c.storage.disk_budget_bytes = self.storage.disk_budget_bytes;
         c.storage.high_water = self.storage.high_water;
         c.storage.critical_water = self.storage.critical_water;
@@ -508,9 +510,20 @@ pub fn lossy_settings(current: &Policies, proposed: &Policies) -> Vec<Problem> {
 /// buckets from one version and a budget from another.
 #[derive(Debug, Clone)]
 pub struct Runtime {
+    /// The buckets of the own tenant's default index.
     pub buckets: LevelBuckets,
     pub disk_budget_bytes: u64,
     pub watermarks: Watermarks,
+}
+
+impl Runtime {
+    /// The tenancy a pass enforces: the config file's (`base`) with the
+    /// default index's buckets taken from the live policy.
+    pub fn tenancy(&self, base: &crate::config::Tenancy) -> crate::config::Tenancy {
+        let mut tenancy = base.clone();
+        tenancy.set_default_buckets(self.buckets.clone());
+        tenancy
+    }
 }
 
 /// What the running process actually enforces. Reads are a read-lock and an

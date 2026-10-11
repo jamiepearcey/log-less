@@ -162,7 +162,7 @@ Reading `latency_ms > 500` (996 of 500,000 rows, 0.20%):
 
 **Row-group pruning on min/max is 0 of 8** for `latency_ms > 500`,
 `http.status_code >= 500` and a last-6-minutes range on the timestamp
-attribute. Files are sorted by `(service, trace_id, observed)` and trace ids are
+attribute. Files are sorted by `(service, trace_id, timestamp)` and trace ids are
 random, so every row group spans the full value range of an attribute that is
 not correlated with service. The gain is in reading one narrow column instead
 of parsing JSON, not in skipping row groups. Pruning would need a sort or

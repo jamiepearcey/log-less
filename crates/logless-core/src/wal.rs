@@ -76,6 +76,12 @@ pub struct WalWriter {
     current_id: u64,
     current_uuid: Uuid,
     current_len: u64,
+    /// Roll a segment this long after its first record, as well as on size.
+    /// `None` rolls on size alone (the main WAL).
+    roll_after: Option<Duration>,
+    /// Unix nanoseconds of the first append into the current segment; 0 while
+    /// it is empty.
+    current_started: u64,
 
     unsynced_bytes: u64,
     last_sync: Instant,
@@ -114,6 +120,8 @@ impl WalWriter {
             current_id: next_id,
             current_uuid: uuid,
             current_len: HEADER_BYTES,
+            roll_after: None,
+            current_started: 0,
             unsynced_bytes: 0,
             last_sync: Instant::now(),
             synced_records: 0,
@@ -122,6 +130,40 @@ impl WalWriter {
             bytes_written: 0,
             syncs: 0,
         })
+    }
+
+    /// Also roll a segment `after` its first record was appended (see
+    /// [`WalWriter::append_at`]). The late spool is rolled this way: its
+    /// records wait for the roll to reach Parquet, so the wait is bounded.
+    pub fn roll_after(mut self, after: Duration) -> Self {
+        self.roll_after = Some(after);
+        self
+    }
+
+    /// [`WalWriter::append`] with the time given, for a writer that rolls on
+    /// age. The clock is passed in so a replay can be driven at its own pace.
+    pub fn append_at(&mut self, batch: &[LogRecord], now_unix_nanos: u64) -> Result<(), WalError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.roll_if_due(now_unix_nanos)?;
+        if self.current_started == 0 {
+            self.current_started = now_unix_nanos.max(1);
+        }
+        self.append(batch)
+    }
+
+    /// Closes the current segment if it holds records and is older than the
+    /// roll period. Called on every writer pass, so a segment that stopped
+    /// receiving records still closes on time.
+    pub fn roll_if_due(&mut self, now_unix_nanos: u64) -> Result<bool, WalError> {
+        let Some(after) = self.roll_after else { return Ok(false) };
+        let due = self.current_started != 0
+            && now_unix_nanos.saturating_sub(self.current_started) >= after.as_nanos().min(u128::from(u64::MAX)) as u64;
+        if due {
+            self.roll()?;
+        }
+        Ok(due)
     }
 
     pub fn current_segment(&self) -> &Path {
@@ -212,7 +254,105 @@ impl WalWriter {
         self.current_path = path;
         self.current_uuid = uuid;
         self.current_len = HEADER_BYTES;
+        self.current_started = 0;
         Ok(())
+    }
+}
+
+/// How the two logs of a [`SplitWal`] roll and sync.
+#[derive(Debug, Clone, Copy)]
+pub struct SplitConfig {
+    pub segment_bytes: u64,
+    pub fsync_interval: Duration,
+    pub fsync_bytes: u64,
+    /// A record whose event time is older than this is late.
+    pub late_threshold: Duration,
+    pub late_roll: Duration,
+    pub late_segment_bytes: u64,
+}
+
+/// The main WAL and the late spool behind one writer.
+///
+/// The store is partitioned on event time, so a merged segment writes one file
+/// per event hour it touches. A replay or a source with a slow clock spreads
+/// one main segment over many hours, each a tiny file. Records whose event
+/// time is already older than `late_threshold` therefore go to a second log,
+/// `wal-late/`, which rolls on age (or size) instead of with the main one: the
+/// same replay then makes one file per partition per late segment. Both logs
+/// are synced together and merged by the same code, so a late record is as
+/// durable as any other; what it gives up is reaching Parquet before its
+/// segment rolls.
+pub struct SplitWal {
+    main: WalWriter,
+    late: WalWriter,
+    late_threshold_nanos: u64,
+    /// Records that went to the late spool.
+    pub late_records: u64,
+}
+
+impl SplitWal {
+    pub fn open(wal_dir: &Path, late_dir: &Path, config: &SplitConfig) -> Result<Self, WalError> {
+        Ok(Self {
+            main: WalWriter::open(wal_dir, config.segment_bytes, config.fsync_interval, config.fsync_bytes)?,
+            late: WalWriter::open(late_dir, config.late_segment_bytes, config.fsync_interval, config.fsync_bytes)?.roll_after(config.late_roll),
+            late_threshold_nanos: config.late_threshold.as_nanos().min(u128::from(u64::MAX)) as u64,
+            late_records: 0,
+        })
+    }
+
+    /// Appends `batch`, each record to the log its event time puts it in.
+    pub fn append(&mut self, batch: &[LogRecord], now_unix_nanos: u64) -> Result<(), WalError> {
+        let cutoff = now_unix_nanos.saturating_sub(self.late_threshold_nanos);
+        if !batch.iter().any(|r| r.timestamp_unix_nano < cutoff) {
+            // The live path: nothing is copied.
+            return self.main.append(batch);
+        }
+        let (late, on_time): (Vec<LogRecord>, Vec<LogRecord>) = batch.iter().cloned().partition(|r| r.timestamp_unix_nano < cutoff);
+        self.late_records += late.len() as u64;
+        self.main.append(&on_time)?;
+        self.late.append_at(&late, now_unix_nanos)
+    }
+
+    /// Syncs on the logs' policy and rolls the late spool when it is due.
+    /// Returns the number of records on disk when that number went up. It
+    /// counts records in the order they were appended, so it is only ever
+    /// published with **both** logs synced: a count that covered a record
+    /// still buffered in the other log would acknowledge it early.
+    pub fn maybe_sync(&mut self, now_unix_nanos: u64) -> Result<Option<u64>, WalError> {
+        self.late.roll_if_due(now_unix_nanos)?;
+        let advanced = self.main.maybe_sync()? | self.late.maybe_sync()?;
+        if !advanced {
+            return Ok(None);
+        }
+        Ok(Some(self.sync()?))
+    }
+
+    /// Syncs both logs and returns the number of records on disk.
+    pub fn sync(&mut self) -> Result<u64, WalError> {
+        if self.main.unsynced_bytes > 0 {
+            self.main.sync()?;
+        }
+        if self.late.unsynced_bytes > 0 {
+            self.late.sync()?;
+        }
+        Ok(self.main.records_written + self.late.records_written)
+    }
+
+    /// Closes the main segment now and starts the next. The agent rolls on
+    /// size; a measurement that replays a corpus rolls where it wants its
+    /// segment boundaries.
+    pub fn roll_main(&mut self) -> Result<(), WalError> {
+        self.main.roll()
+    }
+
+    /// Ids of the segments being written, main then late. A merge must skip
+    /// each in its own directory.
+    pub fn active_segments(&self) -> (u64, u64) {
+        (self.main.current_segment_id(), self.late.current_segment_id())
+    }
+
+    pub fn records_written(&self) -> u64 {
+        self.main.records_written + self.late.records_written
     }
 }
 
@@ -431,6 +571,14 @@ pub fn segment_uuid(path: &Path) -> Result<Uuid, WalError> {
     Ok(Uuid::from_bytes(uuid_bytes))
 }
 
+/// The late spool's directory name, beside the main WAL in the data dir.
+pub const LATE_DIR: &str = "wal-late";
+
+/// The late spool that goes with the main WAL at `wal_dir`: its sibling.
+pub fn late_dir_beside(wal_dir: &Path) -> PathBuf {
+    wal_dir.with_file_name(LATE_DIR)
+}
+
 /// Bytes on disk under `dir` — used by the disk-budget watermarks.
 pub fn dir_bytes(dir: &Path) -> u64 {
     list_segments(dir)
@@ -479,6 +627,88 @@ mod tests {
         w.sync().unwrap();
         assert!(w.maybe_sync().unwrap(), "an explicit sync is reported too");
         assert_eq!(w.synced_records(), 51);
+    }
+
+    fn split(dir: &Path, late_threshold: Duration, late_roll: Duration) -> SplitWal {
+        let config = SplitConfig {
+            segment_bytes: 1 << 30,
+            fsync_interval: Duration::from_secs(3600),
+            fsync_bytes: 1 << 30,
+            late_threshold,
+            late_roll,
+            late_segment_bytes: 1 << 30,
+        };
+        SplitWal::open(&dir.join("wal"), &late_dir_beside(&dir.join("wal")), &config).unwrap()
+    }
+
+    fn at(event_secs: u64, tag: &str) -> LogRecord {
+        LogRecord::new(event_secs * 1_000_000_000, Severity::INFO, tag)
+    }
+
+    #[test]
+    fn records_older_than_the_threshold_go_to_the_late_spool_and_the_rest_to_the_main_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let hour = 3600u64;
+        let now = 100 * hour;
+        let mut w = split(dir.path(), Duration::from_secs(2 * hour), Duration::from_secs(1800));
+        w.append(&[at(now - 10, "live"), at(now - 3 * hour, "replayed"), at(now - 2 * hour + 1, "just inside"), at(now + 60, "ahead")], now * 1_000_000_000).unwrap();
+        assert_eq!((w.records_written(), w.late_records), (4, 1));
+        assert_eq!(w.sync().unwrap(), 4, "both logs are on disk before the count is given");
+        drop(w);
+        let bodies = |d: &Path| collect(d, false).1.into_iter().map(|r| r.body).collect::<Vec<_>>();
+        assert_eq!(bodies(&dir.path().join("wal")), ["live", "just inside", "ahead"]);
+        assert_eq!(bodies(&dir.path().join("wal-late")), ["replayed"]);
+    }
+
+    #[test]
+    fn the_late_spool_rolls_on_age_whether_or_not_more_late_records_arrive() {
+        let dir = tempfile::tempdir().unwrap();
+        let late = dir.path().join("wal-late");
+        let ns = 1_000_000_000u64;
+        let now = 1_000_000 * ns;
+        let mut w = split(dir.path(), Duration::from_secs(60), Duration::from_secs(1800));
+        let old = |tag: &str| at(1, tag);
+        w.append(&[old("a")], now).unwrap();
+        w.append(&[old("b")], now + 1799 * ns).unwrap();
+        assert_eq!(w.active_segments(), (1, 1), "inside the roll period: one late segment");
+        // A late record past the period closes the segment and starts the next.
+        w.append(&[old("c")], now + 1800 * ns).unwrap();
+        assert_eq!(w.active_segments(), (1, 2));
+        // With nothing arriving, the writer's own pass closes it on time; an empty segment never rolls.
+        assert_eq!(w.maybe_sync(now + 1900 * ns).unwrap(), Some(3), "the roll synced: three records on disk");
+        assert_eq!(w.active_segments(), (1, 2));
+        w.maybe_sync(now + 3600 * ns).unwrap();
+        assert_eq!(w.active_segments(), (1, 3));
+        w.maybe_sync(now + 9000 * ns).unwrap();
+        assert_eq!(w.active_segments(), (1, 3), "segment 3 holds nothing");
+        drop(w);
+        assert_eq!(list_segments(&late).unwrap().len(), 3);
+        let first = replay_segment(&list_segments(&late).unwrap()[0].1, false, |_| {}).unwrap();
+        assert_eq!(first.records, 2);
+    }
+
+    #[test]
+    fn a_published_count_never_covers_a_record_still_buffered_in_the_other_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let ns = 1_000_000_000u64;
+        let now = 1_000_000 * ns;
+        // The main log syncs at once (interval 0); the late one would wait an hour by itself.
+        let config = SplitConfig {
+            segment_bytes: 1 << 30,
+            fsync_interval: Duration::ZERO,
+            fsync_bytes: 1 << 30,
+            late_threshold: Duration::from_secs(60),
+            late_roll: Duration::from_secs(1800),
+            late_segment_bytes: 1 << 30,
+        };
+        let mut w = SplitWal::open(&dir.path().join("wal"), &dir.path().join("wal-late"), &config).unwrap();
+        w.late.fsync_interval = Duration::from_secs(3600);
+        w.append(&[at(1, "late, first in order"), at(1_000_000, "live")], now).unwrap();
+        assert_eq!(w.maybe_sync(now).unwrap(), Some(2));
+        // Read back without the writer flushing anything more: both are on disk.
+        assert_eq!(collect(&dir.path().join("wal-late"), false).1.len(), 1);
+        assert_eq!(collect(&dir.path().join("wal"), false).1.len(), 1);
+        std::mem::forget(w);
     }
 
     #[test]

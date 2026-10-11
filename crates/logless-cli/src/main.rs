@@ -17,7 +17,7 @@ use logless_core::admin_api::{self, AdminServer, AdminService, IngestProbe, List
 use logless_core::budget::{self, DiskUsage, Pressure, Watermarks};
 use logless_core::catalog::Catalog;
 use logless_core::drain::{Drain, DrainConfig};
-use logless_core::config::{Config, IngestConfig, LevelBuckets, PushdownConfig, StorageConfig};
+use logless_core::config::{self, Config, IngestConfig, PushdownConfig, Route, StorageConfig, Tenancy};
 use logless_core::model::{LevelClass, LogRecord, Severity};
 use logless_core::policy::PolicyHandle;
 use logless_core::forward::{Destination, Dispatch, ForwardStats, Forwarder, HttpTransport, Outbound};
@@ -208,9 +208,11 @@ enum Command {
         #[arg(long)]
         inventory: Option<PathBuf>,
         /// Take only this node's parts from the inventory. Needed when central catalogues more than one node.
+        /// Also the `node=` a part is placed under when its footer does not name one.
         #[arg(long)]
         node: Option<String>,
-        /// The edge's config, for its level buckets (default buckets otherwise). Only the buckets are used.
+        /// The edge's config, for its tenants, indexes and their level buckets (one tenant `default` with one
+        /// index `default` and the default buckets otherwise). Nothing else of it is used.
         #[arg(long)]
         config: Option<PathBuf>,
         /// After installing, hash every installed file again and compare the rebuilt catalog with the report.
@@ -222,6 +224,12 @@ enum Command {
         /// Write the full report as JSON.
         #[arg(long)]
         report_json: Option<PathBuf>,
+    },
+    /// Rewrite a store written before tenants and indexes (`hour=…/level=…`) into the current tree, cut on
+    /// event time, and rebuild the catalog's file table. Run it with the agent stopped. Safe to repeat.
+    MigrateLayout {
+        #[arg(long)]
+        config: PathBuf,
     },
     /// Combine small per-segment files into larger ones.
     Compact {
@@ -326,9 +334,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     wal_segment_bytes: 128 * 1024 * 1024,
                     wal_fsync_interval: Duration::from_millis(100),
                     wal_fsync_bytes: 4 * 1024 * 1024,
+                    late_threshold: config::default_late_threshold(),
+                    late_roll: config::default_late_roll(),
+                    late_segment_bytes: config::default_late_segment_bytes(),
+                    compact_quiet: config::default_compact_quiet(),
                 },
                 ingest: IngestConfig::default(),
-                retention: LevelBuckets::default(),
+                // `[node] id` is left out: one is generated on first run and kept in the data dir.
+                node: config::NodeConfig::default(),
                 pushdown: PushdownConfig::default(),
                 typed_columns: logless_core::typed::TypedColumnsConfig::default(),
                 otlp: otlp::ReceiverConfig::default(),
@@ -339,6 +352,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 peer: logless_core::peer::PeerConfig::default(),
                 sync_parts: Default::default(),
                 decision: logless_core::decision::DecisionConfig::default(),
+                tenants: config::default_tenants(),
                 tail: Vec::new(),
                 destinations: Vec::new(),
             };
@@ -460,13 +474,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Recover { config, repair } => {
             let config = load(&config)?;
-            let report = wal::recover(&config.wal_dir(), repair, |_| {})?;
-            println!(
-                "segments={} batches={} records={} truncated={}",
-                report.segments_read, report.batches, report.records, report.truncated.len()
-            );
-            for (path, len) in &report.truncated {
-                println!("  torn tail: {} -> {len} bytes", path.display());
+            // The main WAL, then the late spool: the same segments in a second directory.
+            for dir in [config.wal_dir(), config.wal_late_dir()] {
+                let report = wal::recover(&dir, repair, |_| {})?;
+                println!(
+                    "{}: segments={} batches={} records={} truncated={}",
+                    dir.display(), report.segments_read, report.batches, report.records, report.truncated.len()
+                );
+                for (path, len) in &report.truncated {
+                    println!("  torn tail: {} -> {len} bytes", path.display());
+                }
             }
         }
 
@@ -475,16 +492,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut catalog = Catalog::open(&catalog_path(&config))?;
             let mut drain =
                 Drain::restore(DrainConfig::default(), catalog.load_templates()?);
-            let report = merge::merge_all(
+            let tenancy = config.tenancy()?;
+            let mut report = merge::merge_all(
                 &config.wal_dir(),
                 &config.store_dir(),
                 &mut catalog,
-                &config.retention,
+                &tenancy,
                 &mut drain,
                 &config.typed_columns,
                 None,
                 now_unix_secs(),
             )?;
+            let late = merge::merge_all(
+                &config.wal_late_dir(),
+                &config.store_dir(),
+                &mut catalog,
+                &tenancy,
+                &mut drain,
+                &config.typed_columns,
+                None,
+                now_unix_secs(),
+            )?;
+            report.absorb(late);
             println!(
                 "merged={} skipped={} records={} files={} bytes_written={} wal_freed={} truncated={}",
                 report.segments_merged,
@@ -520,11 +549,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let catalog = Catalog::open(&catalog_path(&config))?;
             let (committed, _bytes) = catalog.totals()?;
 
-            // Replay the WAL to count what is accepted but not yet merged.
+            // Replay the WAL and the late spool to count what is accepted but not yet merged.
             let mut in_wal = 0u64;
-            let report = wal::recover(&config.wal_dir(), false, |batch| {
+            let mut report = wal::recover(&config.wal_dir(), false, |batch| {
                 in_wal += batch.len() as u64;
             })?;
+            report.segments_read += wal::recover(&config.wal_late_dir(), false, |batch| {
+                in_wal += batch.len() as u64;
+            })?
+            .segments_read;
 
             let audit = logless_core::counters::Audit {
                 received: counters.received,
@@ -566,6 +599,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     typed: config.typed_columns,
                     ..Default::default()
                 },
+                // No writer is running beside this command, so no partition is still being written to.
                 None,
             )?;
             println!(
@@ -580,12 +614,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
+        Command::MigrateLayout { config } => {
+            let config = load_any_layout(&config)?;
+            let mut catalog = Catalog::open(&catalog_path(&config))?;
+            let report = logless_core::migrate::migrate(&config.store_dir(), &mut catalog, &config.tenancy()?)?;
+            println!(
+                "migrated: files_read={} files_written={} rows={} rows_moved_to_their_event_hour={} catalog_files={}",
+                report.files_read, report.files_written, report.rows, report.rows_moved_hour, report.catalog_files
+            );
+        }
+
         Command::Restore { from, to, endpoint, region, inventory, node, config, verify, force, report_json } => {
             use logless_core::restore as rs;
-            let buckets = match &config {
-                Some(path) => load(path)?.retention,
-                None => LevelBuckets::default(),
+            let tenants = match &config {
+                Some(path) => load_any_layout(path)?.tenants,
+                None => config::default_tenants(),
             };
+            // The node a part without a footer name is placed under: the one being restored.
+            let tenancy = Tenancy::new(tenants, node.clone().unwrap_or_else(|| "restored".into()))?;
             let inventory = match &inventory {
                 Some(path) => Some(rs::read_inventory(path, node.as_deref())?),
                 None => None,
@@ -604,7 +650,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 Box::new(rs::DirSource(PathBuf::from(&from)))
             };
-            let report = rs::restore(&*source, &rs::Options { to: &to, inventory, buckets: &buckets, force, reverify: verify })?;
+            let report = rs::restore(&*source, &rs::Options { to: &to, inventory, tenancy: &tenancy, force, reverify: verify })?;
             println!("listed={} ignored_keys={} inventory={}", report.listed, report.ignored_keys, report.inventory.map_or("none".into(), |n| n.to_string()));
             println!("restored_parts={} rows={} bytes={}", report.restored, report.rows, report.bytes);
             println!(
@@ -648,7 +694,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = load(&config)?;
             let report = retention::enforce(
                 &config.store_dir(),
-                &config.retention,
+                &config.tenancy()?,
                 now_unix_secs(),
                 dry_run,
             );
@@ -665,9 +711,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             for k in &report.orphan_buckets {
                 println!(
-                    "  orphan bucket {:?} at hour={} — not in config, left in place",
-                    k.bucket,
-                    partition::format_hour(k.epoch_hour)
+                    "  orphan tenant={} index={} hour={} level={} — not in config, left in place",
+                    k.tenant,
+                    k.index,
+                    partition::format_hour(k.epoch_hour),
+                    k.bucket
                 );
             }
             if !dry_run {
@@ -689,9 +737,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("files={} rows={} bytes={}", files.len(), rows, bytes);
             for f in files.iter().take(50) {
                 println!(
-                    "  hour={} level={:<10} rows={:<8} bytes={:<10} {}",
+                    "  tenant={} index={} hour={} level={:<10} node={} rows={:<8} bytes={:<10} {}",
+                    f.key.tenant,
+                    f.key.index,
                     partition::format_hour(f.key.epoch_hour),
                     f.key.bucket,
+                    f.key.node,
                     f.stats.rows,
                     f.stats.bytes,
                     f.path.display()
@@ -739,7 +790,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "rows={} parquet_files={} wal_segments={}",
                 rows,
                 store::list_parquet_files(&config.store_dir()).len(),
-                wal::list_segments(&config.wal_dir())?.len()
+                wal::list_segments(&config.wal_dir())?.len() + wal::list_segments(&config.wal_late_dir())?.len()
             );
         }
 
@@ -809,18 +860,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Command::Buckets { config } => {
             let config = load(&config)?;
-            for b in config.retention.iter() {
-                println!(
-                    "{:<12} severity>={:<3} retention={:?}",
-                    b.name, b.min_severity, b.retention
-                );
+            let tenancy = config.tenancy()?;
+            for (tenant, index, buckets) in tenancy.indexes() {
+                println!("tenant={tenant} index={index}");
+                for b in buckets.iter() {
+                    println!(
+                        "  {:<12} severity>={:<3} retention={:?}",
+                        b.name, b.min_severity, b.retention
+                    );
+                }
             }
         }
     }
     Ok(())
 }
 
+/// Loads a config and refuses a store in the layout before tenants and indexes: its partitions are cut on
+/// `observed`, so every reader and retention here would get them wrong.
 fn load(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
+    let config = load_any_layout(path)?;
+    if partition::is_old_layout(&config.store_dir()) {
+        return Err(format!(
+            "{} is in the old layout (hour=…/level=… at the top). This build stores              tenant=…/index=…/hour=<event hour>/level=…/node=… and will not read or write the old one.              Stop the agent and run `logless migrate-layout --config {}` once; it rewrites the files by event hour.",
+            config.store_dir().display(),
+            path.display()
+        )
+        .into());
+    }
+    Ok(config)
+}
+
+/// [`load`] without the layout check, for the commands that do not open the store as this layout.
+fn load_any_layout(path: &Path) -> Result<Config, Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(path)?;
     let config: Config = toml::from_str(&text)?;
     config.validate()?;
@@ -1053,8 +1124,10 @@ fn run(
         }
     }
 
-    // Published by the writer so maintenance never merges the live segment.
+    // Published by the writer so maintenance never merges the live segment, of the main WAL and of the
+    // late spool.
     let active_segment = Arc::new(AtomicU64::new(0));
+    let active_late = Arc::new(AtomicU64::new(0));
     // Published by maintenance so ingest can stop admitting DEBUG under
     // critical disk pressure. An integer rather than a lock: it is read on
     // every record.
@@ -1063,9 +1136,17 @@ fn run(
     // another thread while the record path owns the plain counter.
     let refused_debug_pressure = Arc::new(AtomicU64::new(0));
 
+    // The tenants and indexes of the config file, with this instance's node id (generated and kept in the
+    // data dir when `[node] id` is not set). The maintenance pass lays the live policy's buckets over it.
+    let tenancy = Arc::new(config.tenancy()?);
+    let routes = Arc::new(config::RouteStats::default());
+    tracing::info!(node = tenancy.node(), tenant = tenancy.tenant(), default_index = tenancy.default_index(), "store identity");
+
     // Peer sync. The tap sits behind the WAL writer, so it sees exactly what the agent accepted and
     // costs one atomic load per batch while no peer is configured.
-    let instance_id = logless_core::peer::instance_id(&config.storage.data_dir);
+    // To its peers this instance is its node id: that is what `logless.origin` carries on the records it
+    // sends, so the `origin` column says the same thing for a row whichever instance stores it.
+    let instance_id = tenancy.node().to_string();
     let sync_store = sync::SyncStore::new(config.storage.data_dir.clone());
     let sync_control = sync::SyncControl::new(instance_id.clone(), sync_store.clone(), initial_sync_target(config, &sync_store));
     sync_control.set_store_dir(config.store_dir());
@@ -1076,19 +1157,29 @@ fn run(
     let writer = {
         let stop = Arc::clone(&stop);
         let active = Arc::clone(&active_segment);
+        let active_late = Arc::clone(&active_late);
         let synced = Arc::clone(&wal_acks);
-        let wal_dir = config.wal_dir();
-        let (segment_bytes, fsync_interval, fsync_bytes) = (
-            config.storage.wal_segment_bytes,
-            config.storage.wal_fsync_interval,
-            config.storage.wal_fsync_bytes,
-        );
+        let (wal_dir, late_dir) = (config.wal_dir(), config.wal_late_dir());
+        let split = wal::SplitConfig {
+            segment_bytes: config.storage.wal_segment_bytes,
+            fsync_interval: config.storage.wal_fsync_interval,
+            fsync_bytes: config.storage.wal_fsync_bytes,
+            late_threshold: config.storage.late_threshold,
+            late_roll: config.storage.late_roll,
+            late_segment_bytes: config.storage.late_segment_bytes,
+        };
         std::thread::Builder::new()
             .name("logless-wal".into())
             .spawn(move || -> Result<u64, wal::WalError> {
-                let mut w =
-                    wal::WalWriter::open(&wal_dir, segment_bytes, fsync_interval, fsync_bytes)?;
-                active.store(w.current_segment_id(), Ordering::Relaxed);
+                let mut w = wal::SplitWal::open(&wal_dir, &late_dir, &split)?;
+                // The late id first: maintenance waits for the main one, and must
+                // then find both.
+                let publish_active = |w: &wal::SplitWal| {
+                    let (main, late) = w.active_segments();
+                    active_late.store(late, Ordering::Relaxed);
+                    active.store(main, Ordering::Relaxed);
+                };
+                publish_active(&w);
                 loop {
                     let batch = consumer.next_batch_lingering(
                         4096,
@@ -1096,25 +1187,24 @@ fn run(
                         WAL_BATCH_LINGER,
                     );
                     if !batch.is_empty() {
-                        w.append(&batch)?;
+                        w.append(&batch, now_unix_nanos())?;
                         writer_tap.offer(&batch);
-                        active.store(w.current_segment_id(), Ordering::Relaxed);
                     }
                     // Publish only after a sync actually happened: this is the
                     // number a HEC ack is judged against and a peer request
                     // waits on, so it must mean "on disk", not "appended".
-                    if w.maybe_sync()? {
-                        synced.publish(w.synced_records());
+                    if let Some(on_disk) = w.maybe_sync(now_unix_nanos())? {
+                        synced.publish(on_disk);
                     }
+                    publish_active(&w);
                     if stop.load(Ordering::Relaxed) && batch.is_empty() {
                         let tail = consumer.drain();
                         if !tail.is_empty() {
-                            w.append(&tail)?;
+                            w.append(&tail, now_unix_nanos())?;
                             writer_tap.offer(&tail);
                         }
-                        w.sync()?;
-                        synced.publish(w.records_written);
-                        return Ok(w.records_written);
+                        synced.publish(w.sync()?);
+                        return Ok(w.records_written());
                     }
                 }
             })?
@@ -1151,6 +1241,8 @@ fn run(
     let maintainer = if maintenance {
         let phase = Arc::clone(&phase);
         let active = Arc::clone(&active_segment);
+        let active_late = Arc::clone(&active_late);
+        let tenancy = Arc::clone(&tenancy);
         let pressure = Arc::clone(&pressure);
         let drain = Arc::clone(&drain);
         let config = config.clone();
@@ -1173,9 +1265,10 @@ fn run(
                         maintenance_pass(
                             &config,
                             &policy,
+                            &tenancy,
                             &mut catalog,
                             &drain,
-                            &active,
+                            (&active, &active_late),
                             &pressure,
                             &sync_control,
                             writer_done,
@@ -1221,7 +1314,23 @@ fn run(
             let tx = tx.clone();
             let queue_capacity = config.ingest.queue_capacity;
             let queue_for_room = Arc::clone(&queue);
-            Some(hec::Receiver::start(&config.hec, Arc::clone(&acks), move |batch| {
+            let (hec_tenancy, hec_routes) = (Arc::clone(&tenancy), Arc::clone(&routes));
+            Some(hec::Receiver::start(&config.hec, Arc::clone(&acks), move |mut batch| {
+                // An event's `index` routes it. One the tenant does not have and refuses
+                // turns the whole request away with Splunk's code 7, before anything of it
+                // is admitted: an acked batch must be stored whole.
+                for record in &mut batch.records {
+                    match hec_tenancy.route_record(record, "index") {
+                        Route::Known(_) => {}
+                        Route::Defaulted(_) => {
+                            hec_routes.defaulted.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Route::Refused => {
+                            hec_routes.refused.fetch_add(1, Ordering::Relaxed);
+                            return Admitted::IncorrectIndex;
+                        }
+                    }
+                }
                 // Refuse rather than shed. An acked batch that later loses its
                 // DEBUG records to severity shedding would be acked as durable
                 // while part of it was dropped, so the batch is only admitted
@@ -1251,7 +1360,7 @@ fn run(
 
     // Records from other log-less instances take the same road as the other receivers: a bounded
     // channel into the main loop (a full one is a 503 and the sender retries), then templating and the
-    // queue. They keep the sender's observed time and event id, so partitions and dedupe stay right.
+    // queue. They keep the sender's event time, observed time and event id, so partitions and dedupe stay right.
     // Each batch carries a ticket: the request is answered only once the WAL has synced the batch.
     let (peer_tx, peer_rx) = if config.peer.enabled {
         let (tx, rx) = crossbeam_channel::bounded::<(logless_core::peer::Ticket, Vec<LogRecord>)>(PEER_PENDING_BATCHES);
@@ -1319,6 +1428,7 @@ fn run(
                 stats: Arc::clone(&stats),
                 written: Arc::clone(&synced_records),
                 refused_debug_pressure: Arc::clone(&refused_debug_pressure),
+                routes: Arc::clone(&routes),
             },
             listeners,
         );
@@ -1428,6 +1538,22 @@ fn run(
                        pushdown_sink: &mut Option<std::io::BufWriter<std::fs::File>>|
      -> bool {
         *raw_bytes_seen += raw_len;
+
+        // Which index the record is for: its `logless.index` attribute (an OTLP resource attribute, a
+        // `[[tail]] index`, or what another instance routed it to), checked against this tenant's indexes.
+        // HEC was routed at the door. A record for an unknown index goes to the default one or is not
+        // stored, by `unknown_index`; either way it is counted (`GET /admin/v1/info`).
+        match tenancy.route_record(&mut record, config::ATTR_INDEX) {
+            Route::Known(_) => {}
+            Route::Defaulted(_) => {
+                routes.defaulted.fetch_add(1, Ordering::Relaxed);
+            }
+            Route::Refused => {
+                routes.refused.fetch_add(1, Ordering::Relaxed);
+                *count += 1;
+                return !(max_records > 0 && *count >= max_records);
+            }
+        }
 
         // Assign the template id here so it reaches both the WAL and pushdown.
         // The template *text* is carried alongside for aggregate events, whose
@@ -1540,6 +1666,7 @@ fn run(
                 exclude: Vec::new(),
                 from_end: tail_from_end,
                 service: None,
+                index: None,
             });
         }
         let mut tailer = (!tail_sources.is_empty())
@@ -1594,19 +1721,25 @@ fn run(
         while !done {
             let mut idle = true;
 
-            let mut batch: Vec<(Option<String>, String)> = Vec::new();
+            let mut batch: Vec<(Option<String>, Option<String>, String)> = Vec::new();
             if let Some(t) = tailer.as_mut() {
-                t.poll_labeled(|_, service, line| {
-                    batch.push((service.map(str::to_string), line.to_string()))
+                t.poll_routed(|_, service, index, line| {
+                    batch.push((service.map(str::to_string), index.map(str::to_string), line.to_string()))
                 });
             }
-            for (service, line) in &batch {
+            for (service, index, line) in &batch {
                 idle = false;
                 let mut record = parse_line(line);
                 // A service named in the line itself is more specific than the
                 // source's label.
                 if record.service.is_none() {
                     record.service = service.clone();
+                }
+                if let Some(index) = index {
+                    record.attributes.push(logless_core::Attr {
+                        key: config::ATTR_INDEX.into(),
+                        value: logless_core::AttrValue::Str(index.clone()),
+                    });
                 }
                 if !process(
                     record,
@@ -2204,12 +2337,14 @@ fn replay_to_sentry(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maintenance_pass(
     config: &Config,
     policy: &PolicyHandle,
+    base: &Tenancy,
     catalog: &mut Catalog,
     drain: &Arc<Mutex<Drain>>,
-    active_segment: &AtomicU64,
+    (active_segment, active_late): (&AtomicU64, &AtomicU64),
     pressure: &AtomicU8,
     sync_control: &Arc<sync::SyncControl>,
     writer_done: bool,
@@ -2218,14 +2353,17 @@ fn maintenance_pass(
     // through the admin API hot. One snapshot per pass so merge, expiry and
     // pressure relief all judge by the same policy.
     let rt = policy.runtime();
+    // The config file's tenants and indexes; the default index's buckets are the live policy's.
+    let tenancy = rt.tenancy(base);
     // 0 means the writer has not published a segment id yet. Merging with
     // `None` here would treat every segment as inactive — including the one the
     // writer is about to append to — so skip merging entirely until it reports.
     // Once the writer has finished, nothing is active and everything can merge.
-    let active = match (writer_done, active_segment.load(Ordering::Relaxed)) {
-        (true, _) => None,
+    let (active, late_active) = match (writer_done, active_segment.load(Ordering::Relaxed)) {
+        (true, _) => (None, None),
         (false, 0) => return,
-        (false, id) => Some(id),
+        // The writer publishes the late id before the main one, so it is set by now.
+        (false, id) => (Some(id), Some(active_late.load(Ordering::Relaxed))),
     };
 
     let merged = {
@@ -2233,28 +2371,45 @@ fn maintenance_pass(
             Ok(d) => d,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // The main WAL, then the late spool: the same merge over a second directory, whose segments
+        // close on age. A failure of the first is reported; the second is still tried next pass.
         merge::merge_all(
             &config.wal_dir(),
             &config.store_dir(),
             catalog,
-            &rt.buckets,
+            &tenancy,
             &mut drain,
             &config.typed_columns,
             active,
             now_unix_secs(),
         )
+        .and_then(|mut report| {
+            let late = merge::merge_all(
+                &config.wal_late_dir(),
+                &config.store_dir(),
+                catalog,
+                &tenancy,
+                &mut drain,
+                &config.typed_columns,
+                late_active,
+                now_unix_secs(),
+            )?;
+            report.absorb(late);
+            Ok(report)
+        })
     };
     // Compaction runs after the merge, so the files it just wrote are
-    // candidates, and never for the hour still being written to.
-    let active_hour = (!writer_done).then(|| now_unix_nanos() / (3_600 * 1_000_000_000));
+    // candidates once their partition has been quiet for `compact_quiet`. With
+    // the writer gone nothing is being written to, and everything may compact.
     match logless_core::compact::compact(
         &config.store_dir(),
         catalog,
         &logless_core::compact::CompactConfig {
             typed: config.typed_columns,
+            quiet: config.storage.compact_quiet,
             ..Default::default()
         },
-        active_hour,
+        (!writer_done).then(now_unix_secs),
     ) {
         Ok(r) if r.partitions_compacted > 0 => tracing::info!(
             partitions = r.partitions_compacted,
@@ -2290,7 +2445,7 @@ fn maintenance_pass(
         &config.store_dir(),
         &config.wal_dir(),
         catalog,
-        &rt.buckets,
+        &tenancy,
         rt.disk_budget_bytes,
         &rt.watermarks,
         now_unix_secs(),
@@ -2491,6 +2646,24 @@ fn trace_bytes(value: &str) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_store_in_the_old_layout_is_refused_with_the_migration_command() {
+        let dir = std::env::temp_dir().join(format!("logless-cli-old-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data/store/hour=2026-01-01T00/level=info")).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, format!("[storage]\ndata_dir = {:?}\n", dir.join("data"))).unwrap();
+        let err = load(&config).unwrap_err().to_string();
+        assert!(err.contains("old layout") && err.contains("logless migrate-layout --config"), "{err}");
+        // The migration itself, and a restore, read the config without that check.
+        assert!(load_any_layout(&config).is_ok());
+        // With the old directories gone the same config loads.
+        std::fs::remove_dir_all(dir.join("data/store/hour=2026-01-01T00")).unwrap();
+        std::fs::create_dir_all(dir.join("data/store/tenant=default/index=default")).unwrap();
+        assert!(load(&config).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_leading_severity() {

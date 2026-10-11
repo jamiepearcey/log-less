@@ -16,14 +16,14 @@
 //! is not log-less. This native path exists because OTLP cannot carry what a log-less hop needs:
 //!
 //! * the **event id**, so a retried batch is recognised and dropped (delivery is at-least-once);
-//! * the **observed time**, which partitions the store, so a replayed backlog lands in the hour it
-//!   happened and not the hour it arrived;
+//! * the **event time and the observed time** as the sender had them: the store is partitioned on the
+//!   event time, so a replayed backlog lands in the hour it happened and not the hour it arrived;
 //! * the **template id**, already mined by the sender.
 //!
 //! # Loops and provenance
 //!
-//! Every record carries two attributes. `logless.origin` is the instance that first sent it (set by the
-//! first sender, kept by every later hop) and `logless.hops` counts the hops since. A receiver refuses a
+//! Every record carries two attributes. `logless.origin` is the instance that first sent it (its node id,
+//! set by the first sender, kept by every later hop, and the row's `origin` column in the store) and `logless.hops` counts the hops since. A receiver refuses a
 //! record whose origin is itself (a cycle came back) or whose hops reached [`MAX_HOPS`], so a mis-wired
 //! ring stops after one lap instead of multiplying data. The attributes stay in the store, which also
 //! answers "which node produced this line" centrally.

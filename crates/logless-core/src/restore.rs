@@ -3,8 +3,13 @@
 //! Central keeps an edge's parts on its own disk (`<parts dir>/<node>/`, read here with [`DirSource`]) or
 //! in an S3-compatible bucket ([`S3Source`]), whichever `[peer.parts]` names (`crate::parts`). Either
 //! holds Parquet parts and nothing else: files named `<sha256 hex>.parquet`. This module lists them, fetches each one, checks it, and only then installs it under
-//! `<to>/store/hour=…/level=…/<name>.parquet`. A part that fails a check is never installed, and is reported
+//! `<to>/store/tenant=…/index=…/hour=…/level=…/node=…/<name>.parquet`. A part that fails a check is never installed, and is reported
 //! by name with the reason. Then the catalog and the template dictionary are rebuilt from what was installed.
+//!
+//! Where a part goes: the hour is the **event** hour of its rows (their `timestamp`), the level is the
+//! bucket of their severity under the part's index, and tenant, index and node are what the part's footer
+//! says it was written under (`logless.tenant`, `logless.index`, `logless.node`). A part whose footer does
+//! not say (written before those keys) goes under the target's own tenant, its default index and its node id.
 //!
 //! Checks per part, in this order:
 //! 1. SHA-256 of the bytes equals the name. This is the integrity check and needs no inventory.
@@ -28,7 +33,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sha2::{Digest, Sha256};
 
 use crate::catalog::{Catalog, TemplateSighting};
-use crate::config::LevelBuckets;
+use crate::config::Tenancy;
 use crate::drain::Template;
 use crate::model::Severity;
 use crate::parts::{self, valid_name};
@@ -289,7 +294,7 @@ pub struct Verified {
     pub rows: u64,
     pub bytes: u64,
     pub key: PartitionKey,
-    /// Rows of this part fall in more than one `(hour, level)` partition; the part is placed by its first row.
+    /// Rows of this part fall in more than one `(event hour, level)` partition; the part is placed by its first row.
     pub multi_partition: bool,
     derived: Derived,
 }
@@ -309,7 +314,7 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 }
 
 /// Checks one fetched file against its name and the inventory. Reads `path` only.
-pub fn verify_part(path: &Path, name: &str, expected: Option<Expected>, buckets: &LevelBuckets) -> Result<Verified, Problem> {
+pub fn verify_part(path: &Path, name: &str, expected: Option<Expected>, tenancy: &Tenancy) -> Result<Verified, Problem> {
     let actual = sha256_file(path).map_err(|e| Problem::Unreadable(e.to_string()))?;
     if actual != name.trim_end_matches(".parquet") {
         return Err(Problem::HashMismatch { actual });
@@ -328,6 +333,11 @@ pub fn verify_part(path: &Path, name: &str, expected: Option<Expected>, buckets:
             return Err(Problem::RowsMismatch { expected: e.rows, footer });
         }
     }
+    let [tenant, index, node] = crate::store::read_file_scope(path).map_err(|e| Problem::Unreadable(e.to_string()))?;
+    // A footer is data: a name that could not be a directory is not used as one.
+    let named = |value: Option<String>, fallback: &str| value.filter(|v| crate::partition::valid_ident(v)).unwrap_or_else(|| fallback.to_string());
+    let (tenant, index, node) = (named(tenant, tenancy.tenant()), named(index, tenancy.default_index()), named(node, tenancy.node()));
+    let buckets = tenancy.buckets(&tenant, &index).unwrap_or_else(|| tenancy.default_buckets());
     let reader = builder.build().map_err(|e| Problem::Unreadable(e.to_string()))?;
     let mut derived = Derived::default();
     let mut decoded = 0u64;
@@ -338,7 +348,7 @@ pub fn verify_part(path: &Path, name: &str, expected: Option<Expected>, buckets:
         let batch = batch.map_err(|e| Problem::Unreadable(e.to_string()))?;
         for r in crate::schema::from_record_batch(&batch) {
             decoded += 1;
-            let k = PartitionKey::from_nanos(r.observed_unix_nano, buckets.bucket_for(r.severity).name.clone());
+            let k = PartitionKey::new(&tenant, &index, r.timestamp_unix_nano / crate::partition::NANOS_PER_HOUR, &buckets.bucket_for(r.severity).name, &node);
             match &key {
                 None => key = Some(k),
                 Some(first) => multi |= *first != k,
@@ -364,7 +374,7 @@ pub fn verify_part(path: &Path, name: &str, expected: Option<Expected>, buckets:
     if decoded != footer {
         return Err(Problem::DecodedRowsMismatch { footer, decoded });
     }
-    let key = key.unwrap_or(PartitionKey { epoch_hour: 0, bucket: buckets.bucket_for(Severity(0)).name.clone() });
+    let key = key.unwrap_or_else(|| PartitionKey::new(&tenant, &index, 0, &buckets.bucket_for(Severity(0)).name, &node));
     Ok(Verified { rows: footer, bytes, key, multi_partition: multi, derived })
 }
 
@@ -427,7 +437,9 @@ pub enum RestoreError {
 pub struct Options<'a> {
     pub to: &'a Path,
     pub inventory: Option<BTreeMap<String, Expected>>,
-    pub buckets: &'a LevelBuckets,
+    /// The target's tenants and indexes: the buckets a part's level directory is chosen from, and where a part
+    /// that does not name its tenant, index or node is placed.
+    pub tenancy: &'a Tenancy,
     /// Install into a non-empty target (existing store files stay; same-named parts are replaced).
     pub force: bool,
     /// After installing, hash every installed file again and compare the catalog with the report.
@@ -476,7 +488,7 @@ pub fn restore(source: &dyn PartSource, opts: &Options) -> Result<Report, Restor
                 continue;
             }
         }
-        match verify_part(&tmp, name, expected, opts.buckets) {
+        match verify_part(&tmp, name, expected, opts.tenancy) {
             Ok(v) => {
                 let dir = v.key.dir(&store_dir);
                 fs::create_dir_all(&dir)?;
@@ -595,8 +607,8 @@ mod tests {
     }
 
     fn run(f: &Fixture, inventory: Option<BTreeMap<String, Expected>>) -> Report {
-        let buckets = LevelBuckets::default();
-        restore(&DirSource(f.bucket.clone()), &Options { to: &f.to, inventory, buckets: &buckets, force: false, reverify: true }).unwrap()
+        let tenancy = Tenancy::default();
+        restore(&DirSource(f.bucket.clone()), &Options { to: &f.to, inventory, tenancy: &tenancy, force: false, reverify: true }).unwrap()
     }
 
     #[test]
@@ -617,10 +629,39 @@ mod tests {
         let files = crate::store::list_parquet_files(&f.to.join("store"));
         assert_eq!(files.len(), 3);
         assert!(files.iter().any(|p| p.to_string_lossy().contains("level=warn_plus")));
+        // These parts were written outside a tree, so they name no tenant, index or node: the target's own.
+        assert!(files.iter().all(|p| p.starts_with(f.to.join("store/tenant=default/index=default")) && p.parent().unwrap().ends_with("node=node-a")), "{files:?}");
         let cat = Catalog::open(&f.to.join("catalog.sqlite")).unwrap();
         let t = cat.load_templates().unwrap();
         assert_eq!(t.iter().map(|t| (t.id, t.count)).collect::<Vec<_>>(), vec![(1, 20), (2, 20), (3, 25)]);
         assert!(!f.to.join(TMP_DIR).exists());
+    }
+
+    #[test]
+    fn a_part_goes_to_the_hour_of_its_events_under_the_tenant_index_and_node_its_footer_names() {
+        // An edge's own file: written in its tree for a replay (event hour 500, observed in hour 900), then
+        // uploaded, which keeps only the bytes and renames them to their hash.
+        let tmp = tempfile::tempdir().unwrap();
+        let bucket = tmp.path().join("bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let mut rows: Vec<_> = (0..10).map(|i| record(500, i, Severity::INFO, Some(1), "api")).collect();
+        for r in &mut rows {
+            r.observed_unix_nano = 900 * 3600 * 1_000_000_000;
+        }
+        let at_edge = PartitionKey::new("acme", "payments", 500, "info", "edge-1").dir(&tmp.path().join("edge")).join("s1.parquet");
+        crate::store::write_partition_file(&at_edge, &rows).unwrap();
+        let name = format!("{}.parquet", sha256_file(&at_edge).unwrap());
+        fs::rename(&at_edge, bucket.join(&name)).unwrap();
+
+        let to = tmp.path().join("restored");
+        let tenancy = Tenancy::default();
+        let r = restore(&DirSource(bucket), &Options { to: &to, inventory: None, tenancy: &tenancy, force: false, reverify: true }).unwrap();
+        assert!(r.ok(), "{r:?}");
+        let files = crate::store::list_parquet_files(&to.join("store"));
+        assert_eq!(files, vec![to.join("store/tenant=acme/index=payments/hour=1970-01-21T20/level=info/node=edge-1").join(&name)]);
+        let cat = Catalog::open(&to.join("catalog.sqlite")).unwrap();
+        let f = &cat.list_files().unwrap()[0];
+        assert_eq!((f.key.epoch_hour, f.stats.min_observed_nanos / 3_600_000_000_000), (500, 900));
     }
 
     #[test]
@@ -715,8 +756,8 @@ mod tests {
         assert_eq!(4, read_inventory(&catalog, None).unwrap().len());
         let inventory = read_inventory(&catalog, Some("edge-a")).unwrap();
         assert_eq!(inventory, self::inventory(&f));
-        let buckets = LevelBuckets::default();
-        let run = |to: &Path, inventory| restore(&DirSource(parts_dir.join("edge-a")), &Options { to, inventory: Some(inventory), buckets: &buckets, force: false, reverify: true }).unwrap();
+        let tenancy = Tenancy::default();
+        let run = |to: &Path, inventory| restore(&DirSource(parts_dir.join("edge-a")), &Options { to, inventory: Some(inventory), tenancy: &tenancy, force: false, reverify: true }).unwrap();
         let r = run(&f.to, inventory.clone());
         assert!(r.ok(), "{r:?}");
         assert_eq!((3, 3, 75, 1, 0), (r.listed, r.restored, r.rows, r.ignored_keys, r.missing.len()));
@@ -733,8 +774,8 @@ mod tests {
     fn refuses_a_target_that_already_holds_a_store() {
         let f = fixture();
         run(&f, None);
-        let buckets = LevelBuckets::default();
-        let err = restore(&DirSource(f.bucket.clone()), &Options { to: &f.to, inventory: None, buckets: &buckets, force: false, reverify: false });
+        let tenancy = Tenancy::default();
+        let err = restore(&DirSource(f.bucket.clone()), &Options { to: &f.to, inventory: None, tenancy: &tenancy, force: false, reverify: false });
         assert!(matches!(err, Err(RestoreError::Refused(_))));
     }
 

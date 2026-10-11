@@ -20,9 +20,17 @@ use crate::model::LogRecord;
 use crate::schema;
 use crate::typed::{self, TypedColumn, TypedLayout};
 
-/// Rows per row group. Small enough that statistics prune usefully on a
-/// time-bounded query, large enough that dictionary encoding still pays.
-const ROW_GROUP_ROWS: usize = 64 * 1024;
+/// Rows per row group. Small relative to an hour's partition, so min/max
+/// statistics on the sorted `service` (and what clusters behind it) prune
+/// inside a file; ADR 0002 measured +2.7% bytes against 64k and 3.4x fewer
+/// bytes read for a template or service filter.
+pub const ROW_GROUP_ROWS: usize = 8 * 1024;
+
+/// Footer keys naming where a file was written, so a file moved out of the
+/// tree (an uploaded part) still says which tenant, index and node it is from.
+pub const META_TENANT: &str = "logless.tenant";
+pub const META_INDEX: &str = "logless.index";
+pub const META_NODE: &str = "logless.node";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -48,6 +56,10 @@ pub enum StoreError {
 pub struct FileStats {
     pub rows: u64,
     pub bytes: u64,
+    /// Event time (`timestamp`): what the partition is cut on and what a
+    /// time-range query prunes by.
+    pub min_ts_nanos: i64,
+    pub max_ts_nanos: i64,
     pub min_observed_nanos: i64,
     pub max_observed_nanos: i64,
 }
@@ -77,6 +89,17 @@ pub fn write_partition_file_with(
     records: &[LogRecord],
     layout: &TypedLayout,
 ) -> Result<FileStats, StoreError> {
+    write_partition_file_sized(path, records, layout, ROW_GROUP_ROWS)
+}
+
+/// [`write_partition_file_with`] with the row-group size given: for
+/// measuring a layout against another, never for the store itself.
+pub fn write_partition_file_sized(
+    path: &Path,
+    records: &[LogRecord],
+    layout: &TypedLayout,
+    row_group_rows: usize,
+) -> Result<FileStats, StoreError> {
     let io = |p: &Path| {
         let p = p.to_path_buf();
         move |source| StoreError::Io { path: p.clone(), source }
@@ -87,7 +110,10 @@ pub fn write_partition_file_with(
     }
     let tmp = path.with_extension("parquet.tmp");
 
-    let batch = schema::to_record_batch(records, layout)?;
+    // The path is the authority on whose file this is; outside the tree
+    // (a scratch file) there is no writer to name.
+    let key = crate::partition::key_of_path(path);
+    let batch = schema::to_record_batch_from(records, layout, key.as_ref().map(|k| k.node.as_str()))?;
     let file_typed: Vec<TypedColumn> = layout
         .columns()
         .iter()
@@ -99,6 +125,11 @@ pub fn write_partition_file_with(
         "logless.schema_version".to_string(),
         schema::SCHEMA_VERSION.to_string(),
     )];
+    if let Some(key) = &key {
+        for (name, value) in [(META_TENANT, &key.tenant), (META_INDEX, &key.index), (META_NODE, &key.node)] {
+            kv.push(KeyValue::new(name.to_string(), value.clone()));
+        }
+    }
     if !file_typed.is_empty() {
         // For readers that never look at the embedded Arrow schema: the
         // column → key → type map, plus the service charged for it.
@@ -114,7 +145,7 @@ pub fn write_partition_file_with(
         ))
         .set_dictionary_enabled(true)
         .set_statistics_enabled(EnabledStatistics::Chunk)
-        .set_max_row_group_row_count(Some(ROW_GROUP_ROWS))
+        .set_max_row_group_row_count(Some(row_group_rows))
         .set_key_value_metadata(Some(kv));
 
     // Timestamps are near-monotonic 64-bit integers, which is the case
@@ -188,34 +219,49 @@ pub fn read_file_stats(path: &Path) -> Result<FileStats, StoreError> {
     let meta = builder.metadata();
     let rows = meta.file_metadata().num_rows().max(0) as u64;
 
-    let mut min = i64::MAX;
-    let mut max = i64::MIN;
+    // (min, max) of `timestamp` then of `observed`, over every row group.
+    let mut range = [(i64::MAX, i64::MIN); 2];
     for rg in meta.row_groups() {
         for col in rg.columns() {
-            if col.column_path().string() != "observed" {
-                continue;
-            }
+            let which = match col.column_path().string().as_str() {
+                "timestamp" => 0,
+                "observed" => 1,
+                _ => continue,
+            };
             if let Some(Statistics::Int64(s)) = col.statistics() {
                 if let Some(v) = s.min_opt() {
-                    min = min.min(*v);
+                    range[which].0 = range[which].0.min(*v);
                 }
                 if let Some(v) = s.max_opt() {
-                    max = max.max(*v);
+                    range[which].1 = range[which].1.max(*v);
                 }
             }
         }
     }
-    if rows == 0 || min > max {
-        min = 0;
-        max = 0;
+    for r in &mut range {
+        if rows == 0 || r.0 > r.1 {
+            *r = (0, 0);
+        }
     }
 
     Ok(FileStats {
         rows,
         bytes,
-        min_observed_nanos: min,
-        max_observed_nanos: max,
+        min_ts_nanos: range[0].0,
+        max_ts_nanos: range[0].1,
+        min_observed_nanos: range[1].0,
+        max_observed_nanos: range[1].1,
     })
+}
+
+/// The `(tenant, index, node)` a file's footer says it was written under, each
+/// `None` for a file that does not say (one written outside the tree).
+pub fn read_file_scope(path: &Path) -> Result<[Option<String>; 3], StoreError> {
+    let file = File::open(path).map_err(|source| StoreError::Io { path: path.to_path_buf(), source })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|source| StoreError::Parquet { path: path.to_path_buf(), source })?;
+    let kv = builder.metadata().file_metadata().key_value_metadata();
+    Ok([META_TENANT, META_INDEX, META_NODE].map(|name| kv.and_then(|kv| kv.iter().find(|e| e.key == name)).and_then(|e| e.value.clone())))
 }
 
 /// The typed columns a file declares in its footer (`logless.typed_columns`).
@@ -340,16 +386,24 @@ mod tests {
     #[test]
     fn writes_and_reports_stats_from_the_footer() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp
-            .path()
-            .join("hour=1970-01-01T00/level=info")
+        let path = crate::partition::PartitionKey::at(0, "info")
+            .dir(tmp.path())
             .join(file_name_for_segment(1, uuid::Uuid::now_v7()));
 
-        let written = write_partition_file(&path, &records(1000, 5_000)).unwrap();
+        let mut recs = records(1000, 5_000);
+        for r in &mut recs {
+            r.observed_unix_nano += 7_000_000;
+        }
+        let written = write_partition_file(&path, &recs).unwrap();
         assert_eq!(written.rows, 1000);
-        assert_eq!(written.min_observed_nanos, 5_000);
-        assert_eq!(written.max_observed_nanos, 5_999);
+        assert_eq!((written.min_ts_nanos, written.max_ts_nanos), (5_000, 5_999), "event time");
+        assert_eq!((written.min_observed_nanos, written.max_observed_nanos), (7_005_000, 7_005_999));
         assert!(written.bytes > 0);
+        // A file in the tree says whose it is; one outside it does not.
+        assert_eq!(read_file_scope(&path).unwrap(), [Some("default".to_string()), Some("default".to_string()), Some("node-a".to_string())]);
+        let loose = tmp.path().join("p/loose.parquet");
+        write_partition_file(&loose, &recs).unwrap();
+        assert_eq!(read_file_scope(&loose).unwrap(), [None, None, None]);
 
         // The point of the footer round trip: the catalog can be rebuilt from it.
         assert_eq!(read_file_stats(&path).unwrap(), written);
@@ -388,7 +442,7 @@ mod tests {
     #[test]
     fn cleans_temp_files_left_by_a_crash() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("hour=1970-01-01T00/level=info");
+        let dir = crate::partition::PartitionKey::at(0, "info").dir(tmp.path());
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("s000000000009.parquet.tmp"), b"partial").unwrap();
         write_partition_file(&dir.join("s000000000001.parquet"), &records(5, 0)).unwrap();
@@ -448,6 +502,17 @@ mod tests {
         // Without a layout nothing is declared.
         write_partition_file(&path, &recs).unwrap();
         assert!(read_typed_columns(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn row_groups_hold_eight_thousand_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("p/s000000000001.parquet");
+        write_partition_file(&path, &records(20_000, 0)).unwrap();
+        let file = File::open(&path).unwrap();
+        let meta = ParquetRecordBatchReaderBuilder::try_new(file).unwrap().metadata().clone();
+        let sizes: Vec<i64> = meta.row_groups().iter().map(|g| g.num_rows()).collect();
+        assert_eq!(sizes, vec![8192, 8192, 3616]);
     }
 
     #[test]

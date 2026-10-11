@@ -74,6 +74,11 @@ Durations are integer seconds or milliseconds as named.
 }
 ```
 
+`retention` is the level buckets of **the default index of the instance's own tenant** (`[[tenants.indexes]]` named
+`default`, or the first one). A single-tenant install has no other. The buckets of any other index or tenant are set in the
+config file (`[[tenants.indexes.retention]]`) and are not part of this document; previews and the maintenance pass apply
+them as the file has them, alongside the document's.
+
 Validation (each problem carries the `path` that breaks it):
 
 * `retention`: at least one bucket, listed in strictly ascending
@@ -162,12 +167,17 @@ All under `/admin/v1`.
 {"version", "started_at_ms", "uptime_secs",
  "listeners": [{"kind", "addr"}],
  "disk": {"used_bytes", "budget_bytes", "fraction", "pressure"},
- "ingest": {"received", "written", "dropped_by_class": {"debug", "info", "critical", "closed", "refused_debug_pressure"}},
+ "ingest": {"received", "written", "dropped_by_class": {"debug", "info", "critical", "closed", "refused_debug_pressure"},
+            "unknown_index": {"defaulted", "refused"}},
+ "node": {"id", "tenant", "default_index", "indexes": [{"tenant", "index"}]},
  "store": {"files", "rows", "bytes"}}
 ```
 
-`written` is records synced to the WAL. `pressure` is `normal`, `high` or
-`critical` against the live watermarks.
+`written` is records synced to the WAL (the main one and the late spool together). `pressure` is `normal`, `high` or
+`critical` against the live watermarks. `unknown_index` counts records that named an index their tenant does not have:
+`defaulted` went to the default index, `refused` were not stored (`unknown_index` in `[[tenants]]`); neither is in
+`received`. `node` is this instance's place in the store's tree: the `node=` it writes, the tenant it writes under, and
+every index it is configured with.
 
 ### `GET /typed-columns`
 
