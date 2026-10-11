@@ -40,6 +40,11 @@ jobs:
       - name: Storm harness
         run: ./scripts/storm.sh 10000 10 512
 
+      # A HEC 200 means queued, not durable, so a fixture that stops the agent
+      # on the last 200 reports its own timing as loss (docs/evidence/spike-drain.md).
+      - name: Spike drain check
+        run: LOGLESS_BIN=./target/release/logless ./scripts/spike-drain-check.sh 100000 0
+
       # ENOSPC arrives one write at a time, so the agent keeps running with
       # some subsystems failing and others fine — the case where a component
       # swallows an error and reports success. Skips itself if it cannot get a
