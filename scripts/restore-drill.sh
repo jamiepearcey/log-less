@@ -186,6 +186,7 @@ wait_http "http://127.0.0.1:$CENTRAL_ADMIN/" 30 || { echo "central did not start
 OTLP_PORT=$(free_port); EDGE_ADMIN=$(free_port); EDGE_TOKEN="$(rand 24)"
 mkdir -p "$R/edge"; : > "$R/edge/empty.log"
 render_config "$R/edge/data" "
+node|id|\"$NODE\"
 storage|wal_segment_bytes|131072
 otlp|enabled|true
 otlp|addr|\"127.0.0.1:$OTLP_PORT\"
@@ -322,13 +323,16 @@ send_batches 1000000 "$N_TAIL" tail
 check "tail: batches after the last upload answered 200" "$(eq $? 0)" "$N_TAIL records acknowledged, none uploaded"
 kill -KILL "$EDGE_PID" 2>/dev/null; wait "$EDGE_PID" 2>/dev/null
 # What an intact disk would still hold: the WAL replayed offline (this is the "WAL tail on the edge" half of the RPO).
-WAL_TAIL=$("$LOGLESS_BIN" recover --config "$R/edge/config.toml" 2>&1 | sed -nE 's/.*records=([0-9]+).*/\1/p' | head -1)
+WAL_TAIL=$("$LOGLESS_BIN" recover --config "$R/edge/config.toml" 2>&1 | sed -nE 's/.*records=([0-9]+).*/\1/p' | awk '{s += $1} END {print s + 0}')   # the WAL and the late spool
 log "edge killed with SIGKILL after $N_TAIL acknowledged records that were never uploaded; its WAL replays $WAL_TAIL records"
 
 # --- keep the inventory (central's peer_parts), destroy the edge -------------------------------------------------
 sqlite3 "$R/central/data/catalog.sqlite" ".backup '$R/inventory.sqlite'"
 INV_N=$(sqlite3 "$R/inventory.sqlite" "select count(*) from peer_parts"); INV_ROWS=$(sqlite3 "$R/inventory.sqlite" "select sum(rows) from peer_parts")
 check "inventory (central peer_parts) matches the stored parts" "$( [ "$INV_N" = "$N_OBJ" ] && [ "$INV_ROWS" = "$BEFORE_ROWS" ] && echo 1 || echo 0)" "peer_parts rows=$INV_N, sum(rows)=$INV_ROWS"
+# Where each file was, as "<tenant=/index=/hour=/level=/node= directory> <sha256>": a restore must put it back there.
+places() { (cd "$1" && find . -name '*.parquet' | sed 's|^\./||' | while read -r f; do echo "$(dirname "$f") $2$(shasum -a 256 "$f" | cut -d' ' -f1)"; done | sort); }
+EDGE_PLACES=$(places "$R/edge/data/store" "")
 rm -rf "$R/edge/data"
 check "edge data directory destroyed" "$(eq "$([ -e "$R/edge/data" ] && echo present || echo gone)" gone)" "removed $R/edge/data"
 
@@ -356,6 +360,11 @@ check "case 1: per-template row counts identical" "$(eq "$(cat "$R/before.tpl")"
 check "case 1: per-(template,service) row counts identical" "$(eq "$(cat "$R/before.pair")" "$(cat "$R/after.pair")")" "$(wc -l < "$R/after.pair" | tr -d ' ') groups"
 check "case 1: catalog templates (id,count) identical" "$(eq "$(cat "$R/before.cat")" "$(cat "$R/after.cat")")" "$(wc -l < "$R/after.cat" | tr -d ' ') templates"
 check "case 1: dictionary (template_id,service) keys identical" "$(eq "$(cat "$R/before.dict")" "$(cat "$R/after.dict")")" "$(wc -l < "$R/after.dict" | tr -d ' ') keys (dictionary text differs by design: exemplar, not mined)"
+RESTORED_PLACES=$(places "$R/restored1/store" "")
+check "case 1: every part is back in the directory it was written in" "$( [ "$RESTORED_PLACES" = "$EDGE_PLACES" ] && [ "$(echo "$EDGE_PLACES" | grep -c "^tenant=default/index=default/hour=[^/]*/level=[^/]*/node=$NODE ")" = "$EDGE_FILES" ] && echo 1 || echo 0)" \
+  "$(echo "$RESTORED_PLACES" | cut -d' ' -f1 | sort -u | wc -l | tr -d ' ') directories, $(echo "$RESTORED_PLACES" | grep -c .) files under tenant=default/index=default/hour=<event hour>/level=/node=$NODE"
+CAT_KEYS=$(sqlite3 "$R/restored1/catalog.sqlite" "select count(*) from files where tenant = 'default' and idx = 'default' and node = '$NODE' and min_ts / 3600000000000 = event_hour and max_ts / 3600000000000 = event_hour")
+check "case 1: catalog rows carry tenant, index, node and the event hour of their rows" "$(eq "$CAT_KEYS" "$EDGE_FILES")" "rows whose event-time range lies in their event_hour: $CAT_KEYS of $EDGE_FILES"
 CAT_FILES=$(sqlite3 "$R/restored1/catalog.sqlite" "select count(*), sum(rows) from files" | tr '|' ' ')
 check "case 1: rebuilt catalog files table matches" "$(eq "$CAT_FILES" "$EDGE_FILES $BEFORE_ROWS")" "files, rows = $CAT_FILES"
 check "RPO: records acknowledged after the last upload are not in the restore" "$( [ "$C1_ROWS" = "$BEFORE_ROWS" ] && [ "$(total_rows "$R/restored1/store")" = "$N_RECORDS" ] && echo 1 || echo 0)" \
