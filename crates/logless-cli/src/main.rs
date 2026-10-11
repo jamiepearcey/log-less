@@ -2648,6 +2648,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_store_in_the_old_layout_is_refused_with_the_migration_command() {
+        let dir = std::env::temp_dir().join(format!("logless-cli-old-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data/store/hour=2026-01-01T00/level=info")).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, format!("[storage]\ndata_dir = {:?}\n", dir.join("data"))).unwrap();
+        let err = load(&config).unwrap_err().to_string();
+        assert!(err.contains("old layout") && err.contains("logless migrate-layout --config"), "{err}");
+        // The migration itself, and a restore, read the config without that check.
+        assert!(load_any_layout(&config).is_ok());
+        // With the old directories gone the same config loads.
+        std::fs::remove_dir_all(dir.join("data/store/hour=2026-01-01T00")).unwrap();
+        std::fs::create_dir_all(dir.join("data/store/tenant=default/index=default")).unwrap();
+        assert!(load(&config).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn parses_leading_severity() {
         assert_eq!(parse_line("ERROR\tboom").severity, Severity::ERROR);
         assert_eq!(parse_line("ERROR\tboom").body, "boom");

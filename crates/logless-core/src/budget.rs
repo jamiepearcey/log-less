@@ -353,6 +353,72 @@ mod tests {
     }
 
     #[test]
+    fn a_replay_of_old_rows_lands_by_event_hour_and_retention_takes_exactly_what_is_past_its_horizon() {
+        // The whole path: the split WAL, the merge of both logs, then a maintenance pass's expiry.
+        use crate::model::LogRecord;
+        use std::time::Duration;
+        const HOUR: u64 = 3600;
+        let tmp = tempfile::tempdir().unwrap();
+        let (wal_dir, store) = (tmp.path().join("wal"), tmp.path().join("store"));
+        let late_dir = wal::late_dir_beside(&wal_dir);
+        let now_hour = 1_000_000u64;
+        let now = now_hour * HOUR + 60;
+        let rows = |hours_ago: u64, n: u64, sev: Severity, tag: &str| -> Vec<LogRecord> {
+            (0..n)
+                .map(|i| {
+                    let mut r = LogRecord::new(((now_hour - hours_ago) * HOUR + i) * 1_000_000_000, sev, format!("{tag} {i}"));
+                    r.observed_unix_nano = now * 1_000_000_000;
+                    r
+                })
+                .collect()
+        };
+        // Default buckets: debug 1 day, info 7 days, warn_plus 30 days. Everything arrives now.
+        let mut batch = rows(0, 100, Severity::INFO, "live");
+        batch.extend(rows(10 * 24, 60, Severity::INFO, "info 10d old: past 7d"));
+        batch.extend(rows(3 * 24, 40, Severity::INFO, "info 3d old: kept"));
+        batch.extend(rows(3 * 24, 30, Severity::DEBUG, "debug 3d old: past 1d"));
+        batch.extend(rows(20 * 24, 20, Severity::WARN, "warn 20d old: kept"));
+        let config = wal::SplitConfig {
+            segment_bytes: 1 << 30,
+            fsync_interval: Duration::from_secs(60),
+            fsync_bytes: 1 << 30,
+            late_threshold: Duration::from_secs(2 * HOUR),
+            late_roll: Duration::from_secs(1800),
+            late_segment_bytes: 1 << 30,
+        };
+        let mut w = wal::SplitWal::open(&wal_dir, &late_dir, &config).unwrap();
+        w.append(&batch, now * 1_000_000_000).unwrap();
+        assert_eq!((w.records_written(), w.late_records), (250, 150), "every replayed row took the late spool");
+        drop(w);
+
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let tenancy = Tenancy::default();
+        let mut drain = crate::drain::Drain::default();
+        for dir in [&wal_dir, &late_dir] {
+            crate::merge::merge_all(dir, &store, &mut cat, &tenancy, &mut drain, &Default::default(), None, now).unwrap();
+        }
+        let placed: Vec<(u64, String, u64)> = cat.list_files().unwrap().iter().map(|f| (now_hour - f.key.epoch_hour, f.key.bucket.clone(), f.stats.rows)).collect();
+        assert_eq!(
+            placed,
+            vec![(480, "warn_plus".into(), 20), (240, "info".into(), 60), (72, "debug".into(), 30), (72, "info".into(), 40), (0, "info".into(), 100)],
+            "(hours before now, level, rows): each row is in the hour it happened"
+        );
+
+        let pass = |cat: &mut Catalog| expire_and_relieve(&store, &wal_dir, cat, &tenancy, u64::MAX, &Watermarks::default(), now, &PinSet::default());
+        let out = pass(&mut cat);
+        let expired: Vec<(u64, &str)> = out.expiry.expired.iter().map(|e| (now_hour - e.key.epoch_hour, e.key.bucket.as_str())).collect();
+        assert_eq!(expired, vec![(240, "info"), (72, "debug")], "the two partitions past their bucket's retention, and no other");
+        assert!(out.reclaim.is_none(), "no disk pressure: nothing else was touched");
+        assert_eq!(cat.totals().unwrap().0, 160, "250 rows less the 60 and the 30");
+        assert_eq!(cat.file_count().unwrap(), 3);
+        let left = crate::scan::scan(&store, &crate::scan::Query { limit: 1000, ..Default::default() }).unwrap();
+        assert_eq!(left.records.len(), 160);
+        assert!(left.records.iter().all(|r| !r.body.contains("past")), "what is left is what its policy keeps");
+        // The next pass has nothing more to expire.
+        assert!(pass(&mut cat).expiry.expired.is_empty());
+    }
+
+    #[test]
     fn pressure_thresholds() {
         const W: Watermarks = Watermarks { high: 0.80, critical: 0.95, reclaim_target: 0.70 };
         let u = |used: u64| DiskUsage {
