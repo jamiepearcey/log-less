@@ -7,11 +7,11 @@ Plane item 119. This page records the decisions and describes `logless restore`.
 
 | Question | Decision |
 |---|---|
-| Durability target | The object store is the replica of an edge's committed data, reached by the parts path (`docs/peer-sync.md`, `crate::parts`). An edge's data directory is rebuildable from the bucket. |
+| Durability target | Central's part store is the replica of an edge's committed data, reached by the parts path (`docs/peer-sync.md`, `crate::parts`). It is central's own disk or an S3-compatible bucket, whichever `[peer.parts]` configures (ADR 0003, which also says what each survives). An edge's data directory is rebuildable from it. "Bucket" below means either. |
 | RPO | Everything in a part that was uploaded, plus whatever is still in the edge's own WAL on a surviving disk. Records accepted after the last upload and lost with the disk are not recoverable from the bucket. The bound is "what the edge accepted since its last upload", which is the operator's upload cadence; there is no automatic cadence yet. |
 | RTO | Measured, not promised. See the evidence file for the numbers and what they do and do not cover. |
 | Integrity | A part is named by the SHA-256 of its bytes. The restore recomputes it, so a flipped byte is detected without any inventory. |
-| Completeness | Needs an inventory: central's `peer_parts` table (`--inventory <central catalog.sqlite>`). A bucket cannot say what it used to hold, so a part deleted from the bucket is only detectable against the inventory. Without `--inventory` the restore says `inventory=none` and cannot report missing parts. |
+| Completeness | Needs an inventory: central's `peer_parts` table (`--inventory <central catalog.sqlite>`, with `--node <id>` when central catalogues more than one node). A bucket or a directory cannot say what it used to hold, so a part deleted from the bucket is only detectable against the inventory. Without `--inventory` the restore says `inventory=none` and cannot report missing parts. |
 | Failure policy | A part that fails any check is not installed, is named in the output with the reason, and the exit status is 1. The other parts are still restored, so a partial restore is usable, and the exit status says it is partial. |
 
 ### Alternatives rejected
@@ -35,10 +35,20 @@ Plane item 119. This page records the decisions and describes `logless restore`.
 ## `logless restore`
 
 ```text
-logless restore --from s3://<bucket>/<prefix>/<node> --endpoint http://host:port --to <data dir> \
-                [--inventory <central catalog.sqlite>] [--config <edge config>] [--verify] [--force] [--report-json <file>]
-logless restore --from <directory of <sha256>.parquet files> --to <data dir> ...
+logless restore --from <central data dir>/parts/<node> --to <data dir> \
+                [--inventory <central catalog.sqlite>] [--node <node>] [--config <edge config>] [--verify] [--force] [--report-json <file>]
+logless restore --from s3://<bucket>/<prefix>/<node> --endpoint http://host:port --to <data dir> ...
 ```
+
+The first form is the local backend: a node's directory under central's parts directory (any directory of
+`<sha256>.parquet` files works, so a copy of it does too). It is read in place and never written; files that are not
+parts, such as an upload in flight, are counted as `ignored_keys`. The second form is a bucket. `--node` takes only
+that node's rows from the inventory: the catalog is keyed `(node, name)`, and without it every other node's parts
+would be reported missing.
+
+Not built: restoring over the network from a local-backend central. Central serves its parts directory read-only over
+S3 (`docs/peer-sync.md`), but `logless restore` reads S3 with presigned GETs and that endpoint accepts only
+header-signed requests. Run the restore where the directory is readable, or copy the node's directory first.
 
 Credentials for `s3://` come from `LOGLESS_S3_ACCESS_KEY_ID` and `LOGLESS_S3_SECRET_ACCESS_KEY` (never flags, so they
 do not reach `ps`). Reads use presigned GETs; listing is `ListObjectsV2` under the prefix, with pagination. Keys that are

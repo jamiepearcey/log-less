@@ -3,9 +3,15 @@
 Status: accepted, 2026-10-11 (Plane item 118). Builds on the cold-path parts upload (`docs/peer-sync.md`,
 "Uploading Parquet parts") and `docs/evidence/parts-minio.md`.
 
+Since ADR 0003 (`0003-parts-push-to-central-local-backend.md`) central keeps parts on its own disk by default and in
+an S3-compatible bucket when configured. Everything decided here holds for both: read "object" as the file
+`<dir>/<node>/<name>` or the object `<prefix>/<node>/<name>`, and "bucket" as either store. Where the two differ it is
+said below.
+
 ## Context
 
-Edges upload finished Parquet files ("parts") to central's object storage through presigned URLs. As built before
+Edges upload finished Parquet files ("parts") to central's object storage through presigned URLs (the only backend
+when this was written; see the note above). As built before
 this decision, every edge shared one prefix and one bearer token, the catalog row was keyed by the part name alone,
 central never changed or removed a part, and nothing said who may expire one. Three questions were open: who owns a
 part's key space, who controls its lifecycle (central or the edge), and what retention tiers exist.
@@ -13,7 +19,7 @@ part's key space, who controls its lifecycle (central or the edge), and what ret
 ## Decision
 
 1. **Central owns the catalog and the lifecycle; an edge owns only writes under its own prefix.**
-   * A part's key is `<prefix>/<node>/<name>`. `<node>` is the id of the `[[peer.nodes]]` entry whose token
+   * A part's key is `<prefix>/<node>/<name>` (on the local backend the path `<dir>/<node>/<name>`). `<node>` is the id of the `[[peer.nodes]]` entry whose token
      authenticated the request. Central builds the key; no request field chooses it. A request that names another
      node is 403 `foreign_prefix`; a name that is not `<64 hex>.parquet` (so `../`, `/`, `%2F`, `?` and the like) is
      422 `bad_name`; a shared `[peer] tokens` token owns no prefix and gets 403 `no_node` on the parts paths.
@@ -45,7 +51,9 @@ part's key space, who controls its lifecycle (central or the edge), and what ret
   to be copied to every edge. Central already holds the credentials and the catalog; the edge keeps no cloud keys.
 * **Bucket lifecycle rules only** (S3 expiration by age). Rejected as the sole mechanism: it cannot tell warm from
   cold, would leave the catalog pointing at objects that no longer exist, and cannot audit. It is still a good
-  backstop for orphans (objects with no catalog row), which this sweep deliberately never touches.
+  backstop for orphans (objects with no catalog row), which this sweep deliberately never touches. The local backend
+  has no such backstop: an uploaded part nobody committed stays on central's disk until someone removes it (ADR 0003,
+  "Not built").
 * **One shared token, node id taken from the request body.** Rejected: ownership would be a claim, not a fact. The
   token is the only identity central can check, so the node comes from it and the body is only compared.
 * **Node id derived from the existing `origin` field.** Rejected: `origin` is the edge's self-reported instance id
