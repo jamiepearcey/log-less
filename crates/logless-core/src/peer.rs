@@ -846,7 +846,8 @@ impl Handler for PeerHandler {
         let (counted, ingest) = match (head.method, head.path) {
             (Method::Get, CAPABILITY_PATH) => (false, false),
             (Method::Post, INGEST_PATH) => (true, true),
-            (Method::Post, crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH) => (true, false),
+            // Parts take the same Content-Type rule as ingest: a typeless POST is a blind cross-site write.
+            (Method::Post, crate::parts::PRESIGN_PATH | crate::parts::COMMIT_PATH) => (true, true),
             _ => return None,
         };
         let refused = self.refuse_head(head, ingest);

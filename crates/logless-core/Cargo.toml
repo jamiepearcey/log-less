@@ -20,7 +20,6 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tiny_http = "0.12"
 tracing.workspace = true
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 uuid.workspace = true

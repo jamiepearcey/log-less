@@ -229,7 +229,9 @@ url_ttl_secs = 900                                # how long an upload URL works
 ```
 
 The capability document says `parts: true` only when this is enabled and complete; an incomplete table is logged (not
-the secret) and the endpoints answer 404. Both endpoints take the same bearer token and body limits as `/v1/ingest`.
+the secret) and the endpoints answer 404. Both endpoints take the same bearer token, body limits and `Content-Type` rule
+as `/v1/ingest`: the body is JSON sent as `application/json` (the edge does), and a request with no `Content-Type` or a
+form or text one is a 415 before it is read, so a web page cannot post here without a preflight.
 
 | Step | Request | Central does |
 |---|---|---|
