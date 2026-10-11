@@ -133,11 +133,11 @@ presign, not by the bearer token. Every row is new code with a new test; all wer
 | No token, a mangled token, two token headers | 403 `bad_token` from the head; body unread | `parts::tests::a_local_upload_with_the_wrong_bytes_or_the_wrong_length_stores_nothing` |
 | Expired token | 403 `token_expired` | `parts::tests::an_upload_token_is_good_for_one_node_one_name_one_size_and_a_while` |
 | Token replayed for another name, for another node's directory, with its size or expiry edited, or signed by another central (or this one before a restart) | 403 `bad_token`: the HMAC covers node, name, size and expiry, compared in constant time before the expiry is looked at | same test |
-| Token replayed for its own part | allowed until it expires: the same bytes to the same place, stored once (`already_present`). Other bytes are refused | `parts::tests::a_duplicate_local_upload_is_checked_and_changes_nothing` |
+| Token replayed for its own part | allowed until it expires: the same bytes to the same place, stored once (`already_present`). Other bytes are refused; while one copy is still arriving, the others are 409 `upload_in_progress` and reserve nothing | `parts::tests::a_duplicate_local_upload_is_checked_and_changes_nothing` |
 | The right size, other bytes | read to the end, 422 `bad_content`, temporary file removed, not present, commit refused 409, nothing catalogued | `parts::tests::a_local_upload_with_the_wrong_bytes_or_the_wrong_length_stores_nothing` |
 | `Content-Length` over `max_part_bytes` (1 TiB declared), or other than the size the token was issued for | 413 `too_large` / 400 `size_mismatch` from the head; body unread | same test |
 | Body shorter than `Content-Length` (client hangs up), body longer than it | 400 `incomplete_body`, nothing kept; bytes past `Content-Length` are never read | same test |
-| Body that stalls, or drips to hold a connection | each read must progress within the listener's 30 s, and the whole body within 30 s plus its length at 64 KiB/s; then 408 `upload_stalled`, nothing kept | `bounded_http::tests::a_streamed_body_is_read_past_the_body_cap_never_past_its_length_and_not_while_it_stalls` (the listener's rule, with a 300 ms limit; the peer's own 30 s is not waited for by a test) |
+| Body that stalls, or drips to hold a connection | each read must progress within the listener's 30 s, and the whole body within 30 s plus its length at `min_upload_bytes_per_sec` (16 KiB/s by default); then 408 `upload_stalled`, nothing kept | `bounded_http::tests::a_streamed_body_is_read_past_the_body_cap_never_past_its_length_and_not_while_it_stalls`, `bounded_http::tests::the_slowest_average_rate_of_a_streamed_body_is_the_listeners_setting` (the listener's rule, with a 300 ms limit; the peer's own 30 s is not waited for by a test) |
 | Traversal and foreign directories in the path: `../edge-b/<name>`, `edge-a/../edge-b/<name>`, `%2F` and `%2e` spellings, `//`, a trailing segment, an upper-case name, no node | the path is not decoded; node and name are each validated (`valid_node`, `valid_name`) before any path is built; 403/404/422 and no file anywhere | `parts::tests::a_foreign_node_or_a_traversal_never_reaches_another_directory_on_centrals_disk` (13 paths, with a valid token) |
 | A node asking for a URL under another node, or a shared ingest token asking for one | 403 `foreign_prefix` / `no_node` at presign, as on S3 (ADR 0001); a node's part is not "present" for another node | same test, `parts::tests::an_upload_token_is_good_for_one_node_one_name_one_size_and_a_while` |
 | Filling central's disk | `disk_budget_bytes` (64 GiB by default) over installed parts plus uploads in flight: 507 at presign and again at the PUT, before the body is read; counted in `parts_store.refused_budget` | `parts::tests::the_disk_budget_refuses_with_507_counts_it_and_frees_with_a_delete` |
@@ -148,8 +148,11 @@ presign, not by the bearer token. Every row is new code with a new test; all wer
 Left open, and known:
 
 * **Uploads are not capped per node.** A node with a valid token can hold one connection per upload for as long as the
-  rule above allows (about 2.3 hours for 512 MiB at the minimum rate), up to the listener's connection cap, which
-  ingest from every other node shares. A node token is already write access to central's store.
+  rule above allows (about 9 hours for 512 MiB at the default minimum rate), up to the listener's connection cap, which
+  ingest from every other node shares. A node token is already write access to central's store. Only one upload of a
+  given part is accepted at a time (409 `upload_in_progress` for the others, no reservation), so one token replayed on
+  many connections reserves the budget once; a node that presigns many different names can still reserve one
+  part-size per name, up to the connection cap (`parts::tests::a_second_upload_of_a_part_already_arriving_reserves_nothing_and_is_told_to_retry`).
 * **A node can use the whole disk budget**, and parts it uploads but never commits are not cleaned up (the sweep reads
   only the catalog). They show as `parts_store.used_bytes` above the catalog's total.
 * **No scrub.** A byte that changes on central's disk after the upload is found by `logless restore`, not by central.

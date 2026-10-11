@@ -23,7 +23,7 @@ part's key space, who controls its lifecycle (central or the edge), and what ret
      authenticated the request. Central builds the key; no request field chooses it. A request that names another
      node is 403 `foreign_prefix`; a name that is not `<64 hex>.parquet` (so `../`, `/`, `%2F`, `?` and the like) is
      422 `bad_name`; a shared `[peer] tokens` token owns no prefix and gets 403 `no_node` on the parts paths.
-     Node ids are `A-Za-z0-9._-`, 1 to 64 characters, not `.` or `..`, and are validated again before any key is
+     Node ids are `A-Za-z0-9._-`, 1 to 64 characters, not starting with a dot, unique ignoring case, and are validated again before any key is
      built, including from catalog rows. Node tokens must be distinct from each other and from shared tokens.
    * The catalog row is keyed `(node, name)`. The same bytes uploaded by two nodes are two objects and two rows, so
      one node can neither claim, probe nor retire another's part (`already_present` is per prefix; retire answers

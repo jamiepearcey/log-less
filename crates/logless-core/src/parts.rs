@@ -127,6 +127,12 @@ pub struct PartsConfig {
     /// How long an upload URL works: the presigned URL's expiry on S3, the upload token's on the local backend.
     #[serde(default = "default_url_ttl")]
     pub url_ttl_secs: u64,
+    /// Local backend: the slowest average rate at which a part may arrive. An upload slower than this
+    /// (after a 30 s allowance) is cut off with 408 and nothing is kept, so it caps how long one upload
+    /// holds a connection and a reservation of the disk budget. A part of `max_part_bytes` needs
+    /// `max_part_bytes / min_upload_bytes_per_sec` seconds at the very least.
+    #[serde(default = "default_min_upload_rate")]
+    pub min_upload_bytes_per_sec: u64,
     /// A warm part whose newest data is older than this many seconds is expired by a sweep. 0 keeps it.
     #[serde(default)]
     pub warm_retention_secs: u64,
@@ -143,6 +149,9 @@ fn default_max_part_bytes() -> u64 {
 }
 fn default_url_ttl() -> u64 {
     900
+}
+fn default_min_upload_rate() -> u64 {
+    16 * 1024
 }
 fn default_disk_budget() -> u64 {
     64 * 1024 * 1024 * 1024
@@ -163,6 +172,7 @@ impl Default for PartsConfig {
             secret_access_key: String::new(),
             max_part_bytes: default_max_part_bytes(),
             url_ttl_secs: default_url_ttl(),
+            min_upload_bytes_per_sec: default_min_upload_rate(),
             warm_retention_secs: 0,
             cold_retention_secs: 0,
         }
@@ -184,6 +194,7 @@ impl std::fmt::Debug for PartsConfig {
             .field("secret_access_key", &"<redacted>")
             .field("max_part_bytes", &self.max_part_bytes)
             .field("url_ttl_secs", &self.url_ttl_secs)
+            .field("min_upload_bytes_per_sec", &self.min_upload_bytes_per_sec)
             .field("warm_retention_secs", &self.warm_retention_secs)
             .field("cold_retention_secs", &self.cold_retention_secs)
             .finish()
@@ -207,6 +218,14 @@ impl PartsConfig {
                 }
             }
             Backend::Local => {
+                // Not named, and nothing to say it is meant to be local: a table that lost its endpoint
+                // (an unset variable, a template slip) must not move the parts onto this disk unannounced.
+                if self.backend.is_none() && [&self.bucket, &self.prefix, &self.access_key_id, &self.secret_access_key].iter().any(|v| !v.is_empty()) {
+                    return Err("[peer.parts] looks like an S3 table without an endpoint (bucket, prefix or keys are set); set endpoint, or backend = \"local\" to keep parts on this disk".into());
+                }
+                if self.min_upload_bytes_per_sec == 0 {
+                    return Err("[peer.parts] min_upload_bytes_per_sec must be above 0".into());
+                }
                 if self.dir.as_ref().is_some_and(|d| d.as_os_str().is_empty()) {
                     return Err("[peer.parts] dir must be a directory path (leave it out for <data_dir>/parts)".into());
                 }
@@ -260,12 +279,12 @@ pub fn valid_name(name: &str) -> bool {
         && name[..64].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// A node id is 1 to 64 of `A-Za-z0-9._-`, and not `.` or `..`: one path segment, never a traversal, and
-/// the same in a key and in a URL.
+/// A node id is 1 to 64 of `A-Za-z0-9._-`, not starting with a dot: one path segment, never a traversal,
+/// the same in a key and in a URL, and a directory that is never taken for a temporary file or hidden from
+/// the budget count and from S3 serve, which skip dot-named entries.
 pub fn valid_node(node: &str) -> bool {
     (1..=64).contains(&node.len())
-        && node != "."
-        && node != ".."
+        && !node.starts_with('.')
         && node.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
@@ -383,6 +402,9 @@ struct LocalStore {
     usage: Mutex<Usage>,
     /// Held across "is it there, else rename it in", so two uploads of one part count once.
     install: Mutex<()>,
+    /// The parts whose bytes are arriving, `(node, name)`. One upload per part at a time, so a token
+    /// replayed on many connections cannot reserve the budget many times over.
+    arriving: Mutex<std::collections::HashSet<(String, String)>>,
     stats: LocalStats,
 }
 
@@ -449,6 +471,18 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
+/// An upload of one part under way, see [`LocalStore::begin`].
+struct Arriving<'a> {
+    set: &'a Mutex<std::collections::HashSet<(String, String)>>,
+    key: (String, String),
+}
+
+impl Drop for Arriving<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.key);
+    }
+}
+
 /// Removes its file when dropped, unless the file was renamed away first.
 struct TempFile(PathBuf);
 
@@ -496,7 +530,7 @@ impl LocalStore {
         let mut key = [0u8; 32];
         getrandom::fill(&mut key).map_err(|e| format!("no random bytes for the upload token key: {e}"))?;
         let usage = Mutex::new(Usage { used: dir_bytes(&dir), reserved: 0, measured: Instant::now() });
-        Ok(Self { dir, key, budget: config.disk_budget_bytes, usage, install: Mutex::new(()), stats: LocalStats::default() })
+        Ok(Self { dir, key, budget: config.disk_budget_bytes, usage, install: Mutex::new(()), arriving: Mutex::new(Default::default()), stats: LocalStats::default() })
     }
 
     fn usage(&self) -> std::sync::MutexGuard<'_, Usage> {
@@ -514,6 +548,14 @@ impl LocalStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(format!("the parts directory is unreadable: {e}")),
         }
+    }
+
+    /// Marks `(node, name)` as arriving until the guard is dropped; `None` when an upload of it is already under way.
+    fn begin(&self, node: &str, name: &str) -> Option<Arriving<'_>> {
+        let key = (node.to_string(), name.to_string());
+        let fresh = self.arriving.lock().unwrap_or_else(|p| p.into_inner()).insert(key.clone());
+        // Lazily: a guard built and dropped here would remove the key of the upload that holds it.
+        fresh.then(|| Arriving { set: &self.arriving, key })
     }
 
     /// Whether `size` more bytes fit the budget; with `reserve`, they are then promised to the caller,
@@ -892,6 +934,11 @@ impl PartsCentral {
             }
             Err(m) => return error_reply(500, "storage_error", &m),
         }
+        // Not while the same part is already arriving: it could be installed once, and each copy would hold
+        // `size` bytes of the budget for as long as its sender cares to dribble.
+        let Some(_arriving) = local.begin(node, name) else {
+            return error_reply(409, "upload_in_progress", "this part is already being uploaded; wait for it, then retry").with_header("Retry-After", "1");
+        };
         if !local.room(size, true) {
             return insufficient_storage();
         }
@@ -1185,6 +1232,7 @@ impl Uploader<'_> {
         let mut last = String::new();
         let mut presigned: Option<PresignReply> = None;
         let mut put_done = false;
+        let mut stalled = 0u32;
         let mut attempt = 0u32;
         while attempt < self.tuning.attempts {
             if self.cancel.load(Ordering::Acquire) {
@@ -1232,7 +1280,16 @@ impl Uploader<'_> {
                         attempt += 1;
                         continue;
                     }
-                    Ok(r) => last = format!("The part store answered HTTP {} to the upload.", r.status().as_u16()),
+                    Ok(r) => {
+                        let status = r.status().as_u16();
+                        // Cut off for arriving too slowly ([peer.parts] min_upload_bytes_per_sec): once may be a
+                        // blip, twice is this link and this part, and the next files may be smaller.
+                        stalled += u32::from(status == 408);
+                        if stalled >= 2 {
+                            return Err(Failure::Rejected(format!("The part store cut the upload of {} off as too slow (HTTP 408, twice); the link is under its minimum upload rate.", part.name)));
+                        }
+                        last = format!("The part store answered HTTP {status} to the upload.");
+                    }
                     Err(e) => last = format!("The upload failed: {e}"),
                 }
                 if !put_done {
@@ -1462,6 +1519,8 @@ mod tests {
         fail_puts: AtomicU64,
         /// The next this many PUTs answer 403, as an expired URL does.
         expire_puts: AtomicU64,
+        /// The next this many PUTs answer 408, as a store that cut a slow upload off does.
+        stall_puts: AtomicU64,
         /// PUTs after this many successes answer 500 (u64::MAX: never).
         fail_after: AtomicU64,
         deletes: AtomicU64,
@@ -1534,7 +1593,9 @@ mod tests {
                         let take = |n: &AtomicU64| n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1)).is_ok();
                         // A checksum header sent but not signed into the URL fails the signature.
                         let checksum_signed = target.contains("X-Amz-SignedHeaders=host%3Bx-amz-checksum-sha256&");
-                        if take(&state.expire_puts) || !signed || (checksum.is_some() != checksum_signed) {
+                        if take(&state.stall_puts) {
+                            reply(&mut out, "408 Request Timeout", "content-length: 0\r\n");
+                        } else if take(&state.expire_puts) || !signed || (checksum.is_some() != checksum_signed) {
                             reply(&mut out, "403 Forbidden", "content-length: 0\r\n");
                         } else if checksum.as_ref().is_some_and(|c| *c != b64_sha256(&body)) {
                             // As S3: a body that does not match the checksum it came with is not stored.
@@ -1716,6 +1777,25 @@ mod tests {
         assert_eq!(("done", 1, 2), (second.state.as_str(), second.skipped, second.uploaded), "{second:?}");
         assert_eq!(puts + 2, fake.puts.load(Ordering::SeqCst));
         assert_eq!(3, crate::catalog::Catalog::open(&c.catalog).unwrap().peer_part_count().unwrap());
+        c.receiver.shutdown();
+        stop.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn an_upload_central_cuts_off_as_too_slow_twice_in_a_row_moves_the_job_on_to_the_next_file() {
+        let (s3, fake, stop) = fake_s3();
+        let c = central(&s3, 512 * 1024 * 1024);
+        let e = edge(&format!("http://{}", c.receiver.local_addr()), &[3_000, 3_001]);
+        // The first file is cut off with 408 on both its tries; the second is never.
+        fake.stall_puts.store(2, Ordering::SeqCst);
+        let status = run(&e, 3_000 * HOUR_MS, 3_002 * HOUR_MS);
+        assert_eq!(("done", 1, 1), (status.state.as_str(), status.rejected, status.uploaded), "{status:?}");
+        assert!(status.error.as_deref().unwrap().contains("too slow"), "{status:?}");
+        // One stall alone is a blip: it is tried again.
+        fake.stall_puts.store(1, Ordering::SeqCst);
+        std::fs::remove_file(e.data.path().join(STATE_FILE)).unwrap();
+        let again = run(&e, 3_000 * HOUR_MS, 3_002 * HOUR_MS);
+        assert_eq!(("done", 0), (again.state.as_str(), again.rejected), "{again:?}");
         c.receiver.shutdown();
         stop.store(true, Ordering::Release);
     }
@@ -2038,6 +2118,12 @@ mod tests {
             vec![node("a", "")],
             vec![node("a", "t"), node("a", "u")],
             vec![node("a", "t"), node("b", "t")],
+            // A dot-led id would hide the node from the budget count and S3 serve, and look like a temporary file.
+            vec![node(".dot", "t")],
+            vec![node("...", "t")],
+            vec![node(".upload-x.tmp", "t")],
+            // Ids that differ only in case are one directory on a case-insensitive filesystem.
+            vec![node("edge-a", "t"), node("EDGE-A", "u")],
         ] {
             assert!(matches!(start(bad.clone(), vec![]), Err(peer::PeerError::BadNode(_))), "{bad:?}");
         }
@@ -2299,6 +2385,14 @@ mod tests {
         let kept = parse("[parts]\nenabled = true\nbackend = \"local\"\nendpoint = \"http://h:9000\"\n").unwrap();
         assert_eq!((Backend::Local, Ok(())), (kept.backend(), kept.check()));
         assert!(parse("[parts]\nenabled = true\nbackend = \"ftp\"\n").is_err());
+        // An S3 table that lost its endpoint is not quietly turned into the local backend.
+        for slip in ["bucket = \"b\"", "prefix = \"edges\"", "access_key_id = \"a\"", "secret_access_key = \"s\"", "endpoint = \"  \"\nbucket = \"b\""] {
+            let cfg = parse(&format!("[parts]\nenabled = true\n{slip}\n")).unwrap();
+            let why = cfg.check().unwrap_err();
+            assert!(why.contains("without an endpoint") && why.contains("backend = \"local\""), "{slip}: {why}");
+        }
+        let slipped = PeerConfig { parts: PartsConfig { enabled: true, bucket: "b".into(), access_key_id: "a".into(), secret_access_key: "s".into(), ..PartsConfig::default() }, ..local_config(1_000, 0) };
+        assert!(matches!(peer::Receiver::start_with_catalog(&slipped, "c".into(), Some(PathBuf::from("/tmp/x.sqlite")), |_| Admitted::Accepted), Err(peer::PeerError::BadParts(m)) if m.contains("endpoint")));
         for (bad, says) in [
             (PartsConfig { enabled: true, max_part_bytes: 1_000, disk_budget_bytes: 999, ..PartsConfig::default() }, "disk_budget_bytes"),
             (PartsConfig { enabled: true, dir: Some(PathBuf::new()), ..PartsConfig::default() }, "dir"),
@@ -2561,6 +2655,42 @@ mod tests {
         wrong[1] ^= 1;
         assert_eq!((422, "bad_content".to_string()), put(a, &path, &token, &wrong));
         assert_eq!((100, 0), (status_of(&c).used_bytes, status_of(&c).reserved_bytes));
+        c.receiver.shutdown();
+    }
+
+    #[test]
+    fn a_second_upload_of_a_part_already_arriving_reserves_nothing_and_is_told_to_retry() {
+        let c = local(100, 300);
+        let a = c.receiver.local_addr();
+        let (body, name, sha) = blob(30, 100);
+        let (path, token) = presign_local(a, &name, 100, &sha);
+        // One upload holds the connection open after its head and ten bytes.
+        let mut held = std::net::TcpStream::connect(a).unwrap();
+        held.write_all(format!("PUT {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n{UPLOAD_TOKEN_HEADER}: {token}\r\n\r\n").as_bytes()).unwrap();
+        held.write_all(&body[..10]).unwrap();
+        let started = Instant::now();
+        while status_of(&c).reserved_bytes != 100 {
+            assert!(started.elapsed() < Duration::from_secs(5), "{:?}", status_of(&c));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The same part again, on the same token, with the same bytes: it is refused and holds no room, so
+        // many of them cannot make another node's uploads 507.
+        for _ in 0..5 {
+            let (status, why) = put(a, &path, &token, &body);
+            assert_eq!((409, "upload_in_progress".to_string()), (status, why));
+        }
+        assert_eq!(100, status_of(&c).reserved_bytes);
+        let (other, other_name, other_sha) = blob(31, 100);
+        let (other_path, other_token) = presign_local(a, &other_name, 100, &other_sha);
+        assert_eq!((200, "true".to_string()), put(a, &other_path, &other_token, &other));
+        // The first upload is unharmed, and once it ends the part is free to be sent again.
+        held.write_all(&body[10..]).unwrap();
+        let mut out = Vec::new();
+        held.shutdown(std::net::Shutdown::Write).unwrap();
+        std::io::Read::read_to_end(&mut held, &mut out).unwrap();
+        assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 200"), "{}", String::from_utf8_lossy(&out));
+        assert_eq!((200, 0), (status_of(&c).used_bytes, status_of(&c).reserved_bytes));
+        assert_eq!((200, "false".to_string()), put(a, &path, &token, &body));
         c.receiver.shutdown();
     }
 

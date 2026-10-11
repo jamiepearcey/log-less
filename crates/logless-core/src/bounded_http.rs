@@ -42,6 +42,9 @@ pub struct HeadLimits {
     /// way `Transfer-Encoding` with `Content-Length`, or with any coding but `chunked`, is refused, and
     /// the reply closes the connection, so there is no second request for a proxy to disagree about.
     pub chunked: bool,
+    /// The slowest average rate, in bytes a second, at which a body handed to `Handler::stream` may
+    /// arrive. With the stall limit on each read it bounds how long one upload can hold a connection.
+    pub min_stream_bytes_per_sec: u64,
 }
 
 impl Default for HeadLimits {
@@ -53,6 +56,7 @@ impl Default for HeadLimits {
             max_connections: 64,
             gzip: false,
             chunked: false,
+            min_stream_bytes_per_sec: DEFAULT_MIN_STREAM_BYTES_PER_SEC,
         }
     }
 }
@@ -370,7 +374,7 @@ fn read_request(
     }
     if !chunked {
         let expects_continue = headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("expect") && v.eq_ignore_ascii_case("100-continue"));
-        let mut reader = BodyReader::new(&mut *stream, &buf[end + 4..], declared as u64, head.request_timeout, expects_continue);
+        let mut reader = BodyReader::new(&mut *stream, &buf[end + 4..], declared as u64, head.request_timeout, head.min_stream_bytes_per_sec, expects_continue);
         if let Some(reply) = handler.stream(&Incoming::new(method, m, &path, &query, &headers, Vec::new()), declared as u64, &mut reader) {
             return fail(Bad::Early(reply));
         }
@@ -396,13 +400,12 @@ fn read_request(
     Ok(Parsed { method, method_name: m.to_string(), path, query, headers, body })
 }
 
-/// The slowest a streamed body may arrive, averaged over the whole of it. With the stall limit on each
-/// read, this bounds how long one upload can hold a connection.
-const MIN_STREAM_BYTES_PER_SEC: u64 = 64 * 1024;
+/// The default for [`HeadLimits::min_stream_bytes_per_sec`].
+pub const DEFAULT_MIN_STREAM_BYTES_PER_SEC: u64 = 64 * 1024;
 
 /// A request body handed to [`Handler::stream`]: at most `left` bytes, first what arrived with the head,
 /// then the socket. Each read must make progress within `stall` (the listener's request timeout), and the
-/// whole body within that plus its length at [`MIN_STREAM_BYTES_PER_SEC`]; past either the read fails with
+/// whole body within that plus its length at [`HeadLimits::min_stream_bytes_per_sec`]; past either the read fails with
 /// `TimedOut`. A client that hangs up early is `UnexpectedEof`. A client that sent `Expect: 100-continue`
 /// is told to go on only when the handler first reads, so a refusal from the head costs it no upload.
 struct BodyReader<'a> {
@@ -415,9 +418,9 @@ struct BodyReader<'a> {
 }
 
 impl<'a> BodyReader<'a> {
-    fn new(stream: &'a mut TcpStream, prefix: &'a [u8], len: u64, stall: Duration, expects_continue: bool) -> Self {
+    fn new(stream: &'a mut TcpStream, prefix: &'a [u8], len: u64, stall: Duration, min_bytes_per_sec: u64, expects_continue: bool) -> Self {
         let prefix = &prefix[..prefix.len().min(usize::try_from(len).unwrap_or(usize::MAX))];
-        let deadline = Instant::now() + stall + Duration::from_secs(len / MIN_STREAM_BYTES_PER_SEC);
+        let deadline = Instant::now() + stall + Duration::from_secs(len / min_bytes_per_sec.max(1));
         Self { stream, prefix, left: len, stall, deadline, expects_continue }
     }
 }
@@ -859,6 +862,37 @@ mod tests {
         assert!(out.starts_with("HTTP/1.1 200") && out.ends_with("streamed 4 of 4"), "{out}");
         let (status, text) = testing::exchange(a, format!("{asked}X-Refuse: 1\r\n\r\n").as_bytes(), testing::WAIT);
         assert!(status == 403 && !text.contains("100 Continue"), "{text}");
+        server.shutdown();
+    }
+
+    #[test]
+    fn the_slowest_average_rate_of_a_streamed_body_is_the_listeners_setting() {
+        // 1000 bytes dripped over about 0.7 s, each piece well inside the stall limit.
+        let drip = |a: std::net::SocketAddr| {
+            let mut c = TcpStream::connect(a).unwrap();
+            c.write_all(b"PUT / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n").unwrap();
+            for _ in 0..10 {
+                if c.write_all(&[1u8; 100]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(70));
+            }
+            let mut out = String::new();
+            let _ = c.read_to_string(&mut out);
+            out
+        };
+        let limits = Limits { max_body_bytes: 16, max_decompressed_bytes: 16 };
+        // At the default floor (64 KiB/s) the whole body is due within the 300 ms stall limit alone.
+        let head = HeadLimits { request_timeout: Duration::from_millis(300), ..Default::default() };
+        let server = BoundedServer::start("127.0.0.1:0", "test", limits, head, Arc::new(Streaming)).unwrap();
+        let out = drip(server.local_addr());
+        assert!(out.contains("TimedOut"), "{out}");
+        server.shutdown();
+        // A lower floor leaves a slow uplink the time it needs.
+        let head = HeadLimits { request_timeout: Duration::from_millis(300), min_stream_bytes_per_sec: 100, ..Default::default() };
+        let server = BoundedServer::start("127.0.0.1:0", "test", limits, head, Arc::new(Streaming)).unwrap();
+        let out = drip(server.local_addr());
+        assert!(out.ends_with("streamed 1000 of 1000"), "{out}");
         server.shutdown();
     }
 

@@ -1058,6 +1058,10 @@ impl Receiver {
                     if leftovers > 0 {
                         tracing::info!(leftovers, "removed temporary files of part uploads cut off by a restart");
                     }
+                    match p.store_status() {
+                        Some(store) => tracing::info!(backend = "local", dir = %store.dir, budget_bytes = store.budget_bytes, used_bytes = store.used_bytes, "part upload is on, parts are stored on this instance's disk"),
+                        None => tracing::info!(backend = "s3", bucket = %config.parts.bucket, "part upload is on, parts are stored in the bucket"),
+                    }
                     Some(Arc::new(p))
                 }
                 // The local backend needs nothing filled in, so a refusal is a mistake to fix, not a table half written.
@@ -1071,9 +1075,10 @@ impl Receiver {
         let mut seen = std::collections::HashSet::new();
         for n in &config.nodes {
             if !crate::parts::valid_node(&n.id) {
-                return Err(PeerError::BadNode(format!("node id {:?} must be 1 to 64 of A-Za-z0-9._- and not . or ..", n.id)));
+                return Err(PeerError::BadNode(format!("node id {:?} must be 1 to 64 of A-Za-z0-9._- and not start with a dot", n.id)));
             }
-            if n.token.is_empty() || !seen.insert(n.id.as_str()) || config.nodes.iter().filter(|o| o.token == n.token).count() > 1 || config.tokens.contains(&n.token) {
+            // Case-insensitively: on a case-insensitive filesystem ids that differ only in case are one parts directory.
+            if n.token.is_empty() || !seen.insert(n.id.to_ascii_lowercase()) || config.nodes.iter().filter(|o| o.token == n.token).count() > 1 || config.tokens.contains(&n.token) {
                 return Err(PeerError::BadNode(format!("node {:?} needs its own non-empty token, and ids are unique", n.id)));
             }
         }
@@ -1101,6 +1106,7 @@ impl Receiver {
         let head = HeadLimits {
             max_connections: (config.workers * CONNECTIONS_PER_WORKER).max(MIN_CONNECTIONS),
             request_timeout: REQUEST_TIMEOUT,
+            min_stream_bytes_per_sec: config.parts.min_upload_bytes_per_sec.max(1),
             gzip: true,
             ..HeadLimits::default()
         };

@@ -228,6 +228,7 @@ enabled = true
 disk_budget_bytes = 68719476736                   # 64 GiB, the default; uploads past it get 507. 0: no budget
 max_part_bytes = 536870912                        # 512 MiB, the default
 url_ttl_secs = 900                                # how long an upload token (or presigned URL) works, the default
+min_upload_bytes_per_sec = 16384                  # local: slowest average upload rate, 16 KiB/s by default (see "Slow links")
 warm_retention_secs = 0                           # expire uploaded parts whose newest data is older than this (0: keep)
 cold_retention_secs = 0                           # the same for parts the node has dropped locally
 
@@ -242,7 +243,7 @@ access_key_id = "..."
 secret_access_key = "..."                         # never logged, serialized or returned
 
 [[peer.nodes]]                                    # one per edge: its token IS its identity and its prefix
-id = "edge-1"                                     # A-Za-z0-9._- , 1 to 64 characters, not "." or ".."
+id = "edge-1"                                     # A-Za-z0-9._- , 1 to 64 characters, not starting with "."; unique ignoring case
 token = "..."                                     # the edge's [[destinations]] token; distinct per node
 ```
 
@@ -251,6 +252,13 @@ disk, where `<node>` is the id of the `[[peer.nodes]]` entry whose token made th
 `foreign_prefix`, a name that is not `<64 hex>.parquet` (traversal, slashes, query strings) is 422 `bad_name`, and a
 shared `[peer] tokens` token owns no prefix (403 `no_node`). The catalog is keyed `(node, name)`. Decision and rejected
 alternatives: `docs/adr/0001-parts-tiering-and-lifecycle.md`.
+
+Node ids must be unique ignoring case (`edge-a` and `EDGE-A` are refused at start): on a case-insensitive filesystem
+they would be one directory. An id may not start with a dot, because dot-named entries are skipped when the disk budget
+is counted and by S3 serve. At start central logs which backend is in force. A table that names none and has no
+`endpoint` is local, but if it also sets `bucket`, `prefix` or keys it looks like an S3 table that lost its endpoint, and
+the listener refuses to start rather than put the parts on this disk unannounced; set `endpoint`, or `backend = "local"`
+to keep them here.
 
 The capability document says `parts: true` only when this is enabled and complete. An incomplete S3 table is logged
 (not the secret) and the endpoints answer 404; a local table that cannot work (the directory cannot be created, a
@@ -275,7 +283,7 @@ on each backend:
 | `headers` | `x-logless-upload-token` (a token for this node, name and size, valid `url_ttl_secs`) and `expect: 100-continue` | `x-amz-checksum-sha256` (signed into the URL) |
 | who checks the bytes | central: it hashes the body while streaming it to a temporary file, and renames it into place only if the SHA-256 is the name | the storage: it refuses a body whose SHA-256 is not the one signed |
 | stored intact means | a regular file of that name and size; only a verified upload can have put it there | a HEAD with `x-amz-checksum-mode: ENABLED` answers that size and the checksum of the name |
-| the PUT answers | 200 `{stored, already_present}`; 403 `bad_token` / `token_expired`; 400 `size_mismatch` / `incomplete_body`; 408 `upload_stalled`; 413 `too_large`; 422 `bad_content` / `bad_name`; 507 `insufficient_storage` | the storage's own |
+| the PUT answers | 200 `{stored, already_present}`; 403 `bad_token` / `token_expired`; 409 `upload_in_progress` (the same part is already arriving; `Retry-After: 1`); 400 `size_mismatch` / `incomplete_body`; 408 `upload_stalled`; 413 `too_large`; 422 `bad_content` / `bad_name`; 507 `insufficient_storage` | the storage's own |
 
 On S3 an object of the right size without the name's checksum (written some other way, or with other bytes) is not
 present, so it is uploaded again and a commit before that is refused. The checksum is what the storage recorded at
@@ -291,6 +299,13 @@ directory `fsync`ed, and then answered 200. A crash at any point leaves a part a
 after the rename and before the commit leaves it present, and the edge's retry commits it. The token format, the
 refusals in order and the timeouts are in ADR 0003; the run with a 128 MiB part and central's memory during it is in
 `docs/evidence/parts-local-backend.md`.
+
+**Slow links (local).** A part must arrive at an average of at least `min_upload_bytes_per_sec` (16 KiB/s by default,
+about 0.13 Mbit/s) after a 30 s allowance, and no single read may stall for 30 s; otherwise 408 `upload_stalled` and
+nothing is kept (there is no resume, the next attempt starts at byte 0). A 512 MiB part therefore needs an uplink above
+about 16 KiB/s to finish within the 9 hours that rule allows; lower the setting for slower links, at the cost of a
+connection and a budget reservation held for longer. An edge that is cut off with 408 twice in a row on one part marks
+that file rejected ("too slow") and goes on to the next; the first 408 alone is retried. The S3 backend has no such floor.
 
 **Disk budget (local).** Installed parts plus uploads in flight may not pass `disk_budget_bytes`. A presign or an
 upload that would is answered 507 `insufficient_storage` with `Retry-After: 60`; the edge retries with backoff and then

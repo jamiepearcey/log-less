@@ -53,7 +53,8 @@ access log.
 **What the local PUT refuses, in order, all before the body is read:** a path that is not `<node>/<name>` (404), a node
 that is not a node id (403 `bad_node`), a name that is not `<64 hex>.parquet` (422 `bad_name`), a missing, forged,
 replayed or duplicated token (403 `bad_token`) or an expired one (403 `token_expired`), a `Content-Length` over
-`max_part_bytes` (413 `too_large`), a `Content-Length` other than the token's size (400 `size_mismatch`), and a part
+`max_part_bytes` (413 `too_large`), a `Content-Length` other than the token's size (400 `size_mismatch`), a part that
+is already arriving on another connection (409 `upload_in_progress`, `Retry-After: 1`, no room reserved), and a part
 that would pass the disk budget (507 `insufficient_storage`). A client that sent `Expect: 100-continue` (the edge
 does, because central asks for it) is told to continue only after these, so a refusal costs it no upload.
 
@@ -66,7 +67,7 @@ name but written nowhere.
 
 **Timeouts.** The head must arrive within the listener's request timeout (30 s). A streamed body is not held to that
 as a whole, since 512 MiB over a slow link does not fit: each read must make progress within the same 30 s, and the
-whole body within 30 s plus its length at 64 KiB/s (`bounded_http::BodyReader`).
+whole body within 30 s plus its length at `min_upload_bytes_per_sec` (default 16 KiB/s; `bounded_http::BodyReader`).
 
 **Crash ordering.** Only the upload path writes under a final name, and only by rename of a file it hashed and synced.
 So after a crash a part is either absent (its bytes, if any, are in a `.upload-*.tmp` file that the next start removes)
@@ -90,10 +91,12 @@ enabled = true
 disk_budget_bytes = 68719476736  # 64 GiB, the default; 0: no budget. Not under max_part_bytes
 max_part_bytes = 536870912       # 512 MiB, the default
 url_ttl_secs = 900               # how long an upload URL (S3) or upload token (local) works
+min_upload_bytes_per_sec = 16384 # local: slowest average upload rate; slower is 408 and nothing is kept
 ```
 
 A local table that cannot work (the directory cannot be created, the budget is under `max_part_bytes`, a TTL out of
-range) stops the peer listener at start with the reason. An incomplete S3 table is still logged and left off, as
+range, or an unnamed backend with a bucket, prefix or keys set but no endpoint, which is an S3 table that lost its
+endpoint) stops the peer listener at start with the reason. An incomplete S3 table is still logged and left off, as
 before, because that is what a table half filled in looks like.
 
 ## What durability each configuration gives
