@@ -26,12 +26,25 @@
 //! ring stops after one lap instead of multiplying data. The attributes stay in the store, which also
 //! answers "which node produced this line" centrally.
 //!
+//! Provenance is read strictly: a hops value that is not a whole number from 0 up, an origin that is not
+//! a non-empty string, or either attribute twice, is refused as a loop (counted with the loops), so a
+//! forged `logless.hops = "0"` or `-100` cannot buy a record more hops.
+//!
 //! # Idempotency
 //!
-//! A bounded window of recently accepted event ids ([`DedupeWindow`]) drops a record seen again. The
-//! window is memory-only and sized by `dedupe_window`; a retry older than it (a peer down for longer than
-//! that many records) can duplicate. That is the same at-least-once contract as every other forwarder,
+//! A bounded window of recently accepted event ids ([`DedupeWindow`]) drops a record seen again. The agent
+//! keeps it in [`DEDUPE_FILE`] in the data dir, so it survives a restart: the ids of each admitted batch
+//! are appended and synced in one write after the pipeline took the batch and before the 200 reply, and
+//! the file is compacted to the window once it holds twice that many. A crash between the pipeline taking
+//! a batch and its ids being saved means the sender, which never heard 200, resends it and the receiver
+//! takes it again; a crash after the ids are saved but before the reply means the resend is reported as
+//! duplicates. A retry older than the window (`dedupe_window` records) can still duplicate: at-least-once,
 //! stated rather than hidden.
+//!
+//! "The pipeline took it" is only as durable as the sink. In the agent the sink is a bounded in-memory
+//! channel ahead of the WAL, so the 200 (and the saved ids) can precede the WAL write: a crash in that
+//! window loses the batch, and with the ids saved a resend would be dropped as a duplicate too. Closing it
+//! means replying only after the WAL synced the batch, as HEC acks do; `docs/peer-sync.md` tracks it.
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
@@ -121,6 +134,8 @@ pub enum PeerError {
     OpenOnPublicAddress { addr: String },
     #[error(transparent)]
     Http(#[from] httpd::HttpError),
+    #[error("the peer dedupe log could not be opened: {0}")]
+    Dedupe(std::io::Error),
 }
 
 /// What a log-less instance says about itself at [`CAPABILITY_PATH`]. A sender reads it to learn whether
@@ -165,44 +180,142 @@ pub fn instance_id(data_dir: &Path) -> String {
     id
 }
 
-/// Recently accepted event ids, oldest forgotten first.
+/// Recently accepted event ids, oldest forgotten first. With a log ([`DedupeWindow::open`]) the window
+/// survives a restart: each admitted batch's ids are appended to the file as raw 16-byte ids and synced
+/// in one write, and the file is rewritten to the window alone once it holds twice the window.
 #[derive(Debug)]
 pub struct DedupeWindow {
     capacity: usize,
-    inner: Mutex<(HashSet<Uuid>, VecDeque<Uuid>)>,
+    inner: Mutex<WindowState>,
 }
 
+#[derive(Debug, Default)]
+struct WindowState {
+    set: HashSet<Uuid>,
+    order: VecDeque<Uuid>,
+    log: Option<IdLog>,
+}
+
+#[derive(Debug)]
+struct IdLog {
+    path: PathBuf,
+    file: std::fs::File,
+    /// Ids in the file, current window or forgotten.
+    ids: usize,
+}
+
+/// The receiver's id log in the data dir.
+pub const DEDUPE_FILE: &str = "peer-dedupe.ids";
+
 impl DedupeWindow {
+    /// Memory only: forgotten by a restart.
     pub fn new(capacity: usize) -> Self {
-        Self { capacity: capacity.max(1), inner: Mutex::new((HashSet::new(), VecDeque::new())) }
+        Self { capacity: capacity.max(1), inner: Mutex::new(WindowState::default()) }
+    }
+
+    /// Loads the last `capacity` ids from `path` (a torn tail from a crash mid-append is cut off) and appends
+    /// every id admitted from now on.
+    pub fn open(capacity: usize, path: &Path) -> std::io::Result<Self> {
+        use std::io::{Read, Seek};
+        let window = Self::new(capacity);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new().read(true).append(true).create(true).open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let whole = bytes.len() / 16 * 16;
+        if whole != bytes.len() {
+            file.set_len(whole as u64)?;
+            file.seek(std::io::SeekFrom::End(0))?;
+        }
+        let ids = whole / 16;
+        {
+            let mut state = window.state();
+            for chunk in bytes[..whole].chunks_exact(16).skip(ids.saturating_sub(window.capacity)) {
+                window.remember(&mut state, Uuid::from_bytes(chunk.try_into().expect("16 bytes")));
+            }
+            state.log = Some(IdLog { path: path.to_path_buf(), file, ids });
+        }
+        Ok(window)
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, WindowState> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn remember(&self, state: &mut WindowState, id: Uuid) -> bool {
+        if !state.set.insert(id) {
+            return false;
+        }
+        state.order.push_back(id);
+        while state.order.len() > self.capacity {
+            if let Some(old) = state.order.pop_front() {
+                state.set.remove(&old);
+            }
+        }
+        true
     }
 
     pub fn contains(&self, id: &Uuid) -> bool {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).0.contains(id)
+        self.state().set.contains(id)
     }
 
-    pub fn insert_all<'a>(&self, ids: impl IntoIterator<Item = &'a Uuid>) {
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let (set, order) = &mut *guard;
+    /// Remembers `ids`, and with a log makes them durable before returning (one append and one sync for
+    /// the batch). An error means the ids are remembered by this process but may be forgotten by a restart.
+    pub fn insert_all<'a>(&self, ids: impl IntoIterator<Item = &'a Uuid>) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut guard = self.state();
+        let mut fresh: Vec<u8> = Vec::new();
         for id in ids {
-            if set.insert(*id) {
-                order.push_back(*id);
-                while order.len() > self.capacity {
-                    if let Some(old) = order.pop_front() {
-                        set.remove(&old);
-                    }
-                }
+            if self.remember(&mut guard, *id) && guard.log.is_some() {
+                fresh.extend_from_slice(id.as_bytes());
             }
         }
+        let state = &mut *guard;
+        let Some(log) = state.log.as_mut() else { return Ok(()) };
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        log.file.write_all(&fresh)?;
+        log.file.sync_data()?;
+        log.ids += fresh.len() / 16;
+        if log.ids > self.capacity.saturating_mul(2) {
+            compact(log, &state.order)?;
+        }
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).1.len()
+        self.state().order.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// Rewrites the log to the current window (temporary file, sync, rename, sync the directory), so it never
+/// holds more than twice the window. A crash leaves the old file or the new one.
+fn compact(log: &mut IdLog, window: &VecDeque<Uuid>) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = log.path.with_extension("tmp");
+    {
+        let mut out = std::fs::File::create(&tmp)?;
+        let mut bytes = Vec::with_capacity(window.len() * 16);
+        for id in window {
+            bytes.extend_from_slice(id.as_bytes());
+        }
+        out.write_all(&bytes)?;
+        out.sync_all()?;
+    }
+    std::fs::rename(&tmp, &log.path)?;
+    if let Some(dir) = log.path.parent().and_then(|d| std::fs::File::open(d).ok()) {
+        let _ = dir.sync_all();
+    }
+    log.file = std::fs::OpenOptions::new().append(true).open(&log.path)?;
+    log.ids = window.len();
+    Ok(())
 }
 
 /// What the pipeline did with a batch, as the other receivers: a full pipeline is a 503 and a retry.
@@ -222,6 +335,8 @@ pub struct PeerStats {
     pub busy: AtomicU64,
     pub unauthorized: AtomicU64,
     pub bad_request: AtomicU64,
+    /// Accepted batches whose ids could not be saved to the dedupe log.
+    pub dedupe_unsaved: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -234,6 +349,7 @@ pub struct PeerStatsSnapshot {
     pub busy: u64,
     pub unauthorized: u64,
     pub bad_request: u64,
+    pub dedupe_unsaved: u64,
 }
 
 impl PeerStats {
@@ -248,6 +364,7 @@ impl PeerStats {
             busy: load(&self.busy),
             unauthorized: load(&self.unauthorized),
             bad_request: load(&self.bad_request),
+            dedupe_unsaved: load(&self.dedupe_unsaved),
         }
     }
 }
@@ -358,8 +475,12 @@ impl PeerHandler {
                     return error_reply(503, "busy", "the ingest pipeline is full; retry").with_header("Retry-After", "1");
                 }
             }
-            // Remembered only after the pipeline took them.
-            self.dedupe.insert_all(ids.iter());
+            // Remembered only after the pipeline took them, and durably before the reply: a sender that hears
+            // 200 has moved on, so a restart must still recognise a late copy (see "Idempotency" above).
+            if let Err(e) = self.dedupe.insert_all(ids.iter()) {
+                self.stats.dedupe_unsaved.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %e, "could not save accepted event ids; a restart may store a resent copy");
+            }
         }
         self.stats.accepted.fetch_add(accepted, Ordering::Relaxed);
         if loops > 0 && accepted == 0 && duplicates == 0 {
@@ -411,50 +532,53 @@ impl Handler for PeerHandler {
     }
 }
 
-/// A record that came back to the instance that first sent it, or has travelled too far.
-pub fn is_loop(record: &LogRecord, own_instance: &str) -> bool {
-    let mut hops = 0u32;
+/// A record's provenance, read strictly. `None` means it was forged or mangled: a hops count that is not a
+/// whole number from 0 up (as an integer or a decimal string), an origin that is not a non-empty string,
+/// or either attribute present twice. Such a record has no trustworthy hop count, so it is treated as a
+/// loop rather than given a fresh budget of hops.
+fn provenance(record: &LogRecord) -> Option<(Option<&str>, u32)> {
+    let (mut origin, mut hops) = (None, None);
     for attr in &record.attributes {
         if attr.key == ATTR_ORIGIN {
-            if let AttrValue::Str(origin) = &attr.value {
-                if origin == own_instance {
-                    return true;
-                }
+            let AttrValue::Str(value) = &attr.value else { return None };
+            if value.is_empty() || origin.replace(value.as_str()).is_some() {
+                return None;
             }
         } else if attr.key == ATTR_HOPS {
-            hops = match &attr.value {
-                AttrValue::I64(n) => (*n).max(0) as u32,
-                AttrValue::Str(s) => s.parse().unwrap_or(0),
-                _ => 0,
+            let n = match &attr.value {
+                AttrValue::I64(n) => u32::try_from(*n).ok()?,
+                AttrValue::Str(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => s.parse().ok()?,
+                _ => return None,
             };
+            if hops.replace(n).is_some() {
+                return None;
+            }
         }
     }
-    hops >= MAX_HOPS
+    Some((origin, hops.unwrap_or(0)))
 }
 
-/// Stamps a record for sending: the first sender's id (kept by later hops) and one more hop.
-pub fn stamp_for_send(record: &mut LogRecord, own_instance: &str) {
-    let mut hops = 0i64;
-    let mut has_origin = false;
-    record.attributes.retain(|attr| {
-        if attr.key == ATTR_HOPS {
-            hops = match &attr.value {
-                AttrValue::I64(n) => *n,
-                AttrValue::Str(s) => s.parse().unwrap_or(0),
-                _ => 0,
-            };
-            false
-        } else {
-            if attr.key == ATTR_ORIGIN {
-                has_origin = true;
-            }
-            true
-        }
-    });
-    if !has_origin {
-        record.attributes.push(Attr { key: ATTR_ORIGIN.into(), value: AttrValue::Str(own_instance.into()) });
+/// A record that came back to the instance that first sent it, has travelled too far, or carries
+/// provenance that does not parse (see [`provenance`]).
+pub fn is_loop(record: &LogRecord, own_instance: &str) -> bool {
+    match provenance(record) {
+        Some((origin, hops)) => origin == Some(own_instance) || hops >= MAX_HOPS,
+        None => true,
     }
-    record.attributes.push(Attr { key: ATTR_HOPS.into(), value: AttrValue::I64(hops + 1) });
+}
+
+/// Stamps a record for sending: the first sender's id (kept by later hops) and one more hop, as exactly one
+/// attribute each. Senders skip what [`is_loop`] refuses, so this normally sees valid provenance; given
+/// a forged one anyway it writes [`MAX_HOPS`], which the next receiver refuses, rather than a count that
+/// would buy the record more hops.
+pub fn stamp_for_send(record: &mut LogRecord, own_instance: &str) {
+    let (origin, hops) = match provenance(record) {
+        Some((origin, hops)) => (origin.unwrap_or(own_instance).to_string(), hops.saturating_add(1).min(MAX_HOPS)),
+        None => (own_instance.to_string(), MAX_HOPS),
+    };
+    record.attributes.retain(|attr| attr.key != ATTR_HOPS && attr.key != ATTR_ORIGIN);
+    record.attributes.push(Attr { key: ATTR_ORIGIN.into(), value: AttrValue::Str(origin) });
+    record.attributes.push(Attr { key: ATTR_HOPS.into(), value: AttrValue::I64(i64::from(hops)) });
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -496,6 +620,19 @@ impl Receiver {
     where
         F: Fn(Vec<LogRecord>) -> Admitted + Send + Sync + 'static,
     {
+        Self::start_in(config, instance, catalog, None, sink)
+    }
+
+    /// As [`Receiver::start_with_catalog`], with the dedupe window kept in [`DEDUPE_FILE`] under `data_dir`
+    /// so it survives a restart. This is how the agent runs it.
+    pub fn start_in<F>(config: &PeerConfig, instance: String, catalog: Option<PathBuf>, data_dir: Option<&Path>, sink: F) -> Result<Self, PeerError>
+    where
+        F: Fn(Vec<LogRecord>) -> Admitted + Send + Sync + 'static,
+    {
+        let dedupe = match data_dir {
+            Some(dir) => DedupeWindow::open(config.dedupe_window, &dir.join(DEDUPE_FILE)).map_err(PeerError::Dedupe)?,
+            None => DedupeWindow::new(config.dedupe_window),
+        };
         let parts = match (config.parts.enabled, catalog) {
             (false, _) => None,
             (true, None) => {
@@ -517,7 +654,7 @@ impl Receiver {
         let handler = Arc::new(PeerHandler {
             config: config.clone(),
             instance: instance.clone(),
-            dedupe: DedupeWindow::new(config.dedupe_window),
+            dedupe,
             stats: Arc::clone(&stats),
             sink: Box::new(sink),
             parts,
@@ -554,6 +691,7 @@ impl Receiver {
 mod tests {
     use super::*;
     use crate::model::Severity;
+    use std::io::Write as _;
     use std::sync::Mutex as StdMutex;
 
     fn record(body: &str) -> LogRecord {
@@ -717,10 +855,114 @@ mod tests {
     fn the_dedupe_window_forgets_the_oldest_first() {
         let w = DedupeWindow::new(2);
         let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
-        w.insert_all(ids.iter());
+        w.insert_all(ids.iter()).unwrap();
         assert!(!w.contains(&ids[0]));
         assert!(w.contains(&ids[1]) && w.contains(&ids[2]));
         assert_eq!(2, w.len());
+    }
+
+    fn with_attr(body: &str, key: &str, value: AttrValue) -> LogRecord {
+        let mut r = record(body);
+        r.attributes.push(Attr { key: key.into(), value });
+        r
+    }
+
+    #[test]
+    fn forged_or_mangled_provenance_is_refused_as_a_loop() {
+        let (rx, got) = start(PeerConfig::default(), false);
+        let forged = vec![
+            with_attr("garbage hops", ATTR_HOPS, AttrValue::Str("lots".into())),
+            with_attr("negative hops", ATTR_HOPS, AttrValue::I64(-5)),
+            with_attr("negative string", ATTR_HOPS, AttrValue::Str("-1".into())),
+            with_attr("signed string", ATTR_HOPS, AttrValue::Str("+1".into())),
+            with_attr("float hops", ATTR_HOPS, AttrValue::F64(1.0)),
+            with_attr("bool hops", ATTR_HOPS, AttrValue::Bool(false)),
+            with_attr("huge hops", ATTR_HOPS, AttrValue::I64(i64::MAX)),
+            with_attr("number origin", ATTR_ORIGIN, AttrValue::I64(7)),
+            with_attr("empty origin", ATTR_ORIGIN, AttrValue::Str(String::new())),
+        ];
+        // A second hops attribute must not reset a chain that has run out: the old code took the last one.
+        let mut reset = with_attr("reset", ATTR_HOPS, AttrValue::I64(MAX_HOPS as i64));
+        reset.attributes.push(Attr { key: ATTR_HOPS.into(), value: AttrValue::I64(0) });
+        let mut two_origins = with_attr("two origins", ATTR_ORIGIN, AttrValue::Str("self0001".into()));
+        two_origins.attributes.push(Attr { key: ATTR_ORIGIN.into(), value: AttrValue::Str("elsewhere".into()) });
+        let fine = with_attr("fine", ATTR_HOPS, AttrValue::Str("3".into()));
+        let mut batch = forged.clone();
+        batch.extend([reset, two_origins, fine.clone()]);
+        let (status, body) = post(rx.local_addr(), INGEST_PATH, None, &ndjson(&batch));
+        assert_eq!(200, status, "{body}");
+        assert_eq!((1, batch.len() as u64 - 1), (body["accepted"].as_u64().unwrap(), body["loops"].as_u64().unwrap()), "{body}");
+        assert_eq!(vec![fine], *got.lock().unwrap());
+        assert_eq!(batch.len() as u64 - 1, rx.stats().loops);
+        rx.shutdown();
+    }
+
+    #[test]
+    fn stamping_never_gives_a_forged_record_a_fresh_budget_of_hops() {
+        let hops_of = |r: &LogRecord| -> Vec<AttrValue> { r.attributes.iter().filter(|a| a.key == ATTR_HOPS).map(|a| a.value.clone()).collect() };
+        for value in [AttrValue::I64(-5), AttrValue::Str("junk".into()), AttrValue::Str("-3".into()), AttrValue::Bool(true)] {
+            let mut r = with_attr("forged", ATTR_HOPS, value.clone());
+            stamp_for_send(&mut r, "edge");
+            assert_eq!(vec![AttrValue::I64(MAX_HOPS as i64)], hops_of(&r), "{value:?}");
+            assert!(is_loop(&r, "central"), "the next receiver refuses it: {value:?}");
+        }
+        let mut deep = with_attr("deep", ATTR_HOPS, AttrValue::I64(MAX_HOPS as i64 + 100));
+        stamp_for_send(&mut deep, "edge");
+        assert_eq!(vec![AttrValue::I64(MAX_HOPS as i64)], hops_of(&deep), "clamped, not incremented past the limit");
+        let mut text = with_attr("text", ATTR_HOPS, AttrValue::Str("2".into()));
+        stamp_for_send(&mut text, "edge");
+        assert_eq!(vec![AttrValue::I64(3)], hops_of(&text), "a valid decimal string still counts");
+        let mut bad_origin = with_attr("bad origin", ATTR_ORIGIN, AttrValue::I64(1));
+        stamp_for_send(&mut bad_origin, "edge");
+        let origins: Vec<_> = bad_origin.attributes.iter().filter(|a| a.key == ATTR_ORIGIN).map(|a| a.value.clone()).collect();
+        assert_eq!(vec![AttrValue::Str("edge".into())], origins, "one origin, a string");
+        assert!(is_loop(&bad_origin, "central"));
+    }
+
+    #[test]
+    fn a_batch_replayed_after_the_receiver_restarts_is_reported_as_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = PeerConfig { enabled: true, addr: "127.0.0.1:0".into(), dedupe_window: 4, ..PeerConfig::default() };
+        let got = Arc::new(StdMutex::new(Vec::new()));
+        let start_durable = || {
+            let sink = Arc::clone(&got);
+            Receiver::start_in(&config, "self0001".into(), None, Some(dir.path()), move |records| {
+                sink.lock().unwrap().extend(records);
+                Admitted::Accepted
+            })
+            .unwrap()
+        };
+        let old = vec![record("a"), record("b")];
+        let first = start_durable();
+        assert_eq!(2, post(first.local_addr(), INGEST_PATH, None, &ndjson(&old)).1["accepted"]);
+        first.shutdown();
+
+        let second = start_durable();
+        let (status, again) = post(second.local_addr(), INGEST_PATH, None, &ndjson(&old));
+        assert_eq!(200, status);
+        assert_eq!((0, 2), (again["accepted"].as_u64().unwrap(), again["duplicates"].as_u64().unwrap()), "{again}");
+        assert_eq!(2, got.lock().unwrap().len(), "stored once across the restart");
+
+        // The window stays bounded: twelve more ids, one request each, push "a" and "b" out and the file
+        // is compacted rather than growing with every id ever accepted.
+        let newer: Vec<LogRecord> = (0..12).map(|i| record(&format!("n{i}"))).collect();
+        for r in &newer {
+            assert_eq!(1, post(second.local_addr(), INGEST_PATH, None, &ndjson(std::slice::from_ref(r))).1["accepted"]);
+        }
+        let log_len = std::fs::metadata(dir.path().join(DEDUPE_FILE)).unwrap().len();
+        assert!(log_len <= 2 * 4 * 16, "the log holds at most twice the window: {log_len} bytes");
+        assert_eq!(0, log_len % 16);
+        second.shutdown();
+
+        // A crash mid-append leaves a torn id at the end: it is cut off, not misread.
+        std::fs::OpenOptions::new().append(true).open(dir.path().join(DEDUPE_FILE)).unwrap().write_all(&[0xAB; 7]).unwrap();
+        let third = start_durable();
+        let last = ndjson(&newer[8..]);
+        let (_, recent) = post(third.local_addr(), INGEST_PATH, None, &last);
+        assert_eq!((0, 4), (recent["accepted"].as_u64().unwrap(), recent["duplicates"].as_u64().unwrap()), "the last window is remembered: {recent}");
+        let (_, forgotten) = post(third.local_addr(), INGEST_PATH, None, &ndjson(&old[..1]));
+        assert_eq!(1, forgotten["accepted"], "older than the window: accepted again, as documented");
+        third.shutdown();
     }
 
     #[test]

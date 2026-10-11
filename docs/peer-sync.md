@@ -37,7 +37,8 @@ built (see below).
 `POST /v1/ingest`, `application/x-ndjson` (optionally `Content-Encoding: gzip`), one `LogRecord` per line
 (`logless-ndjson/1`). OTLP cannot carry what a log-less hop needs, so this path keeps:
 
-* the **event id**, so a retried batch is dropped by the receiver (`dedupe_window` recent ids, memory only);
+* the **event id**, so a retried batch is dropped by the receiver (`dedupe_window` recent ids, kept on disk; see
+  "Duplicates and restarts");
 * the **observed time**, which partitions the store, so a backlog lands in the hour it happened;
 * the **template id** the sender already mined.
 
@@ -59,11 +60,54 @@ full; the peer never slows the write path. Status (`sent_records`, `duplicates`,
 | 503 / 429 / 5xx / network | keep the data, back off 1 s doubling to 60 s |
 | 508 | batch was all loops: counted, dropped |
 
+The cursor commit is checked. If the spool cannot record that a batch was answered (a full or read-only disk), the
+cursor does not move, status goes to `error` with "The peer has the batch, but the sync spool could not record
+that", and the sender backs off and resends; the peer drops the copies as duplicates. It recovers by itself once the
+cursor can be written. A failed spool flush is reported the same way.
+
+`docs/evidence/sync-soak.md` has a soak through a fault-injecting proxy with every record accounted for (minutes of
+injected faults, not the 72-hour soak).
+
+## Duplicates and restarts
+
+The receiver remembers the event ids it accepted, the last `dedupe_window` of them (500,000 by default), and drops a
+record whose id it already holds, reporting it in `duplicates`. The window is kept in `peer-dedupe.ids` in the data
+dir (16 bytes per id), so it survives a restart:
+
+* Each accepted request's ids are appended and synced in one write, after the pipeline took the batch and before the
+  200 reply. Ingest pays one sync per request, not per record.
+* At start the last `dedupe_window` ids are loaded; a torn id at the end (a crash mid-append) is cut off.
+* Once the file holds twice the window it is rewritten to the window alone (temporary file, sync, rename), so it stays
+  under `2 x dedupe_window x 16` bytes (16 MB at the default).
+* A batch the pipeline refused (503) is not remembered, so its retry is not taken for a duplicate.
+
+Crash ordering:
+
+| Crash | Effect |
+|---|---|
+| after the pipeline took the batch, before its ids were saved | the sender never heard 200 and resends; the receiver takes the batch again (a duplicate in the store if the first copy reached the WAL) |
+| after the ids were saved, before the 200 | the resend is reported as duplicates and committed by the sender |
+| retry older than the window | taken again: at-least-once |
+
+**Open gap.** In the agent "the pipeline took it" means the batch entered the bounded in-memory channel ahead of the
+WAL, not that the WAL has it. The 200 (and the saved ids) can therefore precede the WAL write, and a crash in that
+window loses the batch: the sender has committed, and a resend after the ids were saved would be dropped as a
+duplicate. Closing it means replying only after the WAL synced the batch, as HEC acks do. Not built yet.
+
+If the ids cannot be saved, the batch is still accepted (it is in the pipeline), `dedupe_unsaved` in the peer stats
+counts it and a warning is logged: this process still recognises a resend, a restart may not.
+
 ## Loops and provenance
 
 Every record carries `logless.origin` (the first sender's instance id, kept by every later hop) and `logless.hops`.
 A receiver refuses a record whose origin is itself or whose hops reached 8, so a ring stops after one lap. The
 attributes stay in the store: "which node produced this line" is answerable centrally.
+
+Provenance is strict. A record is refused as a loop (and counted in `loops`) when `logless.hops` is not a whole number
+from 0 up (an integer, or a string of digits only: `"lots"`, `"-1"`, `"+1"`, `-5`, `1.0` and `true` are all refused),
+when `logless.origin` is not a non-empty string, or when either attribute appears twice (a second `hops = 0` cannot
+reset a chain that ran out). A sender writes exactly one of each; given forged provenance it writes `hops = 8`, which
+the next receiver refuses, and it never writes more than 8.
 
 ## How much is sent: the detail dial
 

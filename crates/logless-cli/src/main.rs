@@ -1189,7 +1189,8 @@ fn run(
             let queue_for_room = Arc::clone(&queue);
             let mut peer_config = config.peer.clone();
             peer_config.advertise_s3 = config.serve_s3.enabled;
-            Some(logless_core::peer::Receiver::start_with_catalog(&peer_config, instance_id.clone(), Some(config.catalog_path()), move |records| {
+            let data_dir = config.storage.data_dir.clone();
+            Some(logless_core::peer::Receiver::start_in(&peer_config, instance_id.clone(), Some(config.catalog_path()), Some(&data_dir), move |records| {
                 // Refuse rather than shed: the sender holds the batch and retries, which is the right answer
                 // to a peer that is outrunning us, and a shed record would be one the peer already forgot.
                 if queue_capacity.saturating_sub(queue_for_room.len()) < records.len() {
